@@ -264,7 +264,20 @@ async function handleMessage(message) {
   if (!threadId) return; // ignore messages outside any topic
   if (!message.text) return; // ignore non-text (stickers, photos, ...) for v0
 
-  const sessionId = await getOrCreateSession(threadId);
+  let sessionId;
+  try {
+    sessionId = await getOrCreateSession(threadId);
+  } catch (e) {
+    // Without this, a failure here (e.g. session/create rejecting) is
+    // completely silent to the user: message sent, nothing ever happens,
+    // only a server-side log line. The per-update catch in main() logs it
+    // but was never going to tell them anything.
+    console.error(`[bridge] topic ${threadId}: failed to get/create session:`, e);
+    await tg
+      .sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `⚠️ Couldn't start a session: ${e.message}` })
+      .catch((sendErr) => console.error('[bridge] failed to post session-creation failure notice:', sendErr.message));
+    return;
+  }
 
   if (busySessions.has(sessionId)) {
     await tg.sendMessage({
@@ -279,7 +292,22 @@ async function handleMessage(message) {
   busySessions.add(sessionId);
   activeTurns.set(sessionId, { placeholderMessageId: placeholder.message_id, textBuffer: '' });
 
-  await zcode.call('session/send', { sessionId, content: message.text });
+  try {
+    await zcode.call('session/send', { sessionId, content: message.text });
+  } catch (e) {
+    // session/send itself rejecting (e.g. -32010 "already running" after a
+    // restart raced a still-in-flight turn, or the app-server process died)
+    // is a different failure mode than a turn completing with status
+    // "failed" -- finalizeTurn() is never reached for it, so without this
+    // catch busySessions/activeTurns for this session would stay set for
+    // the rest of the process's life and the topic would be stuck on the
+    // placeholder forever.
+    busySessions.delete(sessionId);
+    activeTurns.delete(sessionId);
+    await tg
+      .editMessageText({ chatId: cfg.chatId, messageId: placeholder.message_id, text: `⚠️ Failed to send: ${e.message}` })
+      .catch((editErr) => console.error('[bridge] failed to edit failure notice:', editErr.message));
+  }
 }
 
 async function handleCallbackQuery(cq) {
