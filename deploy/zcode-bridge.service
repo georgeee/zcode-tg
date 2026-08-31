@@ -1,0 +1,16 @@
+[Unit]
+Description=zcode <-> Telegram bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile
+ExecStart=/srv/agent-cage/etheron-bare/agent/etheron-bare/work/toolchain/node/bin/node bridge/index.js
+Restart=always
+RestartSec=3
+StandardOutput=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
+StandardError=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
+
+[Install]
+WantedBy=default.target

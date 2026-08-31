@@ -1,9 +1,14 @@
 // zcode <-> Telegram bridge.
 //
 // One Telegram forum topic == one zcode session. Sending a message in a
-// topic sends it to that session; permission requests come back as
-// Approve/Deny-style inline buttons; the final reply lands as an edited
+// topic sends it to that session; the final reply lands as an edited
 // placeholder message in the same topic.
+//
+// Permission requests: sessions run in "yolo" mode (auto-approve) by
+// default, and any interaction/requestPermission that still arrives is
+// auto-approved with a non-blocking notice posted to the topic. Set
+// AUTO_APPROVE_PERMISSIONS=false to fall back to interactive Approve/Deny
+// inline-keyboard prompts instead.
 //
 // Transport is Telegram long-polling only -- no inbound port, no webhook,
 // nothing to put behind the TLS cert (that's for the future WebSocket/app
@@ -28,6 +33,8 @@ const cfg = {
   defaultModel: process.env.ZCODE_DEFAULT_MODEL || 'zai/glm-5.3',
   storePath: process.env.STORE_PATH || new URL('../data/sessions.json', import.meta.url).pathname,
   permissionTimeoutMs: Number(process.env.PERMISSION_TIMEOUT_MS || 10 * 60 * 1000), // 10 min
+  autoApprovePermissions: process.env.AUTO_APPROVE_PERMISSIONS !== 'false', // default: on
+  defaultSessionMode: process.env.ZCODE_DEFAULT_MODE || 'yolo',
 };
 
 function need(key) {
@@ -60,9 +67,23 @@ const activeTurns = new Map(); // sessionId -> { placeholderMessageId, textBuffe
 const pendingPermissions = new Map(); // requestId -> { resolve, tokenMap: Map(token->response), chatId, threadId }
 const tokenToRequestId = new Map(); // callback_data token -> requestId
 
-// --- permission relay: server asks, we ask Telegram, we answer the server ---
+// --- permission relay: server asks, we answer (auto-approve by default) ---
 zcode.onServerRequest('interaction/requestPermission', async (params) => {
   const topic = sessionToTopic.get(params.sessionId);
+
+  if (cfg.autoApprovePermissions) {
+    const response = pickAutoApproveOption(params.options);
+    if (topic) {
+      // Fire-and-forget audit notice -- never hold up the turn on this.
+      tg.sendMessage({
+        chatId: cfg.chatId,
+        messageThreadId: topic.threadId,
+        text: `🔓 auto-approved: ${params.toolName} (${params.riskLevel})${params.reason ? ` — ${params.reason}` : ''}`,
+      }).catch((e) => console.error('[bridge] failed to post auto-approve notice:', e.message));
+    }
+    return response;
+  }
+
   if (!topic) {
     // Session we don't know about asked for permission (shouldn't happen in
     // practice) -- fail safe rather than hang the turn forever.
@@ -118,6 +139,19 @@ function finishPermission(requestId, response, resultLabel) {
   tg.editMessageText({ chatId: pending.chatId, messageId: pending.messageId, text: resultLabel }).catch((e) =>
     console.error('[bridge] failed to edit permission message:', e.message),
   );
+}
+
+function pickAutoApproveOption(options) {
+  // Prefer a broad/persistent allow (avoids repeat prompts within the same
+  // session) if the server offers one, then any plain allow, then anything
+  // that isn't an explicit denial, then just the first option -- always
+  // answer *something* valid rather than leave the turn hanging.
+  const chosen =
+    options.find((o) => o.response?.decision === 'allow' && o.response?.permissionUpdates?.length) ||
+    options.find((o) => o.response?.decision === 'allow') ||
+    options.find((o) => o.response?.decision !== 'deny') ||
+    options[0];
+  return chosen.response;
 }
 
 function safePreview(input) {
@@ -191,9 +225,10 @@ async function getOrCreateSession(threadId) {
       sessionId,
       model: parseModelRef(cfg.defaultModel),
     });
+    await zcode.call('session/setMode', { sessionId, mode: cfg.defaultSessionMode });
     entry = { sessionId, model: cfg.defaultModel };
     store.setTopic(threadId, entry);
-    console.log(`[bridge] topic ${threadId}: created session ${sessionId} (${cfg.defaultModel})`);
+    console.log(`[bridge] topic ${threadId}: created session ${sessionId} (${cfg.defaultModel}, mode=${cfg.defaultSessionMode})`);
   }
   sessionToTopic.set(entry.sessionId, { threadId });
   if (!subscribedSessions.has(entry.sessionId)) {
@@ -274,15 +309,18 @@ async function main() {
       continue;
     }
     for (const update of updates) {
-      offset = update.update_id + 1;
       try {
         if (update.message) await handleMessage(update.message);
         else if (update.callback_query) await handleCallbackQuery(update.callback_query);
       } catch (e) {
         console.error('[bridge] error handling update:', e);
       }
+      // Persist per-update, not once per batch: if the process dies partway
+      // through a batch, only the update actually in flight gets redelivered
+      // and reprocessed on restart, not everything already handled before it.
+      offset = update.update_id + 1;
+      store.setOffset(offset);
     }
-    if (updates.length) store.setOffset(offset);
   }
 }
 
