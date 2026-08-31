@@ -3,3 +3,4 @@ data/*.json
 !data/.gitkeep
 .env
 *.log
+data/*.lock

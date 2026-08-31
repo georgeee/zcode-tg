@@ -9,6 +9,7 @@
 
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { StringDecoder } from 'node:string_decoder';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 
@@ -22,6 +23,19 @@ export class ZcodeClient extends EventEmitter {
     this._nextId = 1;
     this._pending = new Map(); // id -> {resolve, reject, timer}
     this._buf = '';
+    // Buffer#toString('utf8') is stateless per call: if a multi-byte UTF-8
+    // character straddles two stdout reads (routine here -- large
+    // responses like session/send/session/subscribe already split
+    // unpredictably across 'data' events, which is exactly the condition
+    // needed for this), decoding each chunk independently replaces the
+    // split character with U+FFFD instead of holding the trailing partial
+    // bytes back to combine with the next chunk. StringDecoder is stateful
+    // across calls and handles this correctly. JSON syntax itself can't be
+    // corrupted this way (its delimiters are single-byte ASCII) so this
+    // silently corrupted only *string content* -- e.g. CJK text or emoji in
+    // the model's own replies, posted straight to Telegram with no error
+    // logged anywhere.
+    this._decoder = new StringDecoder('utf8');
     this._serverRequestHandlers = new Map(); // method -> async (params, rawMsg) => resultObject
     this.proc = null;
   }
@@ -88,7 +102,7 @@ export class ZcodeClient extends EventEmitter {
     // one read (this bit us hard during development -- session/send and
     // session/subscribe responses are large enough to split, session/create
     // usually isn't, which made the bug look method-specific at first).
-    this._buf += chunk.toString('utf8');
+    this._buf += this._decoder.write(chunk);
     let idx;
     while ((idx = this._buf.indexOf('\n')) >= 0) {
       const line = this._buf.slice(0, idx);

@@ -105,6 +105,25 @@ look for `State=lingering`) so the service survives logout/reboot without
 an active session; enabling it if it's not already on needs root
 (`loginctl enable-linger <user>`).
 
+The shipped unit only enables prctl/seccomp-based hardening
+(`NoNewPrivileges`, `RestrictSUIDSGID`, `RestrictRealtime`). The
+mount-namespace-based directives (`PrivateTmp`, `ProtectClock`,
+`ProtectHostname`, `ProtectKernelLogs`, `ProtectKernelModules`,
+`ProtectKernelTunables`, `ProtectControlGroups`) were tried and removed:
+under `systemctl --user` on this host they fail the whole service with
+`status=218/CAPABILITIES` — creating those namespaces needs privileges an
+unprivileged user session manager doesn't have here. Confirmed empirically;
+don't re-add without testing on the target host first.
+
+Only one instance may run against a given store path at a time — `store.js`
+takes an exclusive lock file (`data/sessions.json.lock`) at startup and
+fails fast with a clear error if another process already holds it (stale
+locks from a killed process are detected and reclaimed automatically). This
+matters because the natural way to test a change (`node bridge/index.js` in
+the foreground) targets the exact same default store path as the systemd
+service — without the lock, two processes would silently clobber each
+other's topic/session mappings and Telegram update offset.
+
 Logs: `data/bridge.log` (also picked up by `journalctl --user -u
 zcode-bridge`).
 
@@ -127,14 +146,41 @@ no sandbox. The only gate is the `chat_id` + `user_id` allowlist in
 `.env` — anyone who can author a message as that Telegram user has the same
 authority zcode itself has on this box.
 
+**The bridge (and the zcode subprocess it spawns) runs as whatever OS
+account starts it — currently the same low-privilege "executor" account
+that runs ordinary shell commands on this machine, not a dedicated account
+of its own.** `~/.zcode/cli/config.json` (the Z.ai API key) and
+`~/.config/zcode-mobile-bridge/.env` (the Telegram bot token) are therefore
+both readable by that account. Relocating `.env` out of the workspace (see
+above) closes the specific *in-band* leak path (an agent session reading
+its own bridge's secrets during ordinary work); it does **not** provide
+account-level isolation from anything else already running as that same
+account on the host. A dedicated OS account with its own `$HOME` (and its
+own `systemctl --user` instance, which needs root to enable lingering for a
+new account) would close that gap properly; this hasn't been done because
+it needs root access this bridge's own deployment doesn't have. Worth
+doing if that's available.
+
+## Turn lifecycle from Telegram
+
+- **`/stop` or `/cancel`** in a topic with a turn in progress calls
+  `session/stop` and clears the busy state immediately, instead of waiting
+  for it to finish or time out.
+- **A turn that never emits completion** (dropped event, an upstream hang
+  that doesn't crash the app-server process outright) is force-cleared by a
+  background sweep after `TURN_TIMEOUT_MS` (default 20 minutes) — without
+  this, a single missed event would wedge that topic on the busy
+  placeholder for the rest of the process's life.
+
 ## Known scope limits (intentional, not oversights)
 
 - **No file upload/download.** Telegram messages without `text` (photos,
   documents, stickers, voice) are ignored. Not needed for the current use
   case.
-- **One turn at a time per topic.** A message sent while a topic's session
-  is still processing the previous one gets a "still working" reply instead
-  of being queued or interleaved.
+- **One turn at a time per topic**, no queueing — a message sent while a
+  topic's session is still processing the previous one gets a "still
+  working" reply (or use `/stop` to cancel first) rather than being queued
+  or interleaved.
 - **No Goal Mode, subagents, MCP management, or model/mode switching
   commands from Telegram** — the zcode Protocol exposes RPCs for all of
   these (`session/goal`, `session/subagents`, `session/setMode`,
@@ -146,3 +192,28 @@ authority zcode itself has on this box.
   re-subscribes fresh rather than tracking `eventSeq` to request a precise
   replay window — a turn that was in flight exactly when the process died
   may not have its tail end delivered on restart.
+
+## Known issue: resumed sessions can still fail to send
+
+Every bridge restart spawns a brand-new `zcode app-server` process (there's
+no reconnection to a lingering daemon), so a topic used before the restart
+calls `session/resume` to reload its session before doing anything else —
+without this, that topic would be **permanently** broken after every
+restart (confirmed: `session/subscribe`/`session/send` reject with `-32004
+Session is not active` on a session the fresh process has never heard of,
+forever, since the store keeps returning the same dead id). `session/resume`
+fixes that for topics with real prior activity.
+
+However: a resumed session can still report `session/resume` as successful
+and then reject `session/send` with a zcode-internal error to the effect of
+"the historical task's model is no longer available" — its model adapter
+stays deferred/unmaterialized. Confirmed by direct testing that none of
+`session/setModel`, switching models away and back, or passing `workspace`
+on the `resume` call itself unstick it; this looks like a genuine zcode
+limitation, not something wrong on the bridge's side, but it wasn't fully
+reverse-engineered. The bridge's fallback: if `session/send` fails on a
+resumed session, it automatically retries **once** with a brand-new session
+(conversation history for that topic is lost, but the topic keeps working
+instead of staying dead). You'll see this as a topic's next reply after a
+restart occasionally starting a fresh conversation rather than continuing
+the old one.

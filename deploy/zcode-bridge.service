@@ -12,5 +12,28 @@ RestartSec=3
 StandardOutput=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
 StandardError=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
 
+# Kernel/process-level hardening -- deliberately NOT ProtectHome or
+# ProtectSystem=strict (zcode needs unrestricted read/write access to
+# ZCODE_WORKSPACE_DIR by design -- that's its whole job), NOT
+# RestrictNamespaces or LockPersonality (would break legitimate,
+# in-scope agent work like container-based dev/test or gdb debugging,
+# which run as descendants of this same unit), and NOT
+# MemoryDenyWriteExecute (has a history of friction with V8/Node JIT on
+# some kernel+systemd combinations -- needs isolated testing against this
+# exact Node build before adopting, not blanket-enabled).
+#
+# The mount-namespace-based directives (PrivateTmp, ProtectClock,
+# ProtectHostname, ProtectKernelLogs, ProtectKernelModules,
+# ProtectKernelTunables, ProtectControlGroups) were tried and REMOVED:
+# under `systemctl --user` on this host they fail the whole service with
+# exit status 218/CAPABILITIES -- creating those namespaces needs
+# privileges this unprivileged user session manager doesn't have.
+# Confirmed empirically, not assumed; don't re-add without testing.
+# What's left is prctl/seccomp-based, not namespace-based, and does start
+# cleanly under --user here.
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+
 [Install]
 WantedBy=default.target
