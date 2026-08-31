@@ -71,8 +71,18 @@ shape in the schema) — it's nested one level deeper, under `.options`.
 
 ### 3. Configure and run
 
+Config lives at `~/.config/zcode-mobile-bridge/.env`, **not** `.env` in this
+repo. That's deliberate: this repo *is* the workspace the zcode agent
+itself operates in (topics are used to work on this very bridge), and a
+secret sitting in the workspace root can get read and echoed back into
+Telegram by completely ordinary "look at your own code" work under
+auto-approve — no adversarial intent required. Override the path with
+`ZCODE_MOBILE_ENV=/some/other/path` if you'd rather put it elsewhere.
+
 ```
-cp .env.example .env   # fill in the values above
+mkdir -p ~/.config/zcode-mobile-bridge
+cp .env.example ~/.config/zcode-mobile-bridge/.env   # fill in the values above
+chmod 600 ~/.config/zcode-mobile-bridge/.env
 npm install             # only real deps: none at runtime beyond Node itself
 node bridge/index.js    # foreground, for testing
 ```

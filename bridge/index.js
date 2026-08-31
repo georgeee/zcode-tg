@@ -21,7 +21,12 @@ import { ZcodeClient } from './zcodeClient.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
 
-loadEnv(new URL('../.env', import.meta.url).pathname);
+// Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
+// a session running in this same directory could read that file as part of
+// completely ordinary "look at your own code" work and echo the bot token
+// back into Telegram, no adversarial intent required. Kept outside the
+// workspace instead. ZCODE_MOBILE_ENV overrides for other deployments.
+loadEnv(process.env.ZCODE_MOBILE_ENV || `${process.env.HOME}/.config/zcode-mobile-bridge/.env`);
 
 const cfg = {
   telegramToken: need('TELEGRAM_BOT_TOKEN'),
