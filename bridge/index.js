@@ -72,6 +72,22 @@ const activeTurns = new Map(); // sessionId -> { placeholderMessageId, textBuffe
 const pendingPermissions = new Map(); // requestId -> { resolve, tokenMap: Map(token->response), chatId, threadId }
 const tokenToRequestId = new Map(); // callback_data token -> requestId
 
+// interaction/requestUserInput (the model's "AskUserQuestion" tool, asking a
+// mid-turn clarifying question) needs an explicit handler, unlike most
+// other server-initiated requests: the runtime's default client-request
+// path only has a graceful fallback (-> decision:"deny") for a *valid*
+// decline reply matching {action:"accept"|"decline"|"cancel"}. Leaving it
+// to the bridge's blanket "unregistered method -> JSON-RPC error" default
+// makes the runtime's own request-response race (cbt/raceClientRequestWithV4Interaction
+// in the vendored source) rethrow that error instead of catching it, which
+// most likely fails the tool call outright rather than politely declining
+// to answer. No Telegram round-trip here since there's no reasonable way
+// for an unattended bridge to actually answer a free-form question.
+zcode.onServerRequest('interaction/requestUserInput', async () => ({
+  action: 'decline',
+  reason: 'auto-declined: unattended bridge session, no user available to answer',
+}));
+
 // --- permission relay: server asks, we answer (auto-approve by default) ---
 zcode.onServerRequest('interaction/requestPermission', async (params) => {
   const topic = sessionToTopic.get(params.sessionId);
