@@ -134,10 +134,15 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
     replyMarkup: TG.inlineKeyboard(buttons),
   });
 
+  // Persisted so a request still awaiting a button press when the process
+  // dies isn't left as an orphaned message with dead-but-still-clickable
+  // buttons forever -- swept and cleaned up on the next startup, below.
+  store.addPendingPermission(params.requestId, { chatId: cfg.chatId, messageId: msg.message_id, threadId: topic.threadId });
+
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       const denyOpt = params.options.find((o) => o.response?.decision === 'deny');
-      finishPermission(params.requestId, denyOpt?.response ?? { decision: 'deny', reason: 'auto-denied: no response within timeout' }, '⏱ auto-denied (no response in time)');
+      finishPermission(params.requestId, denyOpt?.response ?? { decision: 'deny', reason: 'auto-denied: no response within timeout' }, '⏱ Expired — auto-denied (no response in time).');
     }, cfg.permissionTimeoutMs);
 
     pendingPermissions.set(params.requestId, {
@@ -156,10 +161,34 @@ function finishPermission(requestId, response, resultLabel) {
   clearTimeout(pending.timer);
   pendingPermissions.delete(requestId);
   for (const token of pending.tokenMap.keys()) tokenToRequestId.delete(token);
+  store.removePendingPermission(requestId);
   pending.resolve(response);
-  tg.editMessageText({ chatId: pending.chatId, messageId: pending.messageId, text: resultLabel }).catch((e) =>
+  // Explicitly clearing reply_markup matters: Telegram's editMessageText
+  // only touches the keyboard if you pass one -- omitting it (the previous
+  // bug here) leaves the old buttons live and clickable indefinitely, even
+  // after the request has already been resolved or has timed out.
+  tg.editMessageText({ chatId: pending.chatId, messageId: pending.messageId, text: resultLabel, replyMarkup: { inline_keyboard: [] } }).catch((e) =>
     console.error('[bridge] failed to edit permission message:', e.message),
   );
+}
+
+// Sweep permission requests left dangling by a previous process instance
+// (in-memory `pendingPermissions` above resets on every restart, but this
+// disk-backed record survives it) -- clear their buttons and mark them
+// expired rather than leaving them clickable forever with nothing listening
+// on the other end anymore.
+async function cleanupOrphanedPermissionRequests() {
+  const orphans = store.getAllPendingPermissions();
+  const requestIds = Object.keys(orphans);
+  if (!requestIds.length) return;
+  console.log(`[bridge] cleaning up ${requestIds.length} permission request(s) orphaned by a previous restart`);
+  for (const requestId of requestIds) {
+    const { chatId, messageId } = orphans[requestId];
+    await tg
+      .editMessageText({ chatId, messageId, text: '⚠️ Expired — bridge restarted before this was answered.', replyMarkup: { inline_keyboard: [] } })
+      .catch((e) => console.error(`[bridge] failed to clean up orphaned permission request ${requestId}:`, e.message));
+    store.removePendingPermission(requestId);
+  }
 }
 
 function pickAutoApproveOption(options) {
@@ -335,6 +364,17 @@ async function handleCallbackQuery(cq) {
   const requestId = tokenToRequestId.get(token);
   const pending = requestId && pendingPermissions.get(requestId);
   if (!pending) {
+    // Not tracked (already resolved, timed out, or -- for anything sent
+    // before the orphan-cleanup/reply_markup fixes existed -- simply never
+    // tracked at all). Either way, Telegram hands us the original message on
+    // every callback_query regardless of our own state, so we can still
+    // clear its now-meaningless buttons right here rather than leave them
+    // clickable forever.
+    if (cq.message) {
+      await tg
+        .editMessageText({ chatId: cq.message.chat.id, messageId: cq.message.message_id, text: '⚠️ Expired.', replyMarkup: { inline_keyboard: [] } })
+        .catch(() => {}); // best-effort; e.g. text may already be identical if two clicks race
+    }
     await tg.answerCallbackQuery({ callbackQueryId: cq.id, text: 'This request already expired.' });
     return;
   }
@@ -347,6 +387,7 @@ async function handleCallbackQuery(cq) {
 // --- main poll loop ---
 async function main() {
   console.log(`[bridge] starting. chat=${cfg.chatId} workspace=${cfg.workspaceDir} model=${cfg.defaultModel}`);
+  await cleanupOrphanedPermissionRequests();
   let offset = store.getOffset();
   for (;;) {
     let updates;

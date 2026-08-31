@@ -5,7 +5,7 @@
 
 import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
 
-const EMPTY = { updateOffset: undefined, topics: {} };
+const EMPTY = { updateOffset: undefined, topics: {}, pendingPermissions: {} };
 
 export class Store {
   constructor(path) {
@@ -35,5 +35,25 @@ export class Store {
   setTopic(threadId, entry) {
     this.data.topics[threadId] = { ...this.data.topics[threadId], ...entry };
     this._save();
+  }
+
+  // Tracked so an interactive permission prompt (AUTO_APPROVE_PERMISSIONS=false)
+  // that's still awaiting a button press when the process dies isn't left
+  // as an orphaned message with dead-but-still-clickable buttons forever --
+  // on the next startup we can find it and clean it up (see index.js).
+  addPendingPermission(requestId, entry) {
+    if (!this.data.pendingPermissions) this.data.pendingPermissions = {};
+    this.data.pendingPermissions[requestId] = entry;
+    this._save();
+  }
+
+  removePendingPermission(requestId) {
+    if (!this.data.pendingPermissions) return;
+    delete this.data.pendingPermissions[requestId];
+    this._save();
+  }
+
+  getAllPendingPermissions() {
+    return this.data.pendingPermissions || {};
   }
 }
