@@ -147,16 +147,43 @@ zcode.on('parseError', ({ line, error }) => console.error('[bridge] unparseable 
 // every topic.
 process.on('unhandledRejection', (err) => console.error('[bridge] unhandled rejection:', err));
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-function shutdown(signal) {
-  // Under systemd this is redundant with the default KillMode=control-group
-  // (which already reaps the whole cgroup including the app-server child on
-  // stop/restart). It matters for the foreground/dev-loop path README.md
-  // documents (`node bridge/index.js`, stopped by something other than a
-  // same-terminal Ctrl+C) where nothing else guarantees the child doesn't
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+async function shutdown(signal) {
+  // Found the hard way (2026-09-01): a redeploy -- the common case this
+  // fires for -- kills the app-server child a moment after this runs, and
+  // with it whatever turn was streaming into a topic's placeholder. Nothing
+  // was left to ever edit that message again: the watchdog is off by
+  // default, and even armed, no sweep runs between now and process death.
+  // The placeholder just sits there forever showing a stale "💭 · 117s" --
+  // exactly the "task performed well but didn't report" failure mode all
+  // over again, just triggered by an intentional restart instead of a
+  // timeout. Notify every in-flight turn before killing anything.
+  //
+  // Killing the app-server process (below) is a strictly stronger stop than
+  // the session/stop RPC (confirmed elsewhere in this file not to reliably
+  // interrupt an in-flight tool-call loop) -- once the process is gone,
+  // nothing is running -- so there's no need to also call session/stop here.
+  //
+  // Bounded wait so a slow Telegram call can't hang a redeploy indefinitely;
+  // under systemd this whole handler is also redundant-but-harmless with the
+  // default KillMode=control-group (which reaps the app-server child
+  // regardless), and matters most for the foreground/dev-loop path
+  // README.md documents, where nothing else guarantees the child doesn't
   // outlive us as an orphaned, still-authenticated zcode process.
-  console.log(`[bridge] received ${signal}, stopping zcode app-server and exiting`);
+  console.log(`[bridge] received ${signal}, notifying ${activeTurns.size} in-flight turn(s) and stopping zcode app-server`);
+  const notifications = [...activeTurns.values()].map((turn) => {
+    turn.streamer?.stop();
+    if (!turn.placeholderMessageId) return Promise.resolve();
+    return tg
+      .editMessageText({
+        chatId: cfg.chatId,
+        messageId: turn.placeholderMessageId,
+        text: "⚠️ Bridge is restarting (deploying an update) — this turn was interrupted. Send your message again once it's back (usually a few seconds).",
+      })
+      .catch((e) => console.error('[bridge] failed to notify an in-flight turn of shutdown:', e.message));
+  });
+  await Promise.race([Promise.allSettled(notifications), sleep(8000)]);
   zcode.stop();
   process.exit(0);
 }
