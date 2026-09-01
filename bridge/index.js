@@ -55,7 +55,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { loadEnv } from './env.js';
+import { loadEnv, resolveEnvPath } from './env.js';
 import { ZcodeClient } from './zcodeClient.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
@@ -67,8 +67,9 @@ import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentag
 // a session running in this same directory could read that file as part of
 // completely ordinary "look at your own code" work and echo the bot token
 // back into Telegram, no adversarial intent required. Kept outside the
-// workspace instead. ZCODE_MOBILE_ENV overrides for other deployments.
-loadEnv(process.env.ZCODE_MOBILE_ENV || `${process.env.HOME}/.config/zcode-mobile-bridge/.env`);
+// workspace instead -- see resolveEnvPath (env.js) for the search order and
+// the pre-rename compatibility fallback.
+loadEnv(resolveEnvPath({ override: process.env.ZCODE_TG_ENV || process.env.ZCODE_MOBILE_ENV }));
 
 const cfg = {
   telegramToken: need('TELEGRAM_BOT_TOKEN'),

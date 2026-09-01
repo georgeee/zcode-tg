@@ -19,6 +19,15 @@ topic, get a reply; each topic keeps its own independent conversation.
   status line with plan-usage percentages, and graceful redeploys** that
   let in-flight turns finish instead of cutting them off.
 
+## Status & disclaimer
+
+Unofficial, community software. **Not affiliated with, endorsed by, or
+supported by Z.ai** — "zcode" and Z.ai product names belong to their
+respective owners. This project talks to `zcode app-server`, an interface
+that is undocumented upstream; the findings in this repo were established
+by observation and may break with any upstream release. Use of the Z.ai
+API is governed by your own account's terms.
+
 ## Why this exists / how it works
 
 `zcode`'s official product is a GUI desktop app; there is no official
@@ -81,18 +90,21 @@ shape in the schema) — it's nested one level deeper, under `.options`.
 
 ### 3. Configure and run
 
-Config lives at `~/.config/zcode-mobile-bridge/.env`, **not** `.env` in this
+Config lives at `~/.config/zcode-tg/.env`, **not** `.env` in this
 repo. That's deliberate: this repo *is* the workspace the zcode agent
 itself operates in (topics are used to work on this very bridge), and a
 secret sitting in the workspace root can get read and echoed back into
 Telegram by completely ordinary "look at your own code" work under
 auto-approve — no adversarial intent required. Override the path with
-`ZCODE_MOBILE_ENV=/some/other/path` if you'd rather put it elsewhere.
+`ZCODE_TG_ENV=/some/other/path` if you'd rather put it elsewhere
+(`ZCODE_MOBILE_ENV` from before the repo rename still works, as does a
+config file at the old `~/.config/zcode-mobile-bridge/` path if that's
+what's already on your machine).
 
 ```
-mkdir -p ~/.config/zcode-mobile-bridge
-cp .env.example ~/.config/zcode-mobile-bridge/.env   # fill in the values above
-chmod 600 ~/.config/zcode-mobile-bridge/.env
+mkdir -p ~/.config/zcode-tg
+cp .env.example ~/.config/zcode-tg/.env   # fill in the values above
+chmod 600 ~/.config/zcode-tg/.env
 npm install             # only real deps: none at runtime beyond Node itself
 node bridge/index.js    # foreground, for testing
 ```
@@ -158,7 +170,7 @@ authority zcode itself has on this box.
 
 **The bridge (and the zcode subprocess it spawns) runs as whatever OS
 account starts it — pick that account deliberately.** `~/.zcode/cli/config.json`
-(the Z.ai API key) and `~/.config/zcode-mobile-bridge/.env` (the Telegram
+(the Z.ai API key) and the bridge's `.env` (the Telegram
 bot token) are both readable by that account, as is everything else it can
 reach. Relocating `.env` out of the workspace (see above) closes the
 specific *in-band* leak path (an agent session reading its own bridge's
