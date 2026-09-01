@@ -1,10 +1,12 @@
 {
-  "name": "zcode-mobile-bridge",
+  "name": "zcode-tg",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Telegram bridge for zcode app-server: one forum topic = one zcode session.",
-  "engines": { "node": ">=22.19.0" },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
     "start": "node bridge/index.js"
   }

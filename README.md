@@ -1,13 +1,23 @@
-# zcode-mobile
+# zcode-tg
 
 A Telegram bridge for [zcode](https://zcode.z.ai) (Z.ai's GLM coding agent):
 **one Telegram forum topic == one zcode session.** Send a message in a
 topic, get a reply; each topic keeps its own independent conversation.
 
-Long-term goal is a native Android chat client talking to `zcode app-server`
-directly over WebSocket/TLS. This bridge is the minimal version of that same
-idea, using Telegram as the UI so there's something usable immediately with
-no app to build or install.
+- **Streaming replies** — the answer is edited into one placeholder message
+  as it's generated, with a `⌛` status line (elapsed time, current tool)
+  while the turn runs, and a usage footer (`⏱ duration · tokens · tool
+  calls`) on completion.
+- **Questions actually round-trip** — the agent's AskUserQuestion prompts
+  appear as inline buttons and are answered from Telegram.
+- **Files both ways** — send a document to the topic and the agent reads it
+  (saved under `inbox/`); the agent can attach workspace files to replies,
+  and `/file <path>` pulls one on demand.
+- **Per-topic model & mode** — `/model`, `/mode` list and switch, persisted
+  per topic.
+- **Queueing, background-task notices, reply-to-quote, a pinned topic
+  status line with plan-usage percentages, and graceful redeploys** that
+  let in-flight turns finish instead of cutting them off.
 
 ## Why this exists / how it works
 
@@ -42,12 +52,12 @@ bridge/store.js (data/sessions.json: topic -> session, update offset)
 
 ### 1. zcode runtime
 
-There's no npm-published build with a working `npm install` in this
-environment (arborist bug against the vendor tree — see git history /
-ask if this changed), so the runtime was fetched and prepared by hand from
-the `zcode-app-cli` npm tarball. `ZCODE_BIN` in `.env` points at
-`bin/zcode.js` inside that extracted package; `ZCODE_NODE_BIN` points at a
-plain Node 22.19+ (no other toolchain needed).
+There's no npm-published build with a working `npm install` at the time of
+writing (arborist bug against the vendor tree), so the runtime has to be
+fetched and prepared by hand from the `zcode-app-cli` npm tarball.
+`ZCODE_BIN` in `.env` points at `bin/zcode.js` inside that extracted
+package; `ZCODE_NODE_BIN` points at a plain Node 22.19+ (no other toolchain
+needed).
 
 Login is **not** re-derivable from this repo — it's a stateful one-time
 step against zcode's own TUI (`/login zai-coding-plan-api-key <key>`, since
@@ -110,10 +120,10 @@ The shipped unit only enables prctl/seccomp-based hardening
 mount-namespace-based directives (`PrivateTmp`, `ProtectClock`,
 `ProtectHostname`, `ProtectKernelLogs`, `ProtectKernelModules`,
 `ProtectKernelTunables`, `ProtectControlGroups`) were tried and removed:
-under `systemctl --user` on this host they fail the whole service with
-`status=218/CAPABILITIES` — creating those namespaces needs privileges an
-unprivileged user session manager doesn't have here. Confirmed empirically;
-don't re-add without testing on the target host first.
+under an unprivileged `systemctl --user` manager they can fail the whole
+service with `status=218/CAPABILITIES` — creating those namespaces needs
+privileges a user session manager may not have. Confirmed empirically on at
+least one host; don't re-add without testing on the target host first.
 
 Only one instance may run against a given store path at a time — `store.js`
 takes an exclusive lock file (`data/sessions.json.lock`) at startup and
@@ -147,19 +157,16 @@ no sandbox. The only gate is the `chat_id` + `user_id` allowlist in
 authority zcode itself has on this box.
 
 **The bridge (and the zcode subprocess it spawns) runs as whatever OS
-account starts it — currently the same low-privilege "executor" account
-that runs ordinary shell commands on this machine, not a dedicated account
-of its own.** `~/.zcode/cli/config.json` (the Z.ai API key) and
-`~/.config/zcode-mobile-bridge/.env` (the Telegram bot token) are therefore
-both readable by that account. Relocating `.env` out of the workspace (see
-above) closes the specific *in-band* leak path (an agent session reading
-its own bridge's secrets during ordinary work); it does **not** provide
-account-level isolation from anything else already running as that same
-account on the host. A dedicated OS account with its own `$HOME` (and its
-own `systemctl --user` instance, which needs root to enable lingering for a
-new account) would close that gap properly; this hasn't been done because
-it needs root access this bridge's own deployment doesn't have. Worth
-doing if that's available.
+account starts it — pick that account deliberately.** `~/.zcode/cli/config.json`
+(the Z.ai API key) and `~/.config/zcode-mobile-bridge/.env` (the Telegram
+bot token) are both readable by that account, as is everything else it can
+reach. Relocating `.env` out of the workspace (see above) closes the
+specific *in-band* leak path (an agent session reading its own bridge's
+secrets during ordinary work); it does **not** provide account-level
+isolation from anything else running as that same account. For real
+isolation, give the bridge a dedicated OS account with its own `$HOME`
+(and its own `systemctl --user` instance; enabling lingering for a new
+account needs root).
 
 ## Commands & turn lifecycle from Telegram
 
@@ -206,8 +213,8 @@ through to the model as ordinary input):
   questions are single-pick — a Telegram-buttons limitation). No answer
   within `USER_INPUT_TIMEOUT_MS` (default 10 min) → auto-declined so the
   turn keeps moving.
-- **Each topic gets a status message** — one compact line in the owner's
-  specified format: `📌 idle · no queued · 11% session / 5% week` (one-word
+- **Each topic gets a status message** — one compact line:
+  `📌 idle · no queued · 11% session / 5% week` (one-word
   state, queue depth as `N queued`/`no queued`, Z.ai plan usage as
   percentages only: short-term "session" window and weekly window). Created
   at topic creation (the topic's first message, so it never occupies
@@ -244,9 +251,9 @@ through to the model as ordinary input):
 - **`/stop` or `/cancel`** in a topic with a turn in progress calls
   `session/stop` and clears the busy state immediately, instead of waiting
   for it to finish — then the next queued message (if any) runs.
-- **The turn-timeout watchdog is off by default** (`TURN_TIMEOUT_MS=0`,
-  owner decision 2026-09-01: the old 20-minute default killed real,
-  merely-slow turns — turns here regularly run longer). `/stop` is the
+- **The turn-timeout watchdog is off by default** (`TURN_TIMEOUT_MS=0` —
+  the old 20-minute default killed real, merely-slow turns, and long turns
+  are normal for agentic work). `/stop` is the
   designated escape hatch for a wedged topic. Setting `TURN_TIMEOUT_MS`
   re-arms the automatic sweep (which stops the turn server-side first, so a
   timeout behaves like `/stop`).
@@ -324,7 +331,7 @@ of zero-downtime that IS available in a single process:
 1. Immediately stop admitting new work — messages arriving during a drain
    get an instant "queued, deploying" notice instead of starting a turn, so
    the bridge stays visibly responsive the whole time (no radio silence).
-2. Wait, bounded by `SHUTDOWN_DRAIN_MS` (default 25 min — turns here
+2. Wait, bounded by `SHUTDOWN_DRAIN_MS` (default 25 min — agentic turns
    regularly run 10–30+ minutes, see the watchdog note above), for every
    turn already in flight to finish **naturally** through the ordinary
    delivery path. A turn that finishes during this window is delivered

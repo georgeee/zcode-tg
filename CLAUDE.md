@@ -1,10 +1,11 @@
-# zcode-mobile
+# zcode-tg
 
 A Telegram bridge for zcode (Z.ai's GLM coding agent): one Telegram forum
 topic == one zcode session. Read `README.md` first — architecture, setup,
-safety model, and the "Known scope limits" / "Known issue" sections are the
-canonical reference. This file is the short version for an agent picking up
-work here, plus operational facts README doesn't need to restate.
+safety model, and the "Known scope limits" / "Restart continuity" /
+"Redeploying" sections are the canonical reference. This file is the short
+version for an agent picking up work here, plus operational facts README
+doesn't need to restate.
 
 ## What you're looking at
 
@@ -19,48 +20,52 @@ check there and in `README.md` first.
 
 `bridge/streamer.js` owns the throttled streaming edits of a turn's
 placeholder (one edit per `STREAM_EDIT_INTERVAL_MS`, ⌛-prefixed while
-running). `test/e2e.mjs` runs the whole bridge against a local fake
-Telegram (`TELEGRAM_API_ROOT` seam) and a real scratch app-server — it makes
-real (small) model calls, so don't run it against the live bot token or
-while the account is near its rate limit.
+running). `test/e2e.mjs` and `test/e2e-file.mjs` run the whole bridge
+against a local fake Telegram (`TELEGRAM_API_ROOT` seam) and a real scratch
+app-server — they make real (small) model calls, so don't run them against
+the live bot token or while the account is near its rate limit. The pure
+modules (`format.js`, `usage.js`, `streamer.js`) have fast unit tests:
+`node --test test/format.test.js test/usage.test.js test/streamer.test.js`.
 
-## This repo IS the zcode agent's own workspace
+## The workspace is (or mirrors) the agent's own working directory
 
-`ZCODE_WORKSPACE_DIR` (in the bridge's config) points at this repo's root.
-Any topic's zcode session can read and edit files here — including this
-file. That's intentional (the `zcode-mobile` topic is used to work on this
-very bridge), but it means:
+`ZCODE_WORKSPACE_DIR` (in the bridge's config) points at this repo's root —
+topics are used to work on this very bridge, which is intentional. It means:
 
 - **Never put secrets in this repo.** Config lives at
-  `~/.config/zcode-mobile-bridge/.env` on the host running the bridge, well
-  outside this directory, specifically so an ordinary "look at your own
-  code" prompt can't read and echo a live token back into Telegram.
-- Sessions run in **yolo / auto-approve mode by default** — a message in an
+  `~/.config/zcode-mobile-bridge/.env` (historical name; override with
+  `ZCODE_MOBILE_ENV`) on the host running the bridge, outside the
+  workspace, specifically so an ordinary "look at your own code" prompt
+  can't read and echo a live token back into Telegram.
+- Sessions typically run in **yolo / auto-approve mode** — a message in an
   authorized topic can run arbitrary shell commands and file edits with no
   human approval step. See README's "Permissions / safety model" before
   changing that default.
+- `/file` and the model's `[file: …]` markers are restricted to the
+  workspace subtree for the same reason.
 
-## Where this actually runs (as of 2026-08-31)
+## Running & operations
 
-- Host: this same machine, `systemd --user` service `zcode-bridge.service`
-  (unit file: `deploy/zcode-bridge.service`), `Restart=always`, enabled for
-  boot. `systemctl --user` commands need `XDG_RUNTIME_DIR=/run/user/<uid>`
-  set if not already present in the shell.
-- Logs: `data/bridge.log`.
-- Session store: `data/sessions.json` (topic↔session map + Telegram update
-  offset), guarded by an exclusive lock file (`data/sessions.json.lock`) —
-  **don't run a second `node bridge/index.js` against the same store while
-  the service is up; it will fail fast with a clear "another instance
-  already has this open" error rather than corrupt the store.** That's the
-  point of the lock, not a bug.
-- zcode login (the Z.ai credential) is a *host-level* one-time setup, not
+- The bridge runs as a `systemctl --user` unit; `deploy/zcode-bridge.service`
+  is the template — the live copy lives in `~/.config/systemd/user/` and is
+  what systemd actually reads (repo changes to the unit must be copied there
+  + `daemon-reload`d to take effect). `systemctl --user` needs
+  `XDG_RUNTIME_DIR=/run/user/<uid>` if your shell doesn't set it.
+- Logs: `data/bridge.log`. Session store: `data/sessions.json`, guarded by
+  an exclusive lock file — **don't run a second `node bridge/index.js`
+  against the same store while the service is up**; it fails fast with a
+  clear error rather than corrupt the store. That's the point of the lock.
+- Redeploys drain in-flight turns instead of interrupting them (README,
+  "Redeploying") — but prefer fixing forward to restarting when both are
+  options.
+- zcode login (the Z.ai credential) is a host-level one-time setup, not
   something this repo can re-derive — see README §1 if it's ever missing.
 
 ## Conventions for changes here
 
-- `node -c bridge/*.js` (syntax check) before restarting the service — this
-  is a live bridge with real users on the other end of Telegram, not a repo
-  with a test suite.
+- `node --check bridge/*.js` (syntax check) before restarting the service —
+  this is a live bridge with real users on the other end of Telegram, not a
+  repo with a test suite for index.js.
 - After editing, redeploy with:
   ```
   systemctl --user restart zcode-bridge.service   # (XDG_RUNTIME_DIR set)

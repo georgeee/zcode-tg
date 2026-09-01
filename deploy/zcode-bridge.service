@@ -1,3 +1,14 @@
+# zcode-tg bridge — systemd --user unit TEMPLATE.
+#
+# The repo copy is not what systemd reads. To deploy: copy this file to
+# ~/.config/systemd/user/zcode-bridge.service, adjust the three paths below
+# (WorkingDirectory, ExecStart's node, and the log paths) to your checkout
+# and Node binary, then:
+#   systemctl --user daemon-reload && systemctl --user enable --now zcode-bridge.service
+#
+# %h expands to the home directory of the user running the unit, so the
+# defaults below work for a checkout at ~/zcode-tg with node on PATH.
+
 [Unit]
 Description=zcode <-> Telegram bridge
 After=network-online.target
@@ -5,11 +16,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile
-ExecStart=/srv/agent-cage/etheron-bare/agent/etheron-bare/work/toolchain/node/bin/node bridge/index.js
+WorkingDirectory=%h/zcode-tg
+# /usr/bin/env because systemd requires an absolute path for the first
+# ExecStart token; swap for your node's absolute path if you don't want to
+# depend on PATH (e.g. a toolchain node in a nonstandard location).
+ExecStart=/usr/bin/env node bridge/index.js
 Restart=always
 RestartSec=3
-# bridge/index.js's shutdown() now drains in-flight turns for up to
+# bridge/index.js's shutdown() drains in-flight turns for up to
 # SHUTDOWN_DRAIN_MS (default 25 min, see .env.example) before it actually
 # exits on SIGTERM. systemd's own default TimeoutStopSec (~90s) would
 # SIGKILL it well before that window closes, cutting a turn off harder than
@@ -21,14 +35,12 @@ TimeoutStopSec=1800
 # control-group mode SIGTERMs every process in the cgroup simultaneously,
 # which kills the zcode app-server child (and with it the in-flight turn the
 # bridge is draining) at the same instant the bridge receives its own
-# SIGTERM -- observed live 2026-09-01 18:02: "draining 1 in-flight turn(s)"
-# followed immediately by "app-server exited unexpectedly (code=143)". With
-# mixed, only the main process gets SIGTERM; the child stays alive until the
-# bridge stops it itself after draining (zcode.stop()), and everything else
-# is SIGKILLed only if the 30-min TimeoutStopSec above elapses.
+# SIGTERM. With mixed, only the main process gets SIGTERM; the child stays
+# alive until the bridge stops it itself after draining, and everything else
+# is SIGKILLed only if the TimeoutStopSec above elapses.
 KillMode=mixed
-StandardOutput=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
-StandardError=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
+StandardOutput=append:%h/zcode-tg/data/bridge.log
+StandardError=append:%h/zcode-tg/data/bridge.log
 
 # Kernel/process-level hardening -- deliberately NOT ProtectHome or
 # ProtectSystem=strict (zcode needs unrestricted read/write access to
@@ -43,12 +55,12 @@ StandardError=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobil
 # The mount-namespace-based directives (PrivateTmp, ProtectClock,
 # ProtectHostname, ProtectKernelLogs, ProtectKernelModules,
 # ProtectKernelTunables, ProtectControlGroups) were tried and REMOVED:
-# under `systemctl --user` on this host they fail the whole service with
-# exit status 218/CAPABILITIES -- creating those namespaces needs
-# privileges this unprivileged user session manager doesn't have.
-# Confirmed empirically, not assumed; don't re-add without testing.
-# What's left is prctl/seccomp-based, not namespace-based, and does start
-# cleanly under --user here.
+# under an unprivileged `systemctl --user` manager they can fail the whole
+# service with exit status 218/CAPABILITIES -- creating those namespaces
+# needs privileges a user session manager may not have. Confirmed
+# empirically on at least one host; don't re-add without testing on the
+# target host first. What's left is prctl/seccomp-based, not
+# namespace-based, and does start cleanly under --user there.
 NoNewPrivileges=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
