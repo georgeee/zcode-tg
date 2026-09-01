@@ -77,23 +77,45 @@ const srv = createServer(async (req, res) => {
 await new Promise((r) => srv.listen(0, '127.0.0.1', r));
 const port = srv.address().port;
 
-const bridge = spawn(NODE, [path.join(REPO, 'bridge/index.js')], {
-  env: {
-    ...process.env,
-    TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
-    TELEGRAM_BOT_TOKEN: 'e2e-fake-token',
-    TELEGRAM_CHAT_ID: String(CHAT),
-    TELEGRAM_ALLOWED_USER_ID: String(USER),
-    ZCODE_NODE_BIN: NODE,
-    ZCODE_BIN: ZCODE_BIN,
-    ZCODE_WORKSPACE_DIR: WS,
-    ZCODE_DEFAULT_MODEL: 'zai/glm-5.3',
-    ZCODE_DEFAULT_MODE: 'yolo',
-    STORE_PATH: STORE,
-    HOME: process.env.HOME,
-  },
-  stdio: ['ignore', 'pipe', 'pipe'],
-});
+// E2E_BRIDGE_CMD: run an already-packaged bridge binary (e.g. the nix
+// wrapper) instead of node+index.js -- used to smoke-test the nix package
+// end-to-end, with the wrapper's OWN ZCODE_BIN/ZCODE_NODE_BIN defaults
+// exercising the packaged runtime (those env vars are deliberately NOT set
+// here in that mode).
+const bridgeCmd = process.env.E2E_BRIDGE_CMD;
+const bridge = bridgeCmd
+  ? spawn(bridgeCmd, [], {
+      env: {
+        ...process.env,
+        TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+        TELEGRAM_BOT_TOKEN: 'e2e-fake-token',
+        TELEGRAM_CHAT_ID: String(CHAT),
+        TELEGRAM_ALLOWED_USER_ID: String(USER),
+        ZCODE_WORKSPACE_DIR: WS,
+        ZCODE_DEFAULT_MODEL: 'zai/glm-5.3',
+        ZCODE_DEFAULT_MODE: 'yolo',
+        STORE_PATH: STORE,
+        HOME: process.env.HOME,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  : spawn(NODE, [path.join(REPO, 'bridge/index.js')], {
+      env: {
+        ...process.env,
+        TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+        TELEGRAM_BOT_TOKEN: 'e2e-fake-token',
+        TELEGRAM_CHAT_ID: String(CHAT),
+        TELEGRAM_ALLOWED_USER_ID: String(USER),
+        ZCODE_NODE_BIN: NODE,
+        ZCODE_BIN: ZCODE_BIN,
+        ZCODE_WORKSPACE_DIR: WS,
+        ZCODE_DEFAULT_MODEL: 'zai/glm-5.3',
+        ZCODE_DEFAULT_MODE: 'yolo',
+        STORE_PATH: STORE,
+        HOME: process.env.HOME,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 let bridgeLog = '';
 bridge.stdout.on('data', (c) => { bridgeLog += c; process.stdout.write(`[bridge] ${c}`); });
 bridge.stderr.on('data', (c) => { bridgeLog += c; process.stderr.write(`[bridge-err] ${c}`); });

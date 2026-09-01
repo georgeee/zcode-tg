@@ -22,11 +22,12 @@ stdenv.mkDerivation rec {
 
   src = fetchurl {
     url = "https://registry.npmjs.org/zcode-app-cli/-/zcode-app-cli-${version}.tgz";
-    hash = "sha256-37e90b514b1c4cfb9ae087426c0e7817dc9edd72e17b8f0384b59efc2e524c2e";
+    sha256 = "37e90b514b1c4cfb9ae087426c0e7817dc9edd72e17b8f0384b59efc2e524c2e";
   };
 
   nodejs = nodejs_22;
 
+  dontUnpack = true;
   dontConfigure = true;
   dontBuild = true;
 
@@ -35,7 +36,7 @@ stdenv.mkDerivation rec {
   installPhase = ''
     runHook preInstall
     mkdir -p $out/lib/zcode-app-cli
-    cp -r package/. $out/lib/zcode-app-cli/
+    tar -xzf $src -C $out/lib/zcode-app-cli --strip-components=1
     makeWrapper ${lib.getExe nodejs} $out/bin/zcode \
       --add-flags "$out/lib/zcode-app-cli/bin/zcode.js" \
       --set ZCODE_DISABLE_UPDATE_CHECK 1 \

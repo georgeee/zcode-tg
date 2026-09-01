@@ -21,7 +21,7 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    mkdir -p $out/lib/zcode-tg
+    mkdir -p $out/lib/zcode-tg $out/bin
     cp -r $src/bridge $out/lib/zcode-tg/bridge
     cp $src/package.json $out/lib/zcode-tg/package.json
     install -m 0755 ${./zcode-tg.in.sh} $out/bin/zcode-tg
