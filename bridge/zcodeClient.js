@@ -2,7 +2,7 @@
 // newline-delimited JSON on stdio. Not JSON-RPC 2.0 -- messages are plain
 // {id, method, params} / {id, result|error}, and the server also sends
 // *server-initiated* requests (id like "server-N") that the client must
-// answer. See README.md for how this was reverse-engineered.
+// answer. See README.md for how these behaviors were established.
 //
 // One instance = one long-lived `app-server` process, multiplexing many
 // sessions (one per Telegram topic).

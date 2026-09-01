@@ -11,9 +11,9 @@ doesn't need to restate.
 
 `bridge/index.js` spawns `zcode app-server` as a child process and speaks
 its **"ZCode Protocol"** over newline-delimited JSON on stdio — this is
-*not* JSON-RPC 2.0, and it is almost entirely undocumented upstream (not in
-zcode's public docs, only discoverable via `zcode --help` and by reading the
-vendored runtime bundle). `bridge/zcodeClient.js`'s comments carry the
+*not* JSON-RPC 2.0, and it is minimally documented upstream (`zcode
+--help`), with the rest knowable only by observing a running instance.
+`bridge/zcodeClient.js`'s comments carry the
 specific protocol gotchas that cost real debugging time to find — read them
 before touching that file. Don't re-derive protocol behavior from scratch;
 check there and in `README.md` first.
@@ -80,5 +80,5 @@ topics are used to work on this very bridge, which is intentional. It means:
 - Prefer fixing a root cause over adding a workaround, but when a root
   cause turns out to be outside this codebase (see the "deferred model
   adapter" issue in README) it's fine to ship an honest, documented
-  fallback rather than block on fully reverse-engineering upstream zcode
+  fallback rather than block on fully understanding upstream zcode
   behavior.

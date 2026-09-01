@@ -9,5 +9,7 @@
   },
   "scripts": {
     "start": "node bridge/index.js"
-  }
+  },
+  "license": "MIT",
+  "author": "Yak Software SLU"
 }

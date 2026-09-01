@@ -40,11 +40,11 @@ params}` / `{id, result|error}`; the server also sends *server-initiated*
 requests (id like `"server-1"`) that the client must answer, e.g. asking
 permission before a risky tool call.
 
-This was almost entirely undocumented and had to be reverse-engineered by
-running the actual process and reading the vendored runtime bundle
-(`vendor/zcode.cjs` in the `zcode-app-cli` npm package) — see
-`bridge/zcodeClient.js`'s comments for the specific gotchas (message
-framing, the exact permission-request schema, etc.).
+The protocol is minimally documented upstream (`zcode app-server --help`);
+every behavior recorded in this repo was established by direct observation
+of a running app-server. See `bridge/zcodeClient.js`'s comments for the
+specific gotchas learned that way (message framing, the exact
+permission-request schema, etc.).
 
 ```
 Telegram (long-poll, no inbound port)

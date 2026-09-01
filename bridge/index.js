@@ -273,8 +273,8 @@ const tokenToRequestId = new Map(); // callback_data token -> requestId ('p_' pe
 //   { input, prompt, requestId, sessionId, toolName, turnId,
 //     questions: [{ header, multiSelect, question,
 //                   options: [{ label, description, value }] }] }
-// (field shapes verified against the vendored runtime's emitter, DOi/ROi in
-// the bundle: each option's protocol value IS its label) and expects a reply
+// (field shapes confirmed against a live app-server: each option's protocol
+// value IS its label) and expects a reply
 // matching { action: "accept"|"decline"|"cancel", content?, reason? } --
 // where accept+content gets merged back into the tool input as
 // content.answers keyed by question text (or answer_0..N). Anything else --
@@ -1026,7 +1026,7 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
     // every pre-existing topic's session with -32004 "Session is not
     // active" -- forever, on every single restart, since store.js keeps
     // returning the same now-permanently-dead sessionId on every future
-    // message. Confirmed by tracing the vendored runtime: session/subscribe
+    // message. Confirmed by direct observation of a live app-server: session/subscribe
     // and session/send both resolve the session via a bare Map lookup that
     // throws if it isn't already resident; only session/resume's handler
     // falls back to loading the persisted record from disk.
@@ -1273,8 +1273,9 @@ async function handleModelCommand(threadId, arg) {
 }
 
 // --- /mode: list / switch the topic's session mode ---
-// The runtime's mode enum, from the vendored bundle. Only a sane subset is
-// advertised in the listing, but any enum value is accepted typed out.
+// The runtime's mode enum (observed against a live app-server). Only a
+// sane subset is advertised in the listing, but any enum value is accepted
+// typed out.
 const MODES = ['default', 'plan', 'edit', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions', 'autoEdit', 'build', 'yolo'];
 const MODE_NOTES = {
   default: 'confirm risky tool calls',
