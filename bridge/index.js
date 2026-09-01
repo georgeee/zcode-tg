@@ -444,11 +444,25 @@ async function sendChunkFallback(method, messageId, threadId, chunk, originalErr
 // (which resets every OTHER topic's state too). /stop below is the
 // user-initiated version of this same cleanup, for when 20 minutes is too
 // long to wait.
+//
+// IMPORTANT: this must call session/stop before clearing local state, not
+// just wipe bookkeeping and walk away. Found the hard way: a turn that's
+// merely SLOW (not actually hung -- e.g. a long agentic task doing real
+// work) keeps running server-side even after the bridge stops tracking it.
+// If it later completes, its events arrive with no `activeTurns` entry to
+// attach to (the session/event handler's `if (!turn) return` silently
+// drops them, including the final content), so the real, successful answer
+// is generated and persisted in zcode's own history but never reaches
+// Telegram -- exactly the "task performed well but didn't report" failure
+// mode this was built to prevent, just relocated one level deeper. Calling
+// session/stop here makes a watchdog timeout behave like /stop: the turn
+// actually ends, instead of continuing to run unobserved.
 setInterval(() => {
   const now = Date.now();
   for (const [sessionId, turn] of activeTurns) {
     if (now - turn.startedAt <= cfg.turnTimeoutMs) continue;
-    console.error(`[bridge] turn on session ${sessionId} exceeded ${cfg.turnTimeoutMs}ms with no turn.terminal event -- force-clearing`);
+    console.error(`[bridge] turn on session ${sessionId} exceeded ${cfg.turnTimeoutMs}ms with no turn.terminal event -- stopping it and force-clearing`);
+    zcode.call('session/stop', { sessionId }).catch((e) => console.error(`[bridge] session/stop on watchdog timeout failed for ${sessionId} (state is cleared locally regardless):`, e.message));
     activeTurns.delete(sessionId);
     busySessions.delete(sessionId);
     const topic = sessionToTopic.get(sessionId);
@@ -456,14 +470,16 @@ setInterval(() => {
       .editMessageText({
         chatId: cfg.chatId,
         messageId: turn.placeholderMessageId,
-        text: '⚠️ No response after a long time — giving up on waiting for this turn. Send another message to try again (or /stop next time to cancel earlier).',
+        text: '⚠️ No response after a long time — the turn has been stopped. Send another message to try again (or /stop next time to cancel earlier).',
       })
       .catch((e) => console.error('[bridge] failed to edit watchdog-timeout notice:', e.message))
       .finally(() => topic && drainQueue(topic.threadId));
   }
 }, 60_000);
 
-// --- workspace model-catalog warm-up (the fix for resumed sends) ---
+// --- workspace model-catalog warm-up + explicit runtimeModel (the actual
+// fix for resumed sends -- see below for why warming the catalog ALONE,
+// which is what this used to do, is not sufficient) ---
 // A brand-new `zcode app-server` process starts with an EMPTY model catalog
 // for every workspace key: the per-workspace catalog is only ever filled by
 // `workspace/updateProviderRegistry`, which is part of the desktop app's
@@ -473,19 +489,45 @@ setInterval(() => {
 // and every subsequent `session/send` on that session rejects with
 // ZCODE_RUNTIME_MODEL_UNAVAILABLE ("历史任务使用的模型已不可用") -- the bug this
 // used to be worked around with a fresh-session fallback (history lost).
-// session/setModel does NOT clear it; warming the catalog before resume does,
-// verified live end-to-end (scratch app-server, context preserved across a
-// process kill: see git history of this commit).
+// session/setModel does NOT clear it.
 //
-// The push must carry source:"user" -- the registry handler silently filters
-// out pushes that claim source:"builtin" -- and baseURL + apiKey, which
-// builtin providers resolve internally but user ones must state. The apiKey
-// is read at call time and only ever written to the child's stdin (a pipe to
-// a process that already reads the same config file itself); never logged.
-const warmedCatalogKeys = new Set();
-async function warmWorkspaceCatalog(workspaceKey) {
-  if (warmedCatalogKeys.has(workspaceKey)) return;
-  warmedCatalogKeys.add(workspaceKey);
+// An EARLIER version of this fix only pushed the registry (via
+// workspace/updateProviderRegistry) and then called plain session/resume,
+// on the theory that a warmed catalog would be enough for resume's own
+// "is this model available" check to pass. It reported success in scratch
+// testing, shipped, and then still failed in production: reproduced by
+// hand afterward -- workspace/updateProviderRegistry visibly applies (the
+// returned workspaceState really does show the model as available) and yet
+// the very next session/resume + session/send on that same session still
+// hits the same ZCODE_RUNTIME_MODEL_UNAVAILABLE error. Root cause: the
+// deferred-adapter decision inside resume isn't re-evaluated against
+// whatever the catalog looks like at call time -- it's short-circuited
+// specifically by an *explicit* `runtimeModel` param on the resume call
+// itself. Passing one bypasses the broken availability check entirely,
+// and this path is the one actually confirmed to preserve conversation
+// context across a real process kill and restart (see git history).
+//
+// Two traps found empirically while building this, both costly to
+// discover, worth recording:
+// - The registry push must carry source:"user" -- the registry handler
+//   silently filters out pushes that claim source:"builtin".
+// - `runtimeModel.provider` must be OUR OWN provider object (the one we
+//   just pushed, which still has the real `apiKey`), not the one echoed
+//   back in updateProviderRegistry's response: the server converts our
+//   inline apiKey into an internal `apiKeyRef` pointer for its own
+//   bookkeeping, and (a) `apiKeyRef` isn't even a field runtimeModel.provider's
+//   schema accepts -- passing it verbatim is a validation error -- and
+//   (b) if you strip it without restoring a real `apiKey`, resume succeeds
+//   but the *next* send fails with "Model provider is missing an API key"
+//   -- a different, easy-to-mistake-for-progress failure mode.
+//
+// The apiKey is read at call time and only ever written to the child's
+// stdin (a pipe to a process that already reads the same config file
+// itself); never logged.
+const workspaceRuntimeModels = new Map(); // workspaceKey -> runtimeModel object, cached per process
+async function warmWorkspaceCatalog(workspaceKey, modelRef) {
+  const cached = workspaceRuntimeModels.get(workspaceKey);
+  if (cached) return cached;
   const workspace = { workspacePath: cfg.workspaceDir, workspaceKey };
   try {
     const state = await zcode.call('workspace/readState', { workspace });
@@ -507,11 +549,20 @@ async function warmWorkspaceCatalog(workspaceKey) {
     });
     if (res.status !== 'applied' || res.providerCount < 1) throw new Error(`registry push not applied (status=${res.status}, providerCount=${res.providerCount})`);
     console.log(`[bridge] warmed model catalog for workspace key ${workspaceKey} (${res.providerCount} provider)`);
+    const runtimeModel = {
+      revision: res.appliedProviderRevision,
+      generatedAt: Date.now(),
+      model: parseModelRef(modelRef),
+      provider, // ours, not res.workspaceState's echoed version -- see comment above
+    };
+    workspaceRuntimeModels.set(workspaceKey, runtimeModel);
+    return runtimeModel;
   } catch (e) {
     // Not fatal: sends on resumed sessions may still fail with
     // ZCODE_RUNTIME_MODEL_UNAVAILABLE and fall back to a fresh session --
     // the pre-fix behavior, degraded but working.
     console.error(`[bridge] failed to warm model catalog for workspace key ${workspaceKey} (resumed sessions may still fail):`, e.message);
+    return null;
   }
 }
 
@@ -539,8 +590,16 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
     // throws if it isn't already resident; only session/resume's handler
     // falls back to loading the persisted record from disk.
     try {
-      await warmWorkspaceCatalog(`tg-topic-${threadId}`);
-      await zcode.call('session/resume', { sessionId: entry.sessionId });
+      const workspaceKey = `tg-topic-${threadId}`;
+      const runtimeModel = await warmWorkspaceCatalog(workspaceKey, entry.model);
+      await zcode.call('session/resume', {
+        sessionId: entry.sessionId,
+        // Both fields are required together for the fix to actually take:
+        // runtimeModel is what bypasses the broken deferred-adapter check,
+        // but the runtime still needs `workspace` on this same call to know
+        // which workspace's (just-warmed) catalog to resolve it against.
+        ...(runtimeModel ? { workspace: { workspacePath: cfg.workspaceDir, workspaceKey }, runtimeModel } : {}),
+      });
       resumed = true;
     } catch (e) {
       // Session is genuinely gone upstream (not just "not yet reloaded into
