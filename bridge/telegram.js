@@ -1,7 +1,13 @@
 // Minimal Telegram Bot API client: long-poll getUpdates + the handful of
 // send/edit/answer calls the bridge needs. No dependency, just fetch.
+//
+// TELEGRAM_API_ROOT exists as a testing seam: the end-to-end harness
+// (test/e2e.mjs) points it at a local fake Telegram so the whole bridge --
+// real zcode app-server child included -- runs against canned updates
+// without touching the live bot (whose getUpdates long-poll tolerates
+// exactly one consumer).
 
-const API_ROOT = 'https://api.telegram.org';
+const API_ROOT = process.env.TELEGRAM_API_ROOT || 'https://api.telegram.org';
 
 export class TelegramClient {
   constructor({ token }) {
@@ -52,6 +58,31 @@ export class TelegramClient {
       reply_markup: replyMarkup,
       parse_mode: parseMode,
     });
+  }
+
+  // Multipart document upload for /file. Node 22 has the fetch/FormData/Blob
+  // globals this needs; no dependency. Telegram caps bot uploads at 50 MB.
+  async sendDocument({ chatId, messageThreadId, blob, filename, caption }) {
+    const res = await fetch(`${this.base}/sendDocument`, {
+      method: 'POST',
+      body: (() => {
+        const form = new FormData();
+        form.append('chat_id', String(chatId));
+        if (messageThreadId) form.append('message_thread_id', String(messageThreadId));
+        if (caption) form.append('caption', caption);
+        form.append('document', blob, filename);
+        return form;
+      })(),
+    });
+    const json = await res.json();
+    if (!json.ok) throw new Error(`telegram sendDocument failed: ${json.description || res.status}`);
+    return json.result;
+  }
+
+  // Pinning needs admin (can_pin_messages) in the chat; callers treat a
+  // failure as "stay unpinned", not an error worth retrying.
+  pinChatMessage({ chatId, messageId, disableNotification = true }) {
+    return this._call('pinChatMessage', { chat_id: chatId, message_id: messageId, disable_notification: disableNotification });
   }
 
   // Registers the bridge's own commands so Telegram's client offers them as

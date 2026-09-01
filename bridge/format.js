@@ -12,8 +12,11 @@
 
 const CHUNK_LIMIT = 3900; // headroom under Telegram's 4096 for the chunk joins
 
-export function renderReply(text) {
-  return splitHtml(mdToHtml(text ?? ''), CHUNK_LIMIT);
+// chunkLimit is overridden by the streaming preview (bridge/streamer.js),
+// which needs extra headroom in the same message for its ⌛ prefix and
+// status lines.
+export function renderReply(text, chunkLimit = CHUNK_LIMIT) {
+  return splitHtml(mdToHtml(text ?? ''), chunkLimit);
 }
 
 // Fallback for Telegram rejecting our HTML outright ("can't parse entities"):
