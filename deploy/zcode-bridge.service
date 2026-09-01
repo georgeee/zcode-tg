@@ -17,6 +17,16 @@ RestartSec=3
 # the drain default. 30 min leaves 5 min of slack for the notify-and-kill
 # fallback and process teardown after the drain window elapses.
 TimeoutStopSec=1800
+# KillMode=mixed is what makes the drain above POSSIBLE at all: the default
+# control-group mode SIGTERMs every process in the cgroup simultaneously,
+# which kills the zcode app-server child (and with it the in-flight turn the
+# bridge is draining) at the same instant the bridge receives its own
+# SIGTERM -- observed live 2026-09-01 18:02: "draining 1 in-flight turn(s)"
+# followed immediately by "app-server exited unexpectedly (code=143)". With
+# mixed, only the main process gets SIGTERM; the child stays alive until the
+# bridge stops it itself after draining (zcode.stop()), and everything else
+# is SIGKILLed only if the 30-min TimeoutStopSec above elapses.
+KillMode=mixed
 StandardOutput=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
 StandardError=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
 
