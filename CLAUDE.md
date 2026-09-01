@@ -33,11 +33,10 @@ modules (`format.js`, `usage.js`, `streamer.js`) have fast unit tests:
 topics are used to work on this very bridge, which is intentional. It means:
 
 - **Never put secrets in this repo.** Config lives outside the workspace
-  (`~/.config/zcode-tg/.env` by default; pre-rename
-  `~/.config/zcode-mobile-bridge/.env` still honored, override with
-  `ZCODE_TG_ENV` — see `resolveEnvPath` in `bridge/env.js`) on the host
-  running the bridge, specifically so an ordinary "look at your own code"
-  prompt can't read and echo a live token back into Telegram.
+  (`~/.config/zcode-tg/.env` by default, override with `ZCODE_TG_ENV` —
+  see `resolveEnvPath` in `bridge/env.js`) on the host running the bridge,
+  specifically so an ordinary "look at your own code" prompt can't read
+  and echo a live token back into Telegram.
 - Sessions typically run in **yolo / auto-approve mode** — a message in an
   authorized topic can run arbitrary shell commands and file edits with no
   human approval step. See README's "Permissions / safety model" before

@@ -85,10 +85,7 @@ itself operates in (topics are used to work on this very bridge), and a
 secret sitting in the workspace root can get read and echoed back into
 Telegram by completely ordinary "look at your own code" work under
 auto-approve — no adversarial intent required. Override the path with
-`ZCODE_TG_ENV=/some/other/path` if you'd rather put it elsewhere
-(`ZCODE_MOBILE_ENV` from before the repo rename still works, as does a
-config file at the old `~/.config/zcode-mobile-bridge/` path if that's
-what's already on your machine).
+`ZCODE_TG_ENV=/some/other/path` if you'd rather put it elsewhere.
 
 ```
 mkdir -p ~/.config/zcode-tg

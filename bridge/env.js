@@ -20,10 +20,10 @@ export function loadEnv(path = '.env') {
 }
 
 // Where the bridge's config lives, in preference order: an explicit
-// override (ZCODE_TG_ENV; the pre-rename ZCODE_MOBILE_ENV still honored),
-// then ~/.config/zcode-tg/.env, then -- only when it's what actually exists
-// on the machine -- the historical ~/.config/zcode-mobile-bridge/.env, so
-// deployments from before the repo rename keep working unchanged.
+// ZCODE_TG_ENV override, then ~/.config/zcode-tg/.env, then -- only when
+// it's what actually exists on the machine -- a legacy
+// ~/.config/zcode-mobile-bridge/.env, so existing installations keep
+// working unchanged (ZCODE_MOBILE_ENV is accepted the same way).
 export function resolveEnvPath({ override, home = process.env.HOME }) {
   if (override) return override;
   const fresh = `${home}/.config/zcode-tg/.env`;

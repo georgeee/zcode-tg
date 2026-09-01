@@ -69,7 +69,7 @@ import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentag
 // completely ordinary "look at your own code" work and echo the bot token
 // back into Telegram, no adversarial intent required. Kept outside the
 // workspace instead -- see resolveEnvPath (env.js) for the search order and
-// the pre-rename compatibility fallback.
+// compatibility fallbacks.
 loadEnv(resolveEnvPath({ override: process.env.ZCODE_TG_ENV || process.env.ZCODE_MOBILE_ENV }));
 
 const cfg = {
@@ -143,7 +143,7 @@ function need(key) {
     // The first var every fresh install trips on is TELEGRAM_BOT_TOKEN, and
     // a bare "missing required env var" sent people digging through the
     // README. Point at the config path actually being searched (honoring
-    // ZCODE_TG_ENV / the pre-rename fallbacks) and say what to do about it.
+    // ZCODE_TG_ENV and any fallbacks) and say what to do about it.
     if (key.startsWith('TELEGRAM_')) {
       const cfgPath = resolveEnvPath({ override: process.env.ZCODE_TG_ENV || process.env.ZCODE_MOBILE_ENV });
       const have = existsSync(cfgPath);
@@ -152,7 +152,7 @@ function need(key) {
         have
           ? `${cfgPath} exists but doesn't define ${key} -- fill it in (see .env.example in the repo).`
           : `No config found. Create ${cfgPath} (template: .env.example in the repo) with at least TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID and TELEGRAM_ALLOWED_USER_ID.`,
-        `To use a different location, set ZCODE_TG_ENV=/path/to/.env (the pre-rename ZCODE_MOBILE_ENV and ~/.config/zcode-mobile-bridge/ path still work).`,
+        `To use a different location, set ZCODE_TG_ENV=/path/to/.env.`,
       ];
       console.error(lines.join('\n'));
       process.exit(1);
