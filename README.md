@@ -149,6 +149,37 @@ other's topic/session mappings and Telegram update offset.
 Logs: `data/bridge.log` (also picked up by `journalctl --user -u
 zcode-bridge`).
 
+### 4. Nix (alternative install: bridge + zcode runtime together)
+
+The repo's flake packages **both halves**: `zcode` (the CLI runtime, pinned
+to a specific npm tarball — the bridge is written against that runtime's
+observed protocol behavior, so versions are bumped deliberately, not
+automatically) and `zcode-tg` (this bridge, wired so its defaults point at
+the packaged runtime and its state lives in `~/.local/state/zcode-tg/`,
+outside the read-only store). Telegram credentials are never baked in —
+same `~/.config/zcode-tg/.env` as above.
+
+```
+nix run github:georgeee/zcode-tg              # the bridge
+nix run github:georgeee/zcode-tg#zcode        # the runtime CLI
+nix profile install github:georgeee/zcode-tg  # both on PATH
+```
+
+As a flake input (this is how [agent-cage](https://github.com/georgeee/agent-cage)
+consumes it — mirror of how it consumes claude-code-nix):
+
+```nix
+inputs.zcode-tg-flake = {
+  url = "github:georgeee/zcode-tg";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+# overlays = [ zcode-tg-flake.overlays.default ];  ->  pkgs.zcode, pkgs.zcode-tg
+```
+
+Bumping the pinned runtime = change `version` + `hash` in `nix/zcode.nix`
+(hash via `nix store prefetch-file <tarball-url>`) and re-verify the bridge
+against the new runtime before deploying.
+
 ## Permissions / safety model
 
 Sessions run in **`yolo` mode** by default (`ZCODE_DEFAULT_MODE=yolo`) —
