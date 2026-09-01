@@ -259,11 +259,15 @@ through to the model as ordinary input):
 
 ## Known scope limits (intentional, not oversights)
 
-- **No file upload (inbound).** Telegram messages without `text` (photos,
-  documents, stickers, voice) are ignored. Outbound exists (`/file`), and is
-  deliberately restricted to the workspace subtree — the bridge account can
-  read files (e.g. `~/.zcode` credentials) that must not become one tap away
-  from chat.
+- **Inbound files: documents only.** Sending a document (any file up to
+  `MAX_INBOUND_FILE_MB`, default 20 — Telegram's hard bot download cap)
+  saves it to `inbox/telegram/<timestamp>-<name>` in the workspace and
+  starts a turn whose prompt tells the agent where it landed; your caption,
+  if any, rides along as the instruction. Photos, stickers and voice are
+  still ignored. Outbound (`/file` and the model's `[file: …]` markers)
+  is deliberately restricted to the workspace subtree — the bridge account
+  can read files (e.g. `~/.zcode` credentials) that must not become one tap
+  away from chat.
 - **No Goal Mode, subagents, or MCP management from Telegram** — the zcode
   Protocol exposes RPCs for these (`session/goal`, `session/subagents`,
   `plugins/*`, `mcp/*`, ...) but the bridge doesn't surface them. Model and

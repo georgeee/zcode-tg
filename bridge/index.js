@@ -53,7 +53,7 @@
 // unit); it does not daemonize itself.
 
 import { randomBytes } from 'node:crypto';
-import { readFile, realpath, stat } from 'node:fs/promises';
+import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { loadEnv } from './env.js';
 import { ZcodeClient } from './zcodeClient.js';
@@ -98,6 +98,9 @@ const cfg = {
   userInputTimeoutMs: Number(process.env.USER_INPUT_TIMEOUT_MS || 10 * 60 * 1000),
   // /file upload cap (Telegram bots accept up to 50 MB documents).
   maxFileBytes: Number(process.env.MAX_FILE_MB || 45) * 1024 * 1024,
+  // Inbound (user-sent) document cap. 20 MB is Telegram's hard bot download
+  // limit -- anything larger can sit in chat but can never be fetched.
+  maxInboundFileBytes: Math.min(Number(process.env.MAX_INBOUND_FILE_MB ?? 20), 20) * 1024 * 1024,
   // Opt-in-only safety net for a turn that's accepted but never emits
   // turn.terminal. DISABLED by default (0) per owner decision 2026-09-01:
   // a 20-minute cap killed real, merely-slow turns (turns here regularly
@@ -1346,6 +1349,53 @@ async function handleFileCommand(threadId, arg) {
   }
 }
 
+// Inbound files (owner request 2026-09-01): a document sent to the topic is
+// downloaded (Telegram bots can fetch up to 20 MB) and saved under
+// inbox/telegram/ in the workspace -- the same inbox/ that exists for
+// owner-dropped files generally -- timestamped to avoid collisions. The
+// turn's prompt tells the agent exactly where it landed; the user's
+// caption, if any, rides along as the instruction. Returns the prompt text,
+// or null after posting the specific failure to the topic.
+async function receiveInboundDocument(message, threadId) {
+  const doc = message.document;
+  const caption = (message.caption || '').trim();
+  try {
+    if ((doc.file_size ?? 0) > cfg.maxInboundFileBytes) {
+      throw new Error(`file is ${Math.round((doc.file_size ?? 0) / 1024 / 1024)} MB; Telegram's bot download cap is ${Math.round(cfg.maxInboundFileBytes / 1024 / 1024)} MB`);
+    }
+    const file = await tg.getFile({ fileId: doc.file_id });
+    const buf = await tg.downloadFile(file.file_path);
+    const dir = path.join(cfg.workspaceDir, 'inbox', 'telegram');
+    await mkdir(dir, { recursive: true });
+    const name = `${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}-${sanitizeFileName(doc.file_name, doc.file_unique_id)}`;
+    const dest = path.join(dir, name);
+    await writeFile(dest, buf);
+    const rel = path.relative(cfg.workspaceDir, dest);
+    console.log(`[bridge] topic ${threadId}: inbound file saved -> ${rel} (${abbrev(buf.length)} B)`);
+    return [
+      `[The user sent a file in Telegram; the bridge saved it to ${rel} (${abbrev(buf.length)} bytes). Read it with your file tools whenever useful.]`,
+      caption ? `User's caption: ${caption}` : 'No caption was provided.',
+    ].join('\n');
+  } catch (e) {
+    console.error('[bridge] inbound file failed:', e.message);
+    await tg
+      .sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `⚠️ Couldn't receive "${doc.file_name || 'file'}": ${e.message}` })
+      .catch(() => {});
+    return null;
+  }
+}
+
+// Filename for inbound saves: keep the readable part, drop anything that
+// could escape the save directory or confuse shells, never return empty.
+function sanitizeFileName(name, fallbackId) {
+  const base = path
+    .basename(String(name || ''))
+    .replace(/[^\w.\-+ ()]/g, '_')
+    .replace(/^\.+/, '')
+    .slice(0, 80);
+  return base || `file-${fallbackId || 'unnamed'}`;
+}
+
 // --- Telegram message handling ---
 
 // '/usage@botname arg' -> 'usage'; null for anything that isn't a command.
@@ -1379,7 +1429,7 @@ function helpText() {
     '/mode [name] — list / switch this topic’s mode',
     '/file <path> — send a workspace file here',
     '',
-    'Anything else is sent to the model. Replies stream into the ⌛ placeholder message. Messages sent while a turn is running are queued and run in order; reply to any message to quote it to the model.',
+    'Anything else is sent to the model. Replies stream into the ⌛ placeholder message. Messages sent while a turn is running are queued and run in order; reply to any message to quote it to the model. Send a file as a document and the agent reads it (saved to inbox/, your caption = instruction).',
   ].join('\n');
 }
 
@@ -1405,11 +1455,22 @@ async function handleMessage(message) {
     return;
   }
   if (!threadId) return; // ignore messages outside any topic
-  if (!message.text) return; // ignore non-text (stickers, photos, ...) for v0
+  if (!message.text && !message.document) return; // stickers, photos, voice, ... still ignored
+
+  // An inbound document becomes a turn: the bridge downloads it into the
+  // workspace and prompts the agent with where it landed (the user's
+  // caption, if any, is the instruction). Documents never carry message
+  // text -- captions are a separate field -- so this can't collide with the
+  // command/quote handling below.
+  let fileNote = null;
+  if (message.document) {
+    fileNote = await receiveInboundDocument(message, threadId);
+    if (fileNote === null) return; // specific failure already posted to the topic
+  }
+  const command = parseCommand(message.text ?? '');
 
   // Bridge-own commands that never need a session run before anything else,
   // so a stray /usage in a brand-new topic doesn't spawn a zcode session.
-  const command = parseCommand(message.text);
   if (command === 'usage') {
     await handleUsageCommand(threadId);
     return;
@@ -1458,11 +1519,11 @@ async function handleMessage(message) {
   // ⌛ placeholders) -- quoting "📌 Topic status" into a prompt is noise,
   // and a mid-stream reply's ⌛-prefixed preview is an incomplete text the
   // model can't usefully act on.
-  let promptText = message.text;
+  let promptText = message.text ?? fileNote;
   const quoted = message.reply_to_message?.text;
   if (quoted && quoted.trim() && !/^(📌|📥|⌛|🌀|🔓|⚠️)/.test(quoted.trim())) {
     const q = truncate(quoted, 600);
-    promptText = `[replying to this earlier message in the topic]\n${q.split('\n').map((l) => `> ${l}`).join('\n')}\n\n${message.text}`;
+    promptText = `[replying to this earlier message in the topic]\n${q.split('\n').map((l) => `> ${l}`).join('\n')}\n\n${promptText}`;
   }
 
   // A redeploy is draining: don't start anything new (getOrCreateSession

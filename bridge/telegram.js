@@ -100,6 +100,20 @@ export class TelegramClient {
     return this._call('setMyCommands', { commands, scope });
   }
 
+  // Inbound files: getFile maps a message's file_id to a downloadable
+  // file_path (valid ~1h), downloadFile fetches the bytes from the /file/
+  // route. Bots can download files up to 20 MB -- larger documents can be
+  // SENT in chat but not fetched, so the bridge rejects them by size first.
+  getFile({ fileId }) {
+    return this._call('getFile', { file_id: fileId });
+  }
+
+  async downloadFile(filePath) {
+    const res = await fetch(`${API_ROOT}/file/bot${this.token}/${filePath}`);
+    if (!res.ok) throw new Error(`telegram file download failed: HTTP ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  }
+
   answerCallbackQuery({ callbackQueryId, text, showAlert = false }) {
     return this._call('answerCallbackQuery', { callback_query_id: callbackQueryId, text, show_alert: showAlert });
   }
