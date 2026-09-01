@@ -9,6 +9,14 @@ WorkingDirectory=/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile
 ExecStart=/srv/agent-cage/etheron-bare/agent/etheron-bare/work/toolchain/node/bin/node bridge/index.js
 Restart=always
 RestartSec=3
+# bridge/index.js's shutdown() now drains in-flight turns for up to
+# SHUTDOWN_DRAIN_MS (default 25 min, see .env.example) before it actually
+# exits on SIGTERM. systemd's own default TimeoutStopSec (~90s) would
+# SIGKILL it well before that window closes, cutting a turn off harder than
+# the thing this was built to avoid -- so this must stay comfortably above
+# the drain default. 30 min leaves 5 min of slack for the notify-and-kill
+# fallback and process teardown after the drain window elapses.
+TimeoutStopSec=1800
 StandardOutput=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
 StandardError=append:/srv/agent-cage/etheron-bare/agent/etheron-bare/zcode-mobile/data/bridge.log
 

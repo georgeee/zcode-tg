@@ -251,14 +251,17 @@ through to the model as ordinary input):
   Protocol exposes RPCs for these (`session/goal`, `session/subagents`,
   `plugins/*`, `mcp/*`, ...) but the bridge doesn't surface them. Model and
   mode switching ARE exposed (`/model`, `/mode`).
-- **Replay after a restart is best-effort.** Subscriptions use
+- **Replay after an UNplanned death is best-effort.** Subscriptions use
   `deliveryKind: "web-remote-replayable"`, but the bridge always
   re-subscribes fresh rather than tracking `eventSeq` to request a precise
   replay window — a turn that was in flight exactly when the process died
   may not have its tail end delivered on restart. Concretely: a message
-  whose turn was killed mid-flight by a restart is in no queue and is gone;
-  its `⌛` placeholder stays as-is (only messages *queued behind* a running
-  turn are persisted and drained on startup).
+  whose turn was killed mid-flight by a crash, OOM, or `SIGKILL` is in no
+  queue and is gone; its `⌛` placeholder stays as-is (only messages *queued
+  behind* a running turn are persisted and drained on startup). This does
+  **not** apply to an ordinary redeploy (`SIGTERM`/`SIGINT`) — see
+  "Redeploying" below, which drains in-flight turns first specifically to
+  avoid this.
 
 ## Restart continuity: resume + catalog warm-up
 
@@ -287,3 +290,31 @@ keeps its conversation context across the restart.
 The one-shot fresh-session retry on send failure remains as a fallback for
 whatever else can go wrong — if it ever fires now, that's a new bug worth
 looking at, not the known deferred-adapter one.
+
+## Redeploying: graceful drain, not an interrupt
+
+A real blue-green deploy (old and new processes overlapping) isn't
+available here: Telegram's `getUpdates` long-poll tolerates exactly one
+consumer, `data/sessions.json`'s lock is exclusive to one process, and each
+process owns its own `zcode app-server` child holding all session state.
+So `shutdown()` (`bridge/index.js`, on `SIGTERM`/`SIGINT`) does the version
+of zero-downtime that IS available in a single process:
+
+1. Immediately stop admitting new work — messages arriving during a drain
+   get an instant "queued, deploying" notice instead of starting a turn, so
+   the bridge stays visibly responsive the whole time (no radio silence).
+2. Wait, bounded by `SHUTDOWN_DRAIN_MS` (default 25 min — turns here
+   regularly run 10–30+ minutes, see the watchdog note above), for every
+   turn already in flight to finish **naturally** through the ordinary
+   delivery path. A turn that finishes during this window is delivered
+   exactly as if nothing were happening; nothing about it is interrupted.
+3. Whatever's still running once that window elapses gets the
+   interrupt-and-notify treatment (placeholder edited to say the turn was
+   cut off by a restart) — the previous, unconditional behavior — before the
+   process actually exits.
+
+`deploy/zcode-bridge.service` sets `TimeoutStopSec=1800` so systemd's own
+stop timeout can't SIGKILL the process out from under a drain that's
+legitimately still waiting. Set `SHUTDOWN_DRAIN_MS=0` to skip draining and
+go back to interrupting immediately (e.g. for a deploy you know must land
+fast, at the cost of whatever's running).

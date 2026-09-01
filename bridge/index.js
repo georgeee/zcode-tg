@@ -101,6 +101,14 @@ const cfg = {
   // copied into this process's env or the store.
   zaiConfigPath: process.env.ZAI_CONFIG_PATH || `${process.env.HOME}/.zcode/cli/config.json`,
   maxQueuePerTopic: Number(process.env.MAX_QUEUE_PER_TOPIC || 20),
+  // shutdown()'s graceful-drain window: how long to let turns already in
+  // flight at redeploy time finish NATURALLY (through the ordinary
+  // finalizeTurn delivery path) before falling back to the interrupt-and-
+  // notify behavior. Defaults generous, in the same spirit as
+  // turnTimeoutMs=0 above: turns here regularly run 10-30+ minutes, and a
+  // redeploy that waits under load costs far less than an interrupted turn
+  // does. Set to 0 to skip draining and go straight to notify-and-kill.
+  shutdownDrainMs: Number(process.env.SHUTDOWN_DRAIN_MS ?? 25 * 60 * 1000), // 25 min
 };
 
 // Registered with Telegram on boot so these show as / autocomplete in the
@@ -151,27 +159,56 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));
 async function shutdown(signal) {
   // Found the hard way (2026-09-01): a redeploy -- the common case this
-  // fires for -- kills the app-server child a moment after this runs, and
-  // with it whatever turn was streaming into a topic's placeholder. Nothing
-  // was left to ever edit that message again: the watchdog is off by
-  // default, and even armed, no sweep runs between now and process death.
-  // The placeholder just sits there forever showing a stale "💭 · 117s" --
+  // fires for -- used to kill the app-server child a moment after this ran,
+  // taking with it whatever turn was streaming into a topic's placeholder.
+  // Nothing was left to ever edit that message again: the watchdog is off by
+  // default, and even armed, no sweep runs between then and process death.
+  // The placeholder just sat there forever showing a stale "💭 · 117s" --
   // exactly the "task performed well but didn't report" failure mode all
   // over again, just triggered by an intentional restart instead of a
-  // timeout. Notify every in-flight turn before killing anything.
+  // timeout. That version of this function notified every in-flight turn
+  // before killing anything -- an honest apology, but still an interrupted
+  // turn every time a redeploy landed mid-work.
   //
-  // Killing the app-server process (below) is a strictly stronger stop than
-  // the session/stop RPC (confirmed elsewhere in this file not to reliably
-  // interrupt an in-flight tool-call loop) -- once the process is gone,
-  // nothing is running -- so there's no need to also call session/stop here.
+  // Extended the same day: an apology is strictly worse than the turn just
+  // finishing. Nothing about a redeploy actually requires killing the
+  // process the instant the signal arrives -- so stop ADMITTING new work
+  // (the `draining` flag, checked in handleMessage and drainQueue) and wait
+  // for what's already running to finish through the ordinary finalizeTurn
+  // path first. No special-casing needed there: it already delivers
+  // correctly and clears activeTurns/busySessions itself. This intentionally
+  // is NOT a two-process blue-green handoff -- Telegram's getUpdates
+  // long-poll tolerates exactly one consumer and store.js's lock is
+  // exclusive to one process, both already true of this bridge for other
+  // reasons -- so "keep the one process alive and responsive a bit longer"
+  // is the zero-downtime shape actually available here, not "start a second
+  // one alongside it".
   //
+  // Only turns still open after cfg.shutdownDrainMs get the interrupt-and-
+  // notify treatment below, same as the old unconditional behavior -- a
+  // genuinely stuck turn (or an operator who wants fast restarts) isn't left
+  // waiting forever. Killing the app-server process is a strictly stronger
+  // stop than the session/stop RPC (confirmed elsewhere in this file not to
+  // reliably interrupt an in-flight tool-call loop) -- once the process is
+  // gone, nothing is running -- so there's no need to also call session/stop
+  // on the way out.
+  draining = true;
+  console.log(`[bridge] received ${signal}: draining ${activeTurns.size} in-flight turn(s) for up to ${cfg.shutdownDrainMs}ms before restart`);
+  if ((activeTurns.size > 0 || pendingFinalize > 0) && cfg.shutdownDrainMs > 0) {
+    await waitForDrain(cfg.shutdownDrainMs);
+  }
+  if (activeTurns.size > 0) {
+    console.log(`[bridge] drain window elapsed with ${activeTurns.size} turn(s) still running -- notifying and interrupting`);
+  } else {
+    console.log('[bridge] all in-flight turns finished naturally -- nothing to interrupt');
+  }
+
   // Bounded wait so a slow Telegram call can't hang a redeploy indefinitely;
   // under systemd this whole handler is also redundant-but-harmless with the
   // default KillMode=control-group (which reaps the app-server child
   // regardless), and matters most for the foreground/dev-loop path
   // README.md documents, where nothing else guarantees the child doesn't
   // outlive us as an orphaned, still-authenticated zcode process.
-  console.log(`[bridge] received ${signal}, notifying ${activeTurns.size} in-flight turn(s) and stopping zcode app-server`);
   const notifications = [...activeTurns.values()].map((turn) => {
     turn.streamer?.stop();
     if (!turn.placeholderMessageId) return Promise.resolve();
@@ -188,12 +225,34 @@ async function shutdown(signal) {
   process.exit(0);
 }
 
+// Polls (rather than wiring an event) because activeTurns/pendingFinalize
+// are plain counters mutated all over this file (finalizeTurn, the /stop
+// handler, the watchdog) -- adding an emitter just for this one caller would
+// be more moving parts than a 500ms poll against a bounded, one-shot wait.
+async function waitForDrain(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while ((activeTurns.size > 0 || pendingFinalize > 0) && Date.now() < deadline) {
+    await sleep(500);
+  }
+}
+
 // --- in-memory routing state (rebuilt each process start; durable session
 // identities live in `store`) ---
 const subscribedSessions = new Set(); // sessionId we've called session/subscribe for, this process
 const sessionToTopic = new Map(); // sessionId -> { threadId }
 const busySessions = new Set(); // sessionId currently running a turn
 const activeTurns = new Map(); // sessionId -> { placeholderMessageId, textBuffer, startedAt, turnId?, streamer, usageSummary?, toolNames, adopted? }
+// Set true by shutdown() once a redeploy starts draining. Checked in
+// handleMessage (queue instead of starting a fresh turn) and drainQueue
+// (don't promote the next queued item) so activeTurns can actually reach
+// zero instead of one finished turn being replaced by a freshly-started one.
+let draining = false;
+// Turns still inside finalizeTurn's delivery awaits (Telegram calls) after
+// activeTurns has already lost their entry -- see finalizeTurn and
+// shutdown()'s waitForDrain. Without this, the drain wait could see
+// activeTurns.size hit 0 and process.exit() out from under a reply that's
+// mid-send.
+let pendingFinalize = 0;
 const pendingPermissions = new Map(); // requestId -> { resolve, tokenMap: Map(token->response), chatId, threadId }
 const pendingUserInputs = new Map(); // requestId -> { resolve, timer, questions, answers, tokenToChoice, chatId, threadId }
 const tokenToRequestId = new Map(); // callback_data token -> requestId ('p_' permissions, 'u_' user input)
@@ -650,43 +709,53 @@ async function handleBackgroundTaskFinished(sessionId, payload) {
 }
 
 async function finalizeTurn(sessionId, terminalParams) {
-  const turn = activeTurns.get(sessionId);
-  activeTurns.delete(sessionId);
-  busySessions.delete(sessionId);
-  const topic = sessionToTopic.get(sessionId);
-  if (turn) {
-    turn.streamer?.stop();
-    let text;
-    if (terminalParams.status === 'success') {
-      text = turn.finalText ?? turn.textBuffer ?? '';
-    } else {
-      const err = turn.error;
-      text = `⚠️ Turn failed: ${terminalParams.errorCode || 'unknown_error'}${err?.message ? `\n${err.message}` : ''}`;
-    }
-    if (turn.adopted && !text.trim()) {
-      // Auto-started notification turns sometimes produce no user-facing
-      // text; a quiet label beats spamming "(no reply text)".
-      if (turn.placeholderMessageId) {
-        await tg
-          .editMessageText({ chatId: cfg.chatId, messageId: turn.placeholderMessageId, text: '🌀 Background task notification processed.' })
-          .catch(() => {});
+  // activeTurns loses its entry for this turn a few lines below, before the
+  // delivery awaits underneath ever start -- so shutdown()'s drain wait
+  // can't use activeTurns.size alone to know a turn is truly done.
+  // pendingFinalize covers the gap: incremented here, decremented in the
+  // finally at the very bottom, after delivery (or its failure) is settled.
+  pendingFinalize++;
+  try {
+    const turn = activeTurns.get(sessionId);
+    activeTurns.delete(sessionId);
+    busySessions.delete(sessionId);
+    const topic = sessionToTopic.get(sessionId);
+    if (turn) {
+      turn.streamer?.stop();
+      let text;
+      if (terminalParams.status === 'success') {
+        text = turn.finalText ?? turn.textBuffer ?? '';
+      } else {
+        const err = turn.error;
+        text = `⚠️ Turn failed: ${terminalParams.errorCode || 'unknown_error'}${err?.message ? `\n${err.message}` : ''}`;
       }
-    } else {
-      const footer = terminalParams.status === 'success' ? usageFooter(turn, terminalParams) : '';
-      await deliverReply(turn.placeholderMessageId, topic?.threadId, text.trim() ? text : '(no reply text)', footer);
+      if (turn.adopted && !text.trim()) {
+        // Auto-started notification turns sometimes produce no user-facing
+        // text; a quiet label beats spamming "(no reply text)".
+        if (turn.placeholderMessageId) {
+          await tg
+            .editMessageText({ chatId: cfg.chatId, messageId: turn.placeholderMessageId, text: '🌀 Background task notification processed.' })
+            .catch(() => {});
+        }
+      } else {
+        const footer = terminalParams.status === 'success' ? usageFooter(turn, terminalParams) : '';
+        await deliverReply(turn.placeholderMessageId, topic?.threadId, text.trim() ? text : '(no reply text)', footer);
+      }
     }
+    if (topic) {
+      // Skip the idle write when a queued message immediately re-busies the
+      // topic (drainQueue -> startTurn writes "busy") -- two racing edits of
+      // the same status message can land out of order.
+      if (!store.getQueue(topic.threadId).length) updateTopicStatus(topic.threadId, 'idle').catch(() => {});
+    }
+    // Whatever the user queued behind this turn runs now -- success, failure,
+    // and the "!turn" early-return case all lead here for one reason: the
+    // session is no longer busy, and the queue's whole contract is "runs when
+    // the current message finishes". A no-op while draining (see drainQueue).
+    if (topic) void drainQueue(topic.threadId);
+  } finally {
+    pendingFinalize--;
   }
-  if (topic) {
-    // Skip the idle write when a queued message immediately re-busies the
-    // topic (drainQueue -> startTurn writes "busy") -- two racing edits of
-    // the same status message can land out of order.
-    if (!store.getQueue(topic.threadId).length) updateTopicStatus(topic.threadId, 'idle').catch(() => {});
-  }
-  // Whatever the user queued behind this turn runs now -- success, failure,
-  // and the "!turn" early-return case all lead here for one reason: the
-  // session is no longer busy, and the queue's whole contract is "runs when
-  // the current message finishes".
-  if (topic) void drainQueue(topic.threadId);
 }
 
 // Cost/steps footer appended to the delivered reply (agreed tier-1 item).
@@ -1291,7 +1360,6 @@ async function handleMessage(message) {
     return;
   }
   if (!threadId) return; // ignore messages outside any topic
-  if (!threadId) return; // ignore messages outside any topic
   if (!message.text) return; // ignore non-text (stickers, photos, ...) for v0
 
   // Bridge-own commands that never need a session run before anything else,
@@ -1346,6 +1414,30 @@ async function handleMessage(message) {
   if (quoted && quoted.trim()) {
     const q = truncate(quoted, 600);
     promptText = `[replying to this earlier message in the topic]\n${q.split('\n').map((l) => `> ${l}`).join('\n')}\n\n${message.text}`;
+  }
+
+  // A redeploy is draining: don't start anything new (getOrCreateSession
+  // below can itself call session/create, work an about-to-restart process
+  // has no way to see through to completion). /stop and /cancel are exempt
+  // since they only ever stop something -- letting them fall through to the
+  // ordinary busy-check below is simpler than duplicating that logic here.
+  if (draining && command !== 'stop' && command !== 'cancel') {
+    const queue = store.getQueue(threadId);
+    if (queue.length >= cfg.maxQueuePerTopic) {
+      await tg.sendMessage({
+        chatId: cfg.chatId,
+        messageThreadId: threadId,
+        text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. Try again once the bridge is back.`,
+      });
+      return;
+    }
+    const notice = await tg.sendMessage({
+      chatId: cfg.chatId,
+      messageThreadId: threadId,
+      text: `📥 Queued (position ${queue.length + 1}) — the bridge is deploying an update and will run this once it's back (usually a few seconds).`,
+    });
+    store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id }]);
+    return;
   }
 
   let session;
@@ -1506,6 +1598,12 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
 // restored from disk. Callers `void` it: draining must never block the
 // delivery of the outcome the user is currently reading.
 async function drainQueue(threadId) {
+  // A turn ending during a drain window must not be replaced by a fresh
+  // one -- see shutdown()'s waitForDrain, which polls activeTurns.size to
+  // know when it's safe to restart. The queued item stays queued; it runs
+  // after the next boot picks it up (drainQueue also runs once at startup
+  // for exactly this reason).
+  if (draining) return;
   const queue = store.getQueue(threadId);
   if (!queue.length) return;
   const [next, ...rest] = queue;
@@ -1611,9 +1709,14 @@ async function main() {
 
   // Queues persisted by a previous process instance: their "📥 Queued"
   // Telegram messages are still sitting in their topics -- resume draining.
-  // (A message whose turn was killed MID-FLIGHT by that restart is in no
-  // queue and is simply gone; its placeholder stays "⌛" forever. Known gap,
-  // listed in README's known issues.)
+  // This also picks up whatever got queued during the previous process's
+  // graceful shutdown drain (see shutdown()/draining in this file) -- those
+  // messages were deliberately never started, precisely so they'd run here,
+  // once, cleanly, instead of being started and then killed.
+  // (A message whose turn was killed MID-FLIGHT by an UNplanned death --
+  // crash, OOM, SIGKILL -- is in no queue and is simply gone; its
+  // placeholder stays "⌛" forever. Known gap, listed in README's known
+  // issues. Does not apply to an ordinary SIGTERM/SIGINT redeploy anymore.)
   const restoredQueues = store.getQueues();
   const restoredThreadIds = Object.keys(restoredQueues);
   if (restoredThreadIds.length) {
