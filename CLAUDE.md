@@ -17,6 +17,13 @@ specific protocol gotchas that cost real debugging time to find — read them
 before touching that file. Don't re-derive protocol behavior from scratch;
 check there and in `README.md` first.
 
+`bridge/streamer.js` owns the throttled streaming edits of a turn's
+placeholder (one edit per `STREAM_EDIT_INTERVAL_MS`, ⌛-prefixed while
+running). `test/e2e.mjs` runs the whole bridge against a local fake
+Telegram (`TELEGRAM_API_ROOT` seam) and a real scratch app-server — it makes
+real (small) model calls, so don't run it against the live bot token or
+while the account is near its rate limit.
+
 ## This repo IS the zcode agent's own workspace
 
 `ZCODE_WORKSPACE_DIR` (in the bridge's config) points at this repo's root.

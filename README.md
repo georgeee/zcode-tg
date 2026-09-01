@@ -174,23 +174,55 @@ through to the model as ordinary input):
 | `/stop`, `/cancel` | cancel the topic's running turn (`session/stop`) |
 | `/queue` | list this topic's queued messages |
 | `/clearqueue` | drop this topic's queued messages (their "Queued" notices are edited to "Dropped") |
+| `/model [name]` | list this topic's available models (current one marked `▶`) / switch (`session/setModel`, persisted per topic) |
+| `/mode [name]` | list session modes (current marked) / switch (`session/setMode`, persisted per topic) |
+| `/file <path>` | send a file from the workspace into the topic as a document (realpath-restricted to the workspace subtree, `MAX_FILE_MB` cap) |
 | `/help` | the list above |
 
+- **Replies stream**: the turn's placeholder message is edited in place as
+  the model works — prefixed `⌛` with an elapsed-time/current-tool status
+  line while running (so the last message in the topic always shows the
+  turn is in progress), and the text itself as `text_delta` events arrive,
+  at most one edit per `STREAM_EDIT_INTERVAL_MS` (default 5s; anything
+  produced inside the window folds into the next edit). On completion the
+  preview is replaced by the authoritative full render plus a small usage
+  footer (`⏱ duration · tokens in/out · tool calls`). `bridge/streamer.js`
+  owns the throttling.
+- **The model can ask questions**: `interaction/requestUserInput` (the
+  AskUserQuestion tool) is posted to the topic as inline-button prompts and
+  genuinely answered from Telegram (one tap per question; multi-select
+  questions are single-pick — a Telegram-buttons limitation). No answer
+  within `USER_INPUT_TIMEOUT_MS` (default 10 min) → auto-declined so the
+  turn keeps moving.
+- **Each topic gets a status message** (`📌 Topic status`: model · mode ·
+  busy/idle · queue depth), edited in place on every state change. It's
+  pinned when the bot has pin rights (promote the bot to admin with
+  `can_pin_messages` for that); otherwise it stays a normal message and the
+  bridge logs one notice.
+- **Background tasks**: a task the agent left running that completes while
+  the session is idle gets a `🌀` notice, and the turn the runtime
+  auto-starts for the `<task-notification>` input is adopted (fresh ⌛
+  placeholder, normal delivery) — without adoption its reply would be
+  generated, persisted, and never delivered.
+- **Replying to an earlier Telegram message** quotes it (up to 600 chars)
+  into the prompt sent to the model, so follow-ups can point at a specific
+  earlier message.
 - **A message sent while a turn is still running is queued**, not rejected:
   the bridge posts a `📥 Queued (position N)` notice, and that notice becomes
   the turn's placeholder when the message is dequeued — the reply lands on
   the message the user saw accepted. Queues are persisted
   (`data/sessions.json`) and drained in order when the current turn ends,
-  fails, is cancelled, or times out; they're also restored and drained on
+  fails, or is cancelled; they're also restored and drained on
   startup after a restart. Capped at `MAX_QUEUE_PER_TOPIC` (default 20).
 - **`/stop` or `/cancel`** in a topic with a turn in progress calls
   `session/stop` and clears the busy state immediately, instead of waiting
-  for it to finish or time out — then the next queued message (if any) runs.
-- **A turn that never emits completion** (dropped event, an upstream hang
-  that doesn't crash the app-server process outright) is force-cleared by a
-  background sweep after `TURN_TIMEOUT_MS` (default 20 minutes) — without
-  this, a single missed event would wedge that topic on the busy
-  placeholder for the rest of the process's life.
+  for it to finish — then the next queued message (if any) runs.
+- **The turn-timeout watchdog is off by default** (`TURN_TIMEOUT_MS=0`,
+  owner decision 2026-09-01: the old 20-minute default killed real,
+  merely-slow turns — turns here regularly run longer). `/stop` is the
+  designated escape hatch for a wedged topic. Setting `TURN_TIMEOUT_MS`
+  re-arms the automatic sweep (which stops the turn server-side first, so a
+  timeout behaves like `/stop`).
 - **Model replies are rendered to Telegram HTML** (`bridge/format.js`):
   fenced/inline code, bold/italic/strike, links, headings, lists and quotes;
   everything else passes through escaped. Replies longer than one message
@@ -200,22 +232,22 @@ through to the model as ordinary input):
 
 ## Known scope limits (intentional, not oversights)
 
-- **No file upload/download.** Telegram messages without `text` (photos,
-  documents, stickers, voice) are ignored. Not needed for the current use
-  case.
-- **No Goal Mode, subagents, MCP management, or model/mode switching
-  commands from Telegram** — the zcode Protocol exposes RPCs for all of
-  these (`session/goal`, `session/subagents`, `session/setMode`,
-  `plugins/*`, `mcp/*`, ...) but the bridge doesn't surface them. Not
-  needed for the minimal interface; would be straightforward to add per
-  method if wanted later.
+- **No file upload (inbound).** Telegram messages without `text` (photos,
+  documents, stickers, voice) are ignored. Outbound exists (`/file`), and is
+  deliberately restricted to the workspace subtree — the bridge account can
+  read files (e.g. `~/.zcode` credentials) that must not become one tap away
+  from chat.
+- **No Goal Mode, subagents, or MCP management from Telegram** — the zcode
+  Protocol exposes RPCs for these (`session/goal`, `session/subagents`,
+  `plugins/*`, `mcp/*`, ...) but the bridge doesn't surface them. Model and
+  mode switching ARE exposed (`/model`, `/mode`).
 - **Replay after a restart is best-effort.** Subscriptions use
   `deliveryKind: "web-remote-replayable"`, but the bridge always
   re-subscribes fresh rather than tracking `eventSeq` to request a precise
   replay window — a turn that was in flight exactly when the process died
   may not have its tail end delivered on restart. Concretely: a message
   whose turn was killed mid-flight by a restart is in no queue and is gone;
-  its `⏳` placeholder stays as-is (only messages *queued behind* a running
+  its `⌛` placeholder stays as-is (only messages *queued behind* a running
   turn are persisted and drained on startup).
 
 ## Restart continuity: resume + catalog warm-up

@@ -90,9 +90,14 @@ async function handleFake(method, req, res) {
   }
   if (method === 'sendMessage') {
     const p = JSON.parse(body);
-    calls.send.push(p);
+    // Record the id the fake server assigns WITH the request, so harness
+    // assertions can correlate edits back to the send they target (the raw
+    // request body has no message_id of its own -- an earlier version read
+    // ph.message_id off it and silently matched nothing).
+    const id = nextMsgId++;
+    calls.send.push({ ...p, message_id: id });
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ ok: true, result: { message_id: nextMsgId++ } }));
+    res.end(JSON.stringify({ ok: true, result: { message_id: id } }));
     return;
   }
   if (method === 'sendDocument') {

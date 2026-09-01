@@ -571,6 +571,17 @@ zcode.on('event', (msg) => {
       void adoptUnclaimedTurn(sessionId, msg.params);
       return;
     }
+    // Per-model-request usage, used by the footer as a fallback: the
+    // turn-final session event ({response, usage}) is the nicer source but
+    // arrives on a different event channel whose ordering vs turn.terminal
+    // is NOT guaranteed -- observed live both ways. usage.delta reliably
+    // precedes terminal, so accumulating it per requestId covers the case
+    // where the response event lands after finalize has already run.
+    if (kind === 'usage.delta' && turn && msg.params.requestId) {
+      if (!turn.requestUsage) turn.requestUsage = new Map();
+      turn.requestUsage.set(msg.params.requestId, { inputTokens: msg.params.inputTokens, outputTokens: msg.params.outputTokens });
+      return;
+    }
     if (kind === 'turn.terminal') {
       void finalizeTurn(sessionId, msg.params);
     }
@@ -653,22 +664,34 @@ async function finalizeTurn(sessionId, terminalParams) {
 
 // Cost/steps footer appended to the delivered reply (agreed tier-1 item).
 // Sources, in preference order: the turn-final session event's cumulative
-// usage (verified live: {inputTokens, outputTokens, totalTokens, ...}) and
-// turn.terminal's durationMs/tokenCount/toolCallCount. No dollar figure
+// usage (verified live: {inputTokens, outputTokens, totalTokens, ...}), the
+// sum of per-request usage.delta telemetry (same numbers, ordering-proof),
+// and turn.terminal's durationMs/tokenCount/toolCallCount. No dollar figure
 // exists anywhere in the protocol -- the plan is credit-based, /usage has
 // the quota view.
 function usageFooter(turn, terminal) {
-  const u = turn.usageSummary;
+  const u = turn.usageSummary ?? aggregateRequestUsage(turn.requestUsage);
   const parts = [];
   if (terminal?.durationMs != null) parts.push(`⏱ ${fmtDuration(terminal.durationMs)}`);
   if (u && (u.inputTokens != null || u.outputTokens != null)) {
-    const total = terminal?.tokenCount ?? u.totalTokens;
+    const total = terminal?.tokenCount ?? u.totalTokens ?? (u.inputTokens ?? 0) + (u.outputTokens ?? 0);
     parts.push(`${abbrev(total)} tok · ${abbrev(u.inputTokens)} in / ${abbrev(u.outputTokens)} out`);
   } else if (terminal?.tokenCount != null) {
     parts.push(`${abbrev(terminal.tokenCount)} tok`);
   }
   if (terminal?.toolCallCount) parts.push(`${terminal.toolCallCount} tool call${terminal.toolCallCount === 1 ? '' : 's'}`);
   return parts.length ? `\n\n<i>${parts.join(' · ')}</i>` : '';
+}
+
+function aggregateRequestUsage(map) {
+  if (!map || !map.size) return null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  for (const v of map.values()) {
+    inputTokens += v.inputTokens ?? 0;
+    outputTokens += v.outputTokens ?? 0;
+  }
+  return { inputTokens, outputTokens };
 }
 
 function abbrev(n) {
