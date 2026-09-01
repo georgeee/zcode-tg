@@ -262,7 +262,8 @@ through to the model as ordinary input):
   percentages only: short-term "session" window and weekly window). Created
   at topic creation (the topic's first message, so it never occupies
   conversational space near the latest messages) and edited in place on
-  every state change after that. The usage figures come from the same quota
+  every state change after that (including queue-depth changes: queueing
+  or dropping messages updates the line immediately). The usage figures come from the same quota
   endpoint as `/usage`, cached for 5 minutes (status writes fire per turn
   and the monitor endpoint is rate-limit-sensitive) and omitted while
   unavailable. It's pinned when the bot has admin `can_pin_messages` rights

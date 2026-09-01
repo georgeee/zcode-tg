@@ -1163,6 +1163,16 @@ async function tryPinTopicStatus(threadId, st) {
   }
 }
 
+// Queue-depth changes are status changes too (owner-observed gap
+// 2026-09-01: queueing a message never touched the 📌 line, so `queued: N`
+// stayed stale from the last turn boundary -- and with the idle-write skip
+// in finalizeTurn, the next refresh even showed the post-dequeue count).
+// Called after every queue mutation; state derived from the topic's session.
+function refreshTopicStatusForQueue(threadId) {
+  const sid = store.getTopic(threadId)?.sessionId;
+  updateTopicStatus(threadId, sid && busySessions.has(sid) ? 'busy' : 'idle').catch(() => {});
+}
+
 async function updateTopicStatus(threadId, state) {
   const entry = store.getTopic(threadId);
   if (!entry) return; // topic never used (no store entry) -- nothing to report
@@ -1504,6 +1514,7 @@ async function handleMessage(message) {
   if (command === 'clearqueue') {
     const q = store.getQueue(threadId);
     store.setQueue(threadId, []);
+    refreshTopicStatusForQueue(threadId);
     for (const it of q) {
       await tg.editMessageText({ chatId: cfg.chatId, messageId: it.placeholderMessageId, text: '🗑 Dropped from queue.' }).catch(() => {});
     }
@@ -1549,6 +1560,7 @@ async function handleMessage(message) {
       text: `📥 Queued (position ${queue.length + 1}) — the bridge is deploying an update and will run this once it's back (usually a few seconds).`,
     });
     store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id }]);
+    refreshTopicStatusForQueue(threadId);
     return;
   }
 
@@ -1605,6 +1617,7 @@ async function handleMessage(message) {
       text: `📥 Queued (position ${queue.length + 1}) — runs when the current message finishes. /clearqueue to drop.`,
     });
     store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id }]);
+    refreshTopicStatusForQueue(threadId);
     return;
   }
 
