@@ -7,16 +7,41 @@
 // code block's *content* without reopening the tags in the next chunk.
 //
 // Deliberately not a full CommonMark parser: the model's output is for a chat
-// window, and a wrong-but-contained rendering beats a parse error that bounces
-// the whole reply. Anything unrecognized passes through as escaped plain text.
+// window, and a wrong-but-contained rendering beats a parse error that
+// bounces the whole reply. Anything unrecognized passes through as escaped plain text.
 
 const CHUNK_LIMIT = 3900; // headroom under Telegram's 4096 for the chunk joins
 
 // chunkLimit is overridden by the streaming preview (bridge/streamer.js),
 // which needs extra headroom in the same message for its ⌛ prefix and
-// status lines.
+// status lines. [file: …] markers are stripped here -- the single render
+// choke point -- so no code path (final delivery or streaming preview) can
+// ever flash them into Telegram as visible text.
 export function renderReply(text, chunkLimit = CHUNK_LIMIT) {
-  return splitHtml(mdToHtml(text ?? ''), chunkLimit);
+  return splitHtml(mdToHtml(stripFileMarkers(text)), chunkLimit);
+}
+
+// The protocol has no "emit file" mechanism -- model replies are text only.
+// The agreed convention for the model to attach a file: a `[file: <path>]`
+// marker on its own line. The bridge validates + sends the file as a
+// document (see sendWorkspaceFile in index.js) and the marker is stripped
+// from both the final reply and the streaming preview, so it never reaches
+// Telegram as visible text.
+const FILE_MARKER = /\[file:\s*([^\]\n]+?)\s*\]/g;
+
+export function stripFileMarkers(text) {
+  return (text ?? '').replace(FILE_MARKER, '');
+}
+
+// Returns the extracted marker paths (deduplicated, order preserved) with
+// the marker text removed -- deliverReply sends the files, renders the rest.
+export function extractFileMarkers(text) {
+  const paths = [];
+  const cleaned = (text ?? '').replace(FILE_MARKER, (m, p) => {
+    if (!paths.includes(p)) paths.push(p);
+    return '';
+  });
+  return { paths, cleaned };
 }
 
 // Fallback for Telegram rejecting our HTML outright ("can't parse entities"):

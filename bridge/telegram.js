@@ -85,6 +85,13 @@ export class TelegramClient {
     return this._call('pinChatMessage', { chat_id: chatId, message_id: messageId, disable_notification: disableNotification });
   }
 
+  // Bots may delete their own messages in groups regardless of age -- used
+  // to replace a status message that has aged out of Telegram's 48h edit
+  // window so exactly one exists at a time.
+  deleteMessage({ chatId, messageId }) {
+    return this._call('deleteMessage', { chat_id: chatId, message_id: messageId });
+  }
+
   // Registers the bridge's own commands so Telegram's client offers them as
   // autocomplete when a / is typed in the chat. Idempotent; safe to call on
   // every boot. chat scope = the one forum group this bridge serves, so the

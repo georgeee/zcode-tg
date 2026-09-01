@@ -59,7 +59,7 @@ import { loadEnv } from './env.js';
 import { ZcodeClient } from './zcodeClient.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
-import { renderReply, toPlainText } from './format.js';
+import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
 import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage } from './usage.js';
 
@@ -713,11 +713,15 @@ function fmtDuration(ms) {
 // back to tag-stripped plain text for that chunk: delivered unformatted beats
 // not delivered. A null placeholderMessageId (adopted turns whose placeholder
 // could not be posted) sends the first chunk as a fresh message instead.
+// Any `[file: path]` markers in the text (the model's way of attaching a
+// file -- the protocol has no native mechanism) are stripped here and sent
+// as documents after the text, workspace-restricted like /file.
 async function deliverReply(placeholderMessageId, threadId, text, footerHtml = '') {
-  const chunks = renderReply(text);
+  const { paths, cleaned } = extractFileMarkers(text);
+  const chunks = renderReply(cleaned);
   if (!chunks.length || !chunks[0]) {
     chunks.length = 0;
-    chunks.push('(no reply text)');
+    chunks.push(paths.length ? '(files attached below)' : '(no reply text)');
   }
   if (footerHtml) chunks[chunks.length - 1] += footerHtml;
   try {
@@ -736,6 +740,18 @@ async function deliverReply(placeholderMessageId, threadId, text, footerHtml = '
     } catch (e) {
       await sendChunkFallback('send', null, threadId, chunks[i], e);
     }
+  }
+  // Cap the blast radius of a model bug that marker-spams its reply.
+  for (const p of paths.slice(0, 5)) {
+    if (!threadId) break;
+    try {
+      await sendWorkspaceFile(threadId, p, { source: 'model' });
+    } catch (e) {
+      // Marker send failures stay out of the chat (the text already said
+      // what the model intended); they're visible server-side.
+      console.error(`[bridge] [file:] marker send failed for ${p}:`, e.message);
+    }
+    await sleep(350);
   }
 }
 
@@ -968,47 +984,85 @@ function parseModelRef(ref) {
   return { providerId, modelId };
 }
 
-// --- per-topic pinned status message (agreed tier-2 item) ---
-// One message per topic showing model · mode · busy/idle · queue depth,
-// edited in place whenever that state changes (never re-sent), pinned if
-// the bot has pin rights in the group -- pinning needs admin, so a failure
-// is logged exactly once and the message lives on unpinned.
-const topicStatus = new Map(); // threadId -> { messageId, pinFailed }
-async function updateTopicStatus(threadId, state) {
-  const entry = store.getTopic(threadId);
-  if (!entry) return; // no session yet -- nothing to report
-  const lines = [
+// --- per-topic pinned status message (agreed tier-2 item, reshaped
+// 2026-09-01 per owner feedback) ---
+// One message per topic showing model · mode · busy/idle · queue depth.
+// Placement: created at TOPIC CREATION (the earliest message a topic can
+// have) so it never occupies conversational space near the latest messages,
+// then edited in place for the topic's lifetime. Pinned when the bot has
+// admin pin rights; until then, pinning is retried quietly on every state
+// change, so it activates the moment rights are granted.
+//   - message deleted by someone -> stop tracking (don't resurrect it at the
+//     bottom of the chat; that's the failure mode this reshape fixed).
+//   - message older than Telegram's 48h bot-edit window -> replaced (old
+//     deleted, new posted + pinned + id re-stored) so exactly one exists.
+const topicStatus = new Map(); // threadId -> { messageId, pinned, gone }
+
+function topicStatusText(threadId, entry, state) {
+  return [
     '📌 Topic status',
     `model: ${entry.model || cfg.defaultModel}`,
     `mode: ${entry.mode || cfg.defaultSessionMode}`,
     `state: ${state === 'busy' ? '⌛ busy — turn running' : 'idle'}`,
     `queued: ${store.getQueue(threadId).length}`,
-  ];
-  const text = lines.join('\n');
-  let st = topicStatus.get(threadId);
-  if (st?.messageId) {
-    await tg.editMessageText({ chatId: cfg.chatId, messageId: st.messageId, text }).catch((e) => {
-      // Deleted by someone / too old to edit: fall back to a fresh message.
-      if (/message to edit not found|MESSAGE_ID_INVALID/i.test(e.message || '')) {
-        topicStatus.delete(threadId);
-      } else {
-        console.error('[bridge] failed to update topic status:', e.message);
-      }
-    });
-    if (topicStatus.has(threadId)) return;
+  ].join('\n');
+}
+
+async function tryPinTopicStatus(threadId, st) {
+  if (!st?.messageId || st.pinned) return;
+  try {
+    await tg.pinChatMessage({ chatId: cfg.chatId, messageId: st.messageId });
+    st.pinned = true;
+  } catch (e) {
+    // Usually "not enough rights" -- the bot needs admin can_pin_messages.
+    // Warn once, keep retrying on later state changes (pinChatMessage on an
+    // already-pinned message is idempotent once it succeeds).
+    if (!tryPinTopicStatus.warned) {
+      tryPinTopicStatus.warned = true;
+      console.error(`[bridge] pinChatMessage failed (${e.message}); will keep retrying -- grant the bot admin pin rights to pin the per-topic status`);
+    }
   }
-  st = { messageId: null, pinFailed: false };
+}
+
+async function updateTopicStatus(threadId, state) {
+  const entry = store.getTopic(threadId);
+  if (!entry) return; // topic never used (no store entry) -- nothing to report
+  const text = topicStatusText(threadId, entry, state);
+  let st = topicStatus.get(threadId);
+  if (st?.gone) return;
+  if (st?.messageId) {
+    let keep = true;
+    try {
+      await tg.editMessageText({ chatId: cfg.chatId, messageId: st.messageId, text });
+    } catch (e) {
+      const m = e.message || '';
+      if (/message to edit not found|MESSAGE_ID_INVALID/i.test(m)) {
+        st.gone = true; // deleted (most likely deliberately) -- let it go
+        return;
+      }
+      if (/can't be edited|too old/i.test(m)) {
+        // Aged past the 48h edit window: replace, keeping exactly one.
+        await tg.deleteMessage({ chatId: cfg.chatId, messageId: st.messageId }).catch(() => {});
+        topicStatus.delete(threadId);
+        st = undefined;
+        keep = false;
+      } else {
+        console.error('[bridge] failed to update topic status:', m);
+        return;
+      }
+    }
+    if (keep && st) {
+      await tryPinTopicStatus(threadId, st);
+      return;
+    }
+  }
+  st = { messageId: null, pinned: false, gone: false };
   topicStatus.set(threadId, st);
   try {
     const msg = await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text });
     st.messageId = msg.message_id;
     store.setTopic(threadId, { statusMessageId: msg.message_id });
-    if (!st.pinFailed) {
-      await tg.pinChatMessage({ chatId: cfg.chatId, messageId: msg.message_id }).catch((e) => {
-        st.pinFailed = true;
-        console.error(`[bridge] pinChatMessage failed (bot needs admin pin rights; status stays unpinned): ${e.message}`);
-      });
-    }
+    await tryPinTopicStatus(threadId, st);
   } catch (e) {
     topicStatus.delete(threadId);
     console.error('[bridge] failed to post topic status:', e.message);
@@ -1020,7 +1074,7 @@ async function updateTopicStatus(threadId, state) {
 // posting a second one.
 function restoreTopicStatuses() {
   for (const [threadId, entry] of Object.entries(store.data.topics)) {
-    if (entry.statusMessageId) topicStatus.set(threadId, { messageId: entry.statusMessageId, pinFailed: false });
+    if (entry.statusMessageId) topicStatus.set(threadId, { messageId: entry.statusMessageId, pinned: false, gone: false });
   }
 }
 
@@ -1112,36 +1166,42 @@ async function handleModeCommand(threadId, arg) {
 // --- /file: send a workspace file into the topic as a document ---
 // Restricted to the workspace subtree: the bridge account can read files
 // (e.g. ~/.zcode credentials) that must not become one tap away from chat.
+// Shared by /file (interactive, errors posted to the topic) and the model's
+// `[file: path]` reply markers (silent). Always restricted to the workspace
+// subtree: the bridge account can read files (e.g. ~/.zcode credentials)
+// that must not become one tap away from chat.
+async function sendWorkspaceFile(threadId, arg, { source }) {
+  const abs = path.resolve(cfg.workspaceDir, arg);
+  const real = await realpath(abs);
+  const root = await realpath(cfg.workspaceDir); // so symlinked prefixes compare correctly
+  if (real !== root && !real.startsWith(root + path.sep)) {
+    throw new Error(`${arg} resolves outside the workspace -- only files under it can be sent`);
+  }
+  const st = await stat(real);
+  if (!st.isFile()) throw new Error('not a regular file');
+  if (st.size > cfg.maxFileBytes) throw new Error(`file is ${Math.round(st.size / 1024 / 1024)} MB; cap is ${Math.round(cfg.maxFileBytes / 1024 / 1024)} MB`);
+  const buf = await readFile(real);
+  await tg.sendDocument({
+    chatId: cfg.chatId,
+    messageThreadId: threadId,
+    blob: new Blob([buf]),
+    filename: path.basename(real),
+    caption: `${arg} (${abbrev(st.size)} B)${source === 'model' ? ' — attached by the agent' : ''}`,
+  });
+}
+
 async function handleFileCommand(threadId, arg) {
   if (!arg) {
     await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: 'Usage: /file <path-inside-workspace>' });
     return;
   }
-  const abs = path.resolve(cfg.workspaceDir, arg);
-  let real;
   try {
-    real = await realpath(abs);
-    const root = await realpath(cfg.workspaceDir); // so symlinked prefixes compare correctly
-    if (real !== root && !real.startsWith(root + path.sep)) {
-      throw new Error(`⚠️ ${arg} resolves outside the workspace -- /file only serves files under it.`);
-    }
-    const st = await stat(real);
-    if (!st.isFile()) throw new Error('not a regular file');
-    if (st.size > cfg.maxFileBytes) throw new Error(`file is ${Math.round(st.size / 1024 / 1024)} MB; cap is ${Math.round(cfg.maxFileBytes / 1024 / 1024)} MB`);
-    const buf = await readFile(real);
-    await tg.sendDocument({
-      chatId: cfg.chatId,
-      messageThreadId: threadId,
-      blob: new Blob([buf]),
-      filename: path.basename(real),
-      caption: `${arg} (${abbrev(st.size)} B)`,
-    });
+    await sendWorkspaceFile(threadId, arg, { source: 'command' });
   } catch (e) {
     const msg = /outside the workspace/.test(e.message || '')
-      ? e.message
+      ? `⚠️ ${e.message}`
       : `⚠️ /file failed: ${/ENOENT/.test(e.message || '') ? 'not found' : e.message}`;
     await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: msg }).catch(() => {});
-    return;
   }
 }
 
@@ -1189,11 +1249,21 @@ async function handleMessage(message) {
     console.warn(`[bridge] ignoring message from unauthorized user ${message.from?.id}`);
     return;
   }
+  const threadId = message.message_thread_id;
   if (message.forum_topic_created) {
-    console.log(`[bridge] topic created: "${message.forum_topic_created.name}" (thread ${message.message_thread_id})`);
+    console.log(`[bridge] topic created: "${message.forum_topic_created.name}" (thread ${threadId})`);
+    if (!threadId) return; // service message outside any topic -- nothing to do
+    // Create the 📌 status message NOW, as the topic's first message, so it
+    // never occupies conversational space near later messages (owner
+    // preference 2026-09-01). A minimal store entry is seeded so the status
+    // has somewhere to live; getOrCreateSession merges the session in later.
+    if (!store.getTopic(threadId)) {
+      store.setTopic(threadId, { model: cfg.defaultModel, mode: cfg.defaultSessionMode });
+    }
+    updateTopicStatus(threadId, 'idle').catch(() => {});
     return;
   }
-  const threadId = message.message_thread_id;
+  if (!threadId) return; // ignore messages outside any topic
   if (!threadId) return; // ignore messages outside any topic
   if (!message.text) return; // ignore non-text (stickers, photos, ...) for v0
 

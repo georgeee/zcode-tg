@@ -108,6 +108,8 @@ export class ReplyStreamer {
     const elapsed = Math.max(0, Math.round((Date.now() - this.startedAt) / 1000));
     const statusLine = this.status ? `${this.status} · ${elapsed}s` : `${elapsed}s`;
     if (!this.text) return `⌛ ${statusLine}`;
+    // [file: …] markers are stripped inside renderReply (single choke point)
+    // -- files are sent as documents at final delivery, never shown as text.
     const chunks = renderReply(this.text, PREVIEW_BUDGET);
     let body = chunks[0];
     // Marker that this is a head-truncated preview, not the whole reply. The

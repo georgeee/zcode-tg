@@ -4,7 +4,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderReply, toPlainText } from '../bridge/format.js';
+import { renderReply, toPlainText, stripFileMarkers, extractFileMarkers } from '../bridge/format.js';
 
 function firstChunk(md) {
   return renderReply(md)[0];
@@ -97,4 +97,29 @@ test('toPlainText undoes the rendering', () => {
   const html = firstChunk('**b** `c` < & [l](https://x.y/z)');
   const plain = toPlainText(html);
   assert.equal(plain, 'b c < & l');
+});
+
+// --- [file: path] markers (bridge-side file attachment convention) ---
+
+test('extractFileMarkers pulls paths and strips markers', () => {
+  const { paths, cleaned } = extractFileMarkers('Here you go:\n\n[file: data/bridge.log]\n\nDone.');
+  assert.deepEqual(paths, ['data/bridge.log']);
+  assert.equal(cleaned, 'Here you go:\n\n\n\nDone.');
+});
+
+test('extractFileMarkers deduplicates and handles multiple + spaced paths', () => {
+  const { paths, cleaned } = extractFileMarkers('[file:a.txt]\n[file: b.txt ]\n[file: a.txt]');
+  assert.deepEqual(paths, ['a.txt', 'b.txt']);
+  assert.ok(!cleaned.includes('file:'));
+});
+
+test('stripFileMarkers leaves ordinary text (even bracketed) alone', () => {
+  assert.equal(stripFileMarkers('see [1] and [files: nope]'), 'see [1] and [files: nope]');
+  assert.equal(stripFileMarkers(undefined), '');
+});
+
+test('markers never render into a reply chunk', () => {
+  const chunks = renderReply('reply text\n\n[file: some/path.log]\n\nend');
+  assert.ok(!chunks.join('\n').includes('some/path.log'));
+  assert.ok(chunks[0].includes('reply text'));
 });

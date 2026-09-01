@@ -195,10 +195,20 @@ through to the model as ordinary input):
   within `USER_INPUT_TIMEOUT_MS` (default 10 min) → auto-declined so the
   turn keeps moving.
 - **Each topic gets a status message** (`📌 Topic status`: model · mode ·
-  busy/idle · queue depth), edited in place on every state change. It's
-  pinned when the bot has pin rights (promote the bot to admin with
-  `can_pin_messages` for that); otherwise it stays a normal message and the
-  bridge logs one notice.
+  busy/idle · queue depth), created at topic creation (the topic's first
+  message, so it never occupies conversational space near the latest
+  messages) and edited in place on every state change after that. It's
+  pinned when the bot has admin `can_pin_messages` rights — promote the bot
+  if you want the pin; until then the bridge retries quietly on every state
+  change. Deleting the message disables it for that topic; past Telegram's
+  48-hour edit window it's replaced (old deleted, new posted + pinned) so
+  exactly one exists.
+- **The model can attach files**: a `[file: <path>]` marker in a reply is
+  stripped by the bridge and the path is sent as a document (workspace
+  subtree only, `MAX_FILE_MB` cap, max 5 per reply) — the protocol has no
+  native file-emit mechanism, so this convention (documented to the agent in
+  its instructions file) is the mechanism. `/file` does the same thing on
+  the user's initiative.
 - **Background tasks**: a task the agent left running that completes while
   the session is idle gets a `🌀` notice, and the turn the runtime
   auto-starts for the `<task-notification>` input is adopted (fresh ⌛
