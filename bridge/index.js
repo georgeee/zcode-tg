@@ -2,8 +2,23 @@
 //
 // One Telegram forum topic == one zcode session. Sending a message in a
 // topic sends it to that session; the final reply lands as an edited
-// placeholder message in the same topic. Send /stop (or /cancel) in a busy
-// topic to abort its in-progress turn.
+// placeholder message in the same topic. A message sent while a turn is
+// still running is queued (persistently) and runs when that turn ends.
+// Send /stop (or /cancel) in a busy topic to abort its in-progress turn.
+//
+// Bridge commands (intercepted before anything reaches the model; anything
+// else starting with / is passed through to zcode's own command handling):
+//   /usage      Z.ai plan quota, from the account's monitoring endpoint
+//   /stop /cancel   cancel the topic's running turn
+//   /queue      list this topic's queued messages
+//   /clearqueue drop this topic's queued messages
+//   /help       the list above
+// These are registered with BotFather-style autocomplete (setMyCommands)
+// on every boot.
+//
+// Model replies are rendered from markdown to Telegram HTML (bridge/format.js)
+// and split under the 4096-char message cap; if Telegram ever rejects the
+// entities, the chunk falls back to plain text rather than being lost.
 //
 // Permission requests: sessions run in "yolo" mode (auto-approve) by
 // default, and any interaction/requestPermission that still arrives is
@@ -21,6 +36,8 @@ import { loadEnv } from './env.js';
 import { ZcodeClient } from './zcodeClient.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
+import { renderReply, toPlainText } from './format.js';
+import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage } from './usage.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
 // a session running in this same directory could read that file as part of
@@ -47,7 +64,22 @@ const cfg = {
   // otherwise be stuck showing the busy placeholder for the rest of the
   // process's life with no recovery short of restarting the whole bridge.
   turnTimeoutMs: Number(process.env.TURN_TIMEOUT_MS || 20 * 60 * 1000), // 20 min
+  // /usage reads the key from zcode's own config at call time -- never
+  // copied into this process's env or the store.
+  zaiConfigPath: process.env.ZAI_CONFIG_PATH || `${process.env.HOME}/.zcode/cli/config.json`,
+  maxQueuePerTopic: Number(process.env.MAX_QUEUE_PER_TOPIC || 20),
 };
+
+// Registered with Telegram on boot so these show as / autocomplete in the
+// client. Keep in sync with the command handling in handleMessage().
+const BOT_COMMANDS = [
+  { command: 'usage', description: 'Z.ai plan usage & quota' },
+  { command: 'stop', description: "Cancel this topic's running turn" },
+  { command: 'cancel', description: "Cancel this topic's running turn" },
+  { command: 'queue', description: 'Show queued messages in this topic' },
+  { command: 'clearqueue', description: 'Drop queued messages in this topic' },
+  { command: 'help', description: 'Bridge commands' },
+];
 
 function need(key) {
   const v = process.env[key];
@@ -345,21 +377,63 @@ async function finalizeTurn(sessionId, terminalParams) {
   const turn = activeTurns.get(sessionId);
   activeTurns.delete(sessionId);
   busySessions.delete(sessionId);
-  if (!turn) return;
-
-  let text;
-  if (terminalParams.status === 'success') {
-    text = turn.finalText ?? turn.textBuffer ?? '(no text response)';
-  } else {
-    const err = turn.error;
-    text = `⚠️ Turn failed: ${terminalParams.errorCode || 'unknown_error'}${err?.message ? `\n${err.message}` : ''}`;
+  const topic = sessionToTopic.get(sessionId);
+  if (turn) {
+    let text;
+    if (terminalParams.status === 'success') {
+      text = turn.finalText ?? turn.textBuffer ?? '(no text response)';
+    } else {
+      const err = turn.error;
+      text = `⚠️ Turn failed: ${terminalParams.errorCode || 'unknown_error'}${err?.message ? `\n${err.message}` : ''}`;
+    }
+    await deliverReply(turn.placeholderMessageId, topic?.threadId, text);
   }
-  text = truncate(text, 4000);
+  // Whatever the user queued behind this turn runs now -- success, failure,
+  // and the "!turn" early-return case all lead here for one reason: the
+  // session is no longer busy, and the queue's whole contract is "runs when
+  // the current message finishes".
+  if (topic) void drainQueue(topic.threadId);
+}
 
+// Render the model's markdown as Telegram HTML, put the first chunk into the
+// turn's placeholder, and follow with additional messages if it didn't fit.
+// A Telegram entity-parse failure (a renderer bug we didn't foresee) falls
+// back to tag-stripped plain text for that chunk: delivered unformatted beats
+// not delivered.
+async function deliverReply(placeholderMessageId, threadId, text) {
+  const chunks = renderReply(text);
+  if (!chunks.length || !chunks[0]) {
+    chunks.length = 0;
+    chunks.push('(no reply text)');
+  }
   try {
-    await tg.editMessageText({ chatId: cfg.chatId, messageId: turn.placeholderMessageId, text });
+    await tg.editMessageText({ chatId: cfg.chatId, messageId: placeholderMessageId, text: chunks[0], parseMode: 'HTML' });
   } catch (e) {
-    console.error('[bridge] failed to edit final reply:', e.message);
+    await sendChunkFallback('edit', placeholderMessageId, threadId, chunks[0], e);
+  }
+  for (let i = 1; i < chunks.length; i++) {
+    await sleep(1100); // same group-rate courtesy as auto-approve notices
+    try {
+      await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: chunks[i], parseMode: 'HTML' });
+    } catch (e) {
+      await sendChunkFallback('send', null, threadId, chunks[i], e);
+    }
+  }
+}
+
+async function sendChunkFallback(method, messageId, threadId, chunk, originalError) {
+  const isParseError = /parse entities|can't parse/i.test(originalError.message || '');
+  if (!isParseError) {
+    console.error(`[bridge] failed to deliver reply chunk (${method}):`, originalError.message);
+    return;
+  }
+  console.error('[bridge] Telegram rejected rendered HTML, falling back to plain text:', originalError.message);
+  const plain = truncate(toPlainText(chunk), 4000);
+  try {
+    if (method === 'edit') await tg.editMessageText({ chatId: cfg.chatId, messageId, text: plain });
+    else await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: plain });
+  } catch (e) {
+    console.error('[bridge] plain-text fallback also failed:', e.message);
   }
 }
 
@@ -377,15 +451,69 @@ setInterval(() => {
     console.error(`[bridge] turn on session ${sessionId} exceeded ${cfg.turnTimeoutMs}ms with no turn.terminal event -- force-clearing`);
     activeTurns.delete(sessionId);
     busySessions.delete(sessionId);
+    const topic = sessionToTopic.get(sessionId);
     tg
       .editMessageText({
         chatId: cfg.chatId,
         messageId: turn.placeholderMessageId,
         text: '⚠️ No response after a long time — giving up on waiting for this turn. Send another message to try again (or /stop next time to cancel earlier).',
       })
-      .catch((e) => console.error('[bridge] failed to edit watchdog-timeout notice:', e.message));
+      .catch((e) => console.error('[bridge] failed to edit watchdog-timeout notice:', e.message))
+      .finally(() => topic && drainQueue(topic.threadId));
   }
 }, 60_000);
+
+// --- workspace model-catalog warm-up (the fix for resumed sends) ---
+// A brand-new `zcode app-server` process starts with an EMPTY model catalog
+// for every workspace key: the per-workspace catalog is only ever filled by
+// `workspace/updateProviderRegistry`, which is part of the desktop app's
+// workspace-open flow -- a flow this bridge never runs. Without it,
+// `session/resume` (no runtimeModel param, persisted model not in the
+// catalog) takes its "deferred model adapter" path: resume reports success,
+// and every subsequent `session/send` on that session rejects with
+// ZCODE_RUNTIME_MODEL_UNAVAILABLE ("历史任务使用的模型已不可用") -- the bug this
+// used to be worked around with a fresh-session fallback (history lost).
+// session/setModel does NOT clear it; warming the catalog before resume does,
+// verified live end-to-end (scratch app-server, context preserved across a
+// process kill: see git history of this commit).
+//
+// The push must carry source:"user" -- the registry handler silently filters
+// out pushes that claim source:"builtin" -- and baseURL + apiKey, which
+// builtin providers resolve internally but user ones must state. The apiKey
+// is read at call time and only ever written to the child's stdin (a pipe to
+// a process that already reads the same config file itself); never logged.
+const warmedCatalogKeys = new Set();
+async function warmWorkspaceCatalog(workspaceKey) {
+  if (warmedCatalogKeys.has(workspaceKey)) return;
+  warmedCatalogKeys.add(workspaceKey);
+  const workspace = { workspacePath: cfg.workspaceDir, workspaceKey };
+  try {
+    const state = await zcode.call('workspace/readState', { workspace });
+    const models = state.modelCatalog?.providers?.find((p) => p.providerId === 'zai')?.models;
+    const zai = readZaiProvider(cfg.zaiConfigPath);
+    if (!models?.length) throw new Error('readState returned no zai models');
+    const provider = {
+      providerId: zai.providerId,
+      kind: zai.kind,
+      source: 'user',
+      label: zai.label,
+      baseURL: zai.baseURL,
+      apiKey: { source: 'inline', value: zai.apiKey },
+      models,
+    };
+    const res = await zcode.call('workspace/updateProviderRegistry', {
+      workspace,
+      registry: { revision: `bridge-warm-${Date.now()}`, generatedAt: Date.now(), providers: [provider] },
+    });
+    if (res.status !== 'applied' || res.providerCount < 1) throw new Error(`registry push not applied (status=${res.status}, providerCount=${res.providerCount})`);
+    console.log(`[bridge] warmed model catalog for workspace key ${workspaceKey} (${res.providerCount} provider)`);
+  } catch (e) {
+    // Not fatal: sends on resumed sessions may still fail with
+    // ZCODE_RUNTIME_MODEL_UNAVAILABLE and fall back to a fresh session --
+    // the pre-fix behavior, degraded but working.
+    console.error(`[bridge] failed to warm model catalog for workspace key ${workspaceKey} (resumed sessions may still fail):`, e.message);
+  }
+}
 
 // --- get-or-create the zcode session for a Telegram topic ---
 // Returns { sessionId, resumed }. `resumed: true` means this call reloaded
@@ -411,6 +539,7 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
     // throws if it isn't already resident; only session/resume's handler
     // falls back to loading the persisted record from disk.
     try {
+      await warmWorkspaceCatalog(`tg-topic-${threadId}`);
       await zcode.call('session/resume', { sessionId: entry.sessionId });
       resumed = true;
     } catch (e) {
@@ -459,6 +588,39 @@ function parseModelRef(ref) {
 }
 
 // --- Telegram message handling ---
+
+// '/usage@botname arg' -> 'usage'; null for anything that isn't a command.
+// Only the bridge's OWN commands are intercepted below -- anything else
+// starting with '/' (zcode's /init, /memo, ...) passes through to the model
+// as ordinary input.
+function parseCommand(text) {
+  const m = text.match(/^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s|$)/);
+  return m ? m[1].toLowerCase() : null;
+}
+
+async function handleUsageCommand(threadId) {
+  let text;
+  try {
+    const apiKey = readZaiApiKey(cfg.zaiConfigPath);
+    text = renderUsage(await fetchUsage({ apiKey }));
+  } catch (e) {
+    text = `⚠️ /usage failed: ${e.message}`;
+  }
+  await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text }).catch((e) => console.error('[bridge] failed to post usage:', e.message));
+}
+
+function helpText() {
+  return [
+    'Bridge commands (each scoped to this topic):',
+    '/usage — Z.ai plan usage & quota',
+    '/stop, /cancel — cancel the running turn',
+    '/queue — show queued messages',
+    '/clearqueue — drop queued messages',
+    '',
+    'Anything else is sent to the model. Messages sent while a turn is running are queued and run in order.',
+  ].join('\n');
+}
+
 async function handleMessage(message) {
   if (message.from?.is_bot) return;
   if (message.chat?.id !== cfg.chatId) return;
@@ -473,6 +635,37 @@ async function handleMessage(message) {
   const threadId = message.message_thread_id;
   if (!threadId) return; // ignore messages outside any topic
   if (!message.text) return; // ignore non-text (stickers, photos, ...) for v0
+
+  // Bridge-own commands that never need a session run before anything else,
+  // so a stray /usage in a brand-new topic doesn't spawn a zcode session.
+  const command = parseCommand(message.text);
+  if (command === 'usage') {
+    await handleUsageCommand(threadId);
+    return;
+  }
+  if (command === 'help') {
+    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: helpText() });
+    return;
+  }
+  if (command === 'queue') {
+    const q = store.getQueue(threadId);
+    const text = q.length
+      ? ['📥 Queued in this topic:', ...q.map((it, i) => `${i + 1}. ${truncate((it.text || '').split('\n')[0], 80)}`)].join('\n')
+      : 'Queue for this topic is empty.';
+    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text });
+    return;
+  }
+  if (command === 'clearqueue') {
+    const q = store.getQueue(threadId);
+    store.setQueue(threadId, []);
+    for (const it of q) {
+      await tg.editMessageText({ chatId: cfg.chatId, messageId: it.placeholderMessageId, text: '🗑 Dropped from queue.' }).catch(() => {});
+    }
+    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: q.length ? `🗑 Dropped ${q.length} queued message(s).` : 'Queue was already empty.' });
+    return;
+  }
+  // /stop and /cancel are NOT handled here: they need the topic's sessionId,
+  // resolved below.
 
   let session;
   try {
@@ -491,33 +684,64 @@ async function handleMessage(message) {
   let sessionId = session.sessionId;
 
   if (busySessions.has(sessionId)) {
-    const cmd = message.text.trim().toLowerCase();
-    if (cmd === '/stop' || cmd === '/cancel') {
+    if (command === 'stop' || command === 'cancel') {
       await zcode.call('session/stop', { sessionId }).catch((e) => console.error('[bridge] session/stop failed:', e.message));
       const turn = activeTurns.get(sessionId);
       busySessions.delete(sessionId);
       activeTurns.delete(sessionId);
+      const queued = store.getQueue(threadId).length;
+      const label = `🛑 Cancelled.${queued ? ` ${queued} queued message(s) will run next.` : ''}`;
       if (turn) {
-        await tg.editMessageText({ chatId: cfg.chatId, messageId: turn.placeholderMessageId, text: '🛑 Cancelled.' }).catch((e) => console.error('[bridge] failed to edit cancelled placeholder:', e.message));
+        await tg.editMessageText({ chatId: cfg.chatId, messageId: turn.placeholderMessageId, text: label }).catch((e) => console.error('[bridge] failed to edit cancelled placeholder:', e.message));
       } else {
-        await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: '🛑 Cancelled.' });
+        await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: label });
       }
+      void drainQueue(threadId);
       return;
     }
-    await tg.sendMessage({
+
+    // Busy + ordinary message: queue it. The notice we post becomes the
+    // turn's placeholder when the message is dequeued, so the reply lands on
+    // the message the user already saw accepted.
+    const queue = store.getQueue(threadId);
+    if (queue.length >= cfg.maxQueuePerTopic) {
+      await tg.sendMessage({
+        chatId: cfg.chatId,
+        messageThreadId: threadId,
+        text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. /stop to cancel the running turn.`,
+      });
+      return;
+    }
+    const notice = await tg.sendMessage({
       chatId: cfg.chatId,
       messageThreadId: threadId,
-      text: '⏳ Still working on the previous message in this topic — try again once it finishes, or send /stop to cancel it.',
+      text: `📥 Queued (position ${queue.length + 1}) — runs when the current message finishes. /clearqueue to drop.`,
     });
+    store.setQueue(threadId, [...queue, { text: message.text, placeholderMessageId: notice.message_id }]);
+    return;
+  }
+
+  if (command === 'stop' || command === 'cancel') {
+    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: 'Nothing is running in this topic.' });
     return;
   }
 
   const placeholder = await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: '⏳ …' });
+  await startTurn(threadId, session, message.text, placeholder.message_id);
+}
+
+// Send one turn's prompt to its session and own every failure path of the
+// send -- including the one-shot fresh-session retry for the known zcode
+// "resumed session rejects sends" quirk (see getOrCreateSession). Split out
+// of handleMessage so the queue drain starts turns through the exact same
+// code path a live-typed message takes.
+async function startTurn(threadId, session, text, placeholderMessageId) {
+  const sessionId = session.sessionId;
   busySessions.add(sessionId);
-  activeTurns.set(sessionId, { placeholderMessageId: placeholder.message_id, textBuffer: '', startedAt: Date.now() });
+  activeTurns.set(sessionId, { placeholderMessageId, textBuffer: '', startedAt: Date.now() });
 
   try {
-    await zcode.call('session/send', { sessionId, content: message.text });
+    await zcode.call('session/send', { sessionId, content: text });
   } catch (e) {
     // session/send itself rejecting outright (as opposed to the turn later
     // completing with status "failed") is a different failure mode --
@@ -545,24 +769,71 @@ async function handleMessage(message) {
       // permanently broken, fall back once to a fresh session (conversation
       // history is lost) and retry this same message before giving up.
       console.error(`[bridge] topic ${threadId}: send failed on a resumed session, retrying once with a fresh session (history lost):`, e.message);
+      let freshSessionId;
       try {
         const fresh = await getOrCreateSession(threadId, { forceFresh: true });
-        busySessions.add(fresh.sessionId);
-        activeTurns.set(fresh.sessionId, { placeholderMessageId: placeholder.message_id, textBuffer: '', startedAt: Date.now() });
-        await zcode.call('session/send', { sessionId: fresh.sessionId, content: message.text });
+        freshSessionId = fresh.sessionId;
+        busySessions.add(freshSessionId);
+        activeTurns.set(freshSessionId, { placeholderMessageId, textBuffer: '', startedAt: Date.now() });
+        await zcode.call('session/send', { sessionId: freshSessionId, content: text });
         return; // retry accepted -- the normal event-driven flow takes it from here
       } catch (retryErr) {
-        busySessions.delete(sessionId);
-        activeTurns.delete(sessionId);
+        // Clears the FRESH session's routing state -- the original
+        // sessionId was already cleared above. (The pre-queue version of
+        // this path cleared the original id twice and never the fresh one,
+        // leaving the fresh session in busySessions forever: a latent
+        // topic-wedging bug this restructure fixes.)
+        if (freshSessionId) {
+          busySessions.delete(freshSessionId);
+          activeTurns.delete(freshSessionId);
+        }
         console.error(`[bridge] topic ${threadId}: retry with a fresh session also failed:`, retryErr);
         e = retryErr;
       }
     }
 
     await tg
-      .editMessageText({ chatId: cfg.chatId, messageId: placeholder.message_id, text: `⚠️ Failed to send: ${e.message}` })
+      .editMessageText({ chatId: cfg.chatId, messageId: placeholderMessageId, text: `⚠️ Failed to send: ${e.message}` })
       .catch((editErr) => console.error('[bridge] failed to edit failure notice:', editErr.message));
+    // The message behind this failed one doesn't deserve to wait forever
+    // just because its predecessor's send was rejected.
+    void drainQueue(threadId);
   }
+}
+
+// Runs the next queued message for a topic, if any -- called from every path
+// that marks a topic's session not-busy (turn finished, failed, cancelled,
+// watchdog-timed-out, send rejected), and once at startup for queues
+// restored from disk. Callers `void` it: draining must never block the
+// delivery of the outcome the user is currently reading.
+async function drainQueue(threadId) {
+  const queue = store.getQueue(threadId);
+  if (!queue.length) return;
+  const [next, ...rest] = queue;
+  store.setQueue(threadId, rest);
+
+  let session;
+  try {
+    session = await getOrCreateSession(threadId);
+  } catch (e) {
+    console.error(`[bridge] topic ${threadId}: failed to get/create session for a queued message:`, e);
+    await tg
+      .editMessageText({ chatId: cfg.chatId, messageId: next.placeholderMessageId, text: `⚠️ Couldn't start a session: ${e.message}` })
+      .catch(() => {});
+    await drainQueue(threadId); // give the one behind it the same chance
+    return;
+  }
+  if (busySessions.has(session.sessionId)) {
+    // Only reachable if something re-busied the session between the turn
+    // ending and this drain. Put the item back at the front rather than
+    // risk a concurrent session/send (-32010).
+    store.setQueue(threadId, [next, ...store.getQueue(threadId)]);
+    return;
+  }
+  await tg
+    .editMessageText({ chatId: cfg.chatId, messageId: next.placeholderMessageId, text: '⏳ …' })
+    .catch((e) => console.error('[bridge] failed to promote queued notice to placeholder:', e.message));
+  await startTurn(threadId, session, next.text, next.placeholderMessageId);
 }
 
 async function handleCallbackQuery(cq) {
@@ -607,6 +878,30 @@ async function handleCallbackQuery(cq) {
 async function main() {
   console.log(`[bridge] starting. chat=${cfg.chatId} workspace=${cfg.workspaceDir} model=${cfg.defaultModel}`);
   await cleanupOrphanedPermissionRequests();
+
+  // Command autocomplete: idempotent, safe on every boot. The chat scope is
+  // the one forum group this bridge serves (so the list shows exactly there);
+  // the default scope covers a 1:1 chat with the bot. Failure is logged and
+  // non-fatal -- the commands still work typed out in full.
+  try {
+    await tg.setMyCommands({ commands: BOT_COMMANDS, scope: { type: 'chat', chat_id: cfg.chatId } });
+    await tg.setMyCommands({ commands: BOT_COMMANDS });
+  } catch (e) {
+    console.error('[bridge] setMyCommands failed (no / autocomplete; commands still work):', e.message);
+  }
+
+  // Queues persisted by a previous process instance: their "📥 Queued"
+  // Telegram messages are still sitting in their topics -- resume draining.
+  // (A message whose turn was killed MID-FLIGHT by that restart is in no
+  // queue and is simply gone; its placeholder stays "⏳" forever. Known gap,
+  // listed in README's known issues.)
+  const restoredQueues = store.getQueues();
+  const restoredThreadIds = Object.keys(restoredQueues);
+  if (restoredThreadIds.length) {
+    console.log(`[bridge] restoring queues: ${restoredThreadIds.map((t) => `topic ${t} (${restoredQueues[t].length})`).join(', ')}`);
+    for (const threadId of restoredThreadIds) await drainQueue(threadId);
+  }
+
   let offset = store.getOffset();
   for (;;) {
     let updates;

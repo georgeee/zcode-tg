@@ -14,7 +14,7 @@
 
 import { readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, unlinkSync } from 'node:fs';
 
-const EMPTY = { updateOffset: undefined, topics: {}, pendingPermissions: {} };
+const EMPTY = { updateOffset: undefined, topics: {}, pendingPermissions: {}, queues: {} };
 
 function isProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -106,5 +106,26 @@ export class Store {
 
   getAllPendingPermissions() {
     return this.data.pendingPermissions || {};
+  }
+
+  // --- per-topic message queue (messages sent while a turn was running) ---
+  // Persisted for the same reason as everything else here: a restart between
+  // "queued" and "processed" shouldn't silently swallow what the user sent.
+  // Each item carries the Telegram message_id of its "queued" notice, which
+  // becomes the turn's placeholder when the item is dequeued -- so even after
+  // a restart the reply lands on the message the user saw accepted.
+  getQueues() {
+    return this.data.queues || {};
+  }
+
+  getQueue(threadId) {
+    return (this.data.queues || {})[threadId] || [];
+  }
+
+  setQueue(threadId, items) {
+    if (!this.data.queues) this.data.queues = {};
+    if (items.length) this.data.queues[threadId] = items;
+    else delete this.data.queues[threadId]; // don't accumulate empty arrays
+    this._save();
   }
 }

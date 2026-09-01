@@ -30,24 +30,36 @@ export class TelegramClient {
     return this._call('getUpdates', { offset, timeout, allowed_updates: allowedUpdates });
   }
 
-  sendMessage({ chatId, messageThreadId, text, replyMarkup, replyToMessageId }) {
+  // parseMode is opt-in per call: model output goes through bridge/format.js
+  // and is sent as 'HTML'; everything the bridge composes itself stays plain
+  // text so an accidental entity in our own strings can't bounce a notice.
+  sendMessage({ chatId, messageThreadId, text, replyMarkup, replyToMessageId, parseMode }) {
     return this._call('sendMessage', {
       chat_id: chatId,
       message_thread_id: messageThreadId,
       text,
       reply_markup: replyMarkup,
       reply_to_message_id: replyToMessageId,
-      parse_mode: undefined, // plain text: model output may contain characters that break Markdown/HTML parsing
+      parse_mode: parseMode,
     });
   }
 
-  editMessageText({ chatId, messageId, text, replyMarkup }) {
+  editMessageText({ chatId, messageId, text, replyMarkup, parseMode }) {
     return this._call('editMessageText', {
       chat_id: chatId,
       message_id: messageId,
       text,
       reply_markup: replyMarkup,
+      parse_mode: parseMode,
     });
+  }
+
+  // Registers the bridge's own commands so Telegram's client offers them as
+  // autocomplete when a / is typed in the chat. Idempotent; safe to call on
+  // every boot. chat scope = the one forum group this bridge serves, so the
+  // command list doesn't leak into whatever other chats the bot ever joins.
+  setMyCommands({ commands, scope }) {
+    return this._call('setMyCommands', { commands, scope });
   }
 
   answerCallbackQuery({ callbackQueryId, text, showAlert = false }) {

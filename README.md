@@ -161,26 +161,48 @@ new account) would close that gap properly; this hasn't been done because
 it needs root access this bridge's own deployment doesn't have. Worth
 doing if that's available.
 
-## Turn lifecycle from Telegram
+## Commands & turn lifecycle from Telegram
 
+The bridge intercepts its own commands before anything reaches the model
+(registered for `/` autocomplete via `setMyCommands` on every boot; anything
+else starting with `/` — e.g. zcode's own `/init`, `/memo` — is passed
+through to the model as ordinary input):
+
+| | |
+|---|---|
+| `/usage` | Z.ai plan quota, from the account's own monitoring endpoint (`/api/monitor/usage/quota/limit`); key read point-of-use from zcode's config |
+| `/stop`, `/cancel` | cancel the topic's running turn (`session/stop`) |
+| `/queue` | list this topic's queued messages |
+| `/clearqueue` | drop this topic's queued messages (their "Queued" notices are edited to "Dropped") |
+| `/help` | the list above |
+
+- **A message sent while a turn is still running is queued**, not rejected:
+  the bridge posts a `📥 Queued (position N)` notice, and that notice becomes
+  the turn's placeholder when the message is dequeued — the reply lands on
+  the message the user saw accepted. Queues are persisted
+  (`data/sessions.json`) and drained in order when the current turn ends,
+  fails, is cancelled, or times out; they're also restored and drained on
+  startup after a restart. Capped at `MAX_QUEUE_PER_TOPIC` (default 20).
 - **`/stop` or `/cancel`** in a topic with a turn in progress calls
   `session/stop` and clears the busy state immediately, instead of waiting
-  for it to finish or time out.
+  for it to finish or time out — then the next queued message (if any) runs.
 - **A turn that never emits completion** (dropped event, an upstream hang
   that doesn't crash the app-server process outright) is force-cleared by a
   background sweep after `TURN_TIMEOUT_MS` (default 20 minutes) — without
   this, a single missed event would wedge that topic on the busy
   placeholder for the rest of the process's life.
+- **Model replies are rendered to Telegram HTML** (`bridge/format.js`):
+  fenced/inline code, bold/italic/strike, links, headings, lists and quotes;
+  everything else passes through escaped. Replies longer than one message
+  are split at safe boundaries (an interrupted code block is reopened in the
+  next chunk). If Telegram ever rejects the rendered entities, the chunk
+  falls back to tag-stripped plain text rather than being lost.
 
 ## Known scope limits (intentional, not oversights)
 
 - **No file upload/download.** Telegram messages without `text` (photos,
   documents, stickers, voice) are ignored. Not needed for the current use
   case.
-- **One turn at a time per topic**, no queueing — a message sent while a
-  topic's session is still processing the previous one gets a "still
-  working" reply (or use `/stop` to cancel first) rather than being queued
-  or interleaved.
 - **No Goal Mode, subagents, MCP management, or model/mode switching
   commands from Telegram** — the zcode Protocol exposes RPCs for all of
   these (`session/goal`, `session/subagents`, `session/setMode`,
@@ -191,9 +213,12 @@ doing if that's available.
   `deliveryKind: "web-remote-replayable"`, but the bridge always
   re-subscribes fresh rather than tracking `eventSeq` to request a precise
   replay window — a turn that was in flight exactly when the process died
-  may not have its tail end delivered on restart.
+  may not have its tail end delivered on restart. Concretely: a message
+  whose turn was killed mid-flight by a restart is in no queue and is gone;
+  its `⏳` placeholder stays as-is (only messages *queued behind* a running
+  turn are persisted and drained on startup).
 
-## Known issue: resumed sessions can still fail to send
+## Restart continuity: resume + catalog warm-up
 
 Every bridge restart spawns a brand-new `zcode app-server` process (there's
 no reconnection to a lingering daemon), so a topic used before the restart
@@ -201,19 +226,22 @@ calls `session/resume` to reload its session before doing anything else —
 without this, that topic would be **permanently** broken after every
 restart (confirmed: `session/subscribe`/`session/send` reject with `-32004
 Session is not active` on a session the fresh process has never heard of,
-forever, since the store keeps returning the same dead id). `session/resume`
-fixes that for topics with real prior activity.
+forever, since the store keeps returning the same dead id).
 
-However: a resumed session can still report `session/resume` as successful
-and then reject `session/send` with a zcode-internal error to the effect of
-"the historical task's model is no longer available" — its model adapter
-stays deferred/unmaterialized. Confirmed by direct testing that none of
-`session/setModel`, switching models away and back, or passing `workspace`
-on the `resume` call itself unstick it; this looks like a genuine zcode
-limitation, not something wrong on the bridge's side, but it wasn't fully
-reverse-engineered. The bridge's fallback: if `session/send` fails on a
-resumed session, it automatically retries **once** with a brand-new session
-(conversation history for that topic is lost, but the topic keeps working
-instead of staying dead). You'll see this as a topic's next reply after a
-restart occasionally starting a fresh conversation rather than continuing
-the old one.
+Resuming alone used not to be enough: a cold process also has an **empty
+model catalog for every workspace key** (only `workspace/updateProviderRegistry`
+— part of the desktop app's workspace-open flow — fills it), so a plain
+resume took zcode's "deferred model adapter" path: `session/resume` reports
+success, then every `session/send` rejects with `ZCODE_RUNTIME_MODEL_UNAVAILABLE`
+("历史任务使用的模型已不可用"). `session/setModel` does not clear it. The bridge now
+**warms the catalog before every resume** (`warmWorkspaceCatalog()` in
+`bridge/index.js`): `workspace/readState` for the model list, then a registry
+push of the `zai` provider as `source:"user"` with the `baseURL`/`apiKey`
+from `~/.zcode/cli/config.json` (builtin-source pushes are filtered out by
+the runtime, and user-source providers must state what builtins resolve
+internally). Verified live: a scratch session killed and resumed this way
+keeps its conversation context across the restart.
+
+The one-shot fresh-session retry on send failure remains as a fallback for
+whatever else can go wrong — if it ever fires now, that's a new bug worth
+looking at, not the known deferred-adapter one.
