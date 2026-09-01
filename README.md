@@ -59,36 +59,25 @@ bridge/store.js (data/sessions.json: topic -> session, update offset)
 
 ## Setup
 
-### 1. zcode runtime
+Two install paths, equally supported: **Nix** (one command, brings its own
+Node and the pinned zcode runtime) and **manual** (your own Node 22.19+ and
+the runtime fetched by hand). Steps 1–2 are the same for both; pick your
+path in step 3.
 
-There's no npm-published build with a working `npm install` at the time of
-writing (arborist bug against the vendor tree), so the runtime has to be
-fetched and prepared by hand from the `zcode-app-cli` npm tarball.
-`ZCODE_BIN` in `.env` points at `bin/zcode.js` inside that extracted
-package; `ZCODE_NODE_BIN` points at a plain Node 22.19+ (no other toolchain
-needed).
-
-Login is **not** re-derivable from this repo — it's a stateful one-time
-step against zcode's own TUI (`/login zai-coding-plan-api-key <key>`, since
-Z.ai OAuth requires macOS). The resulting credential lives in
-`~/.zcode/cli/config.json` under `provider.zai.options.apiKey` on whatever
-host runs the bridge. If you need to re-run it: the API-key field name is
-NOT `provider.zai.apiKey` (that's a decoy — matches a *different* provider
-shape in the schema) — it's nested one level deeper, under `.options`.
-
-### 2. Telegram bot
+### 1. Telegram bot
 
 1. [@BotFather](https://t.me/BotFather) → `/newbot` → copy the token.
 2. `/setprivacy` on that bot → **Disable** (otherwise it only sees
    @-mentions, not every message in a topic).
 3. Create a group, enable **Topics** in group settings, add the bot as a
    normal member (no admin needed — topics are created by hand in the
-   Telegram UI, not by the bot).
+   Telegram UI, not by the bot; promote it with pin rights later if you
+   want the per-topic status message pinned).
 4. Send one message in any topic, then hit
    `https://api.telegram.org/bot<token>/getUpdates` to read off the
    group's `chat_id` (negative number) and your own `user_id`.
 
-### 3. Configure and run
+### 2. Config file, and the one-time zcode login
 
 Config lives at `~/.config/zcode-tg/.env`, **not** `.env` in this
 repo. That's deliberate: this repo *is* the workspace the zcode agent
@@ -103,61 +92,31 @@ what's already on your machine).
 
 ```
 mkdir -p ~/.config/zcode-tg
-cp .env.example ~/.config/zcode-tg/.env   # fill in the values above
+cp .env.example ~/.config/zcode-tg/.env   # fill in the values from step 1
 chmod 600 ~/.config/zcode-tg/.env
-npm install             # only real deps: none at runtime beyond Node itself
-node bridge/index.js    # foreground, for testing
 ```
 
-For a persistent service, see `deploy/zcode-bridge.service` (a `systemd
---user` unit — no root needed since the bridge binds no privileged port and
-only long-polls Telegram outbound):
+The zcode login is **not** re-derivable from this repo — it's a stateful
+one-time step against zcode's own TUI (`/login zai-coding-plan-api-key
+<key>`, since Z.ai OAuth requires macOS), run once on whatever host
+operates the bridge (`nix run github:georgeee/zcode-tg#zcode` gives you
+the CLI on the Nix path). The resulting credential lives in
+`~/.zcode/cli/config.json` under `provider.zai.options.apiKey`. If you
+ever need to re-run it: the API-key field name is NOT
+`provider.zai.apiKey` (that's a decoy — matches a *different* provider
+shape in the schema) — it's nested one level deeper, under `.options`.
 
-```
-mkdir -p ~/.config/systemd/user
-cp deploy/zcode-bridge.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now zcode-bridge.service
-```
+### 3. Install and run
 
-`systemctl --user` needs `XDG_RUNTIME_DIR=/run/user/<uid>` set if your
-shell doesn't already have it (e.g. a bare SSH session vs. a full login).
-Requires lingering enabled for the account (`loginctl show-user <user>` —
-look for `State=lingering`) so the service survives logout/reboot without
-an active session; enabling it if it's not already on needs root
-(`loginctl enable-linger <user>`).
+#### Option A — Nix
 
-The shipped unit only enables prctl/seccomp-based hardening
-(`NoNewPrivileges`, `RestrictSUIDSGID`, `RestrictRealtime`). The
-mount-namespace-based directives (`PrivateTmp`, `ProtectClock`,
-`ProtectHostname`, `ProtectKernelLogs`, `ProtectKernelModules`,
-`ProtectKernelTunables`, `ProtectControlGroups`) were tried and removed:
-under an unprivileged `systemctl --user` manager they can fail the whole
-service with `status=218/CAPABILITIES` — creating those namespaces needs
-privileges a user session manager may not have. Confirmed empirically on at
-least one host; don't re-add without testing on the target host first.
-
-Only one instance may run against a given store path at a time — `store.js`
-takes an exclusive lock file (`data/sessions.json.lock`) at startup and
-fails fast with a clear error if another process already holds it (stale
-locks from a killed process are detected and reclaimed automatically). This
-matters because the natural way to test a change (`node bridge/index.js` in
-the foreground) targets the exact same default store path as the systemd
-service — without the lock, two processes would silently clobber each
-other's topic/session mappings and Telegram update offset.
-
-Logs: `data/bridge.log` (also picked up by `journalctl --user -u
-zcode-bridge`).
-
-### 4. Nix (alternative install: bridge + zcode runtime together)
-
-The repo's flake packages **both halves**: `zcode` (the CLI runtime, pinned
-to a specific npm tarball — the bridge is written against that runtime's
+The flake packages **both halves**: `zcode` (the CLI runtime, pinned to a
+specific npm tarball — the bridge is written against that runtime's
 observed protocol behavior, so versions are bumped deliberately, not
 automatically) and `zcode-tg` (this bridge, wired so its defaults point at
-the packaged runtime and its state lives in `~/.local/state/zcode-tg/`,
-outside the read-only store). Telegram credentials are never baked in —
-same `~/.config/zcode-tg/.env` as above.
+the packaged runtime and Node, and its state lives in
+`~/.local/state/zcode-tg/`, outside the read-only store). Telegram
+credentials are never baked in — same `~/.config/zcode-tg/.env` as above.
 
 ```
 nix run github:georgeee/zcode-tg              # the bridge
@@ -179,6 +138,71 @@ inputs.zcode-tg-flake = {
 Bumping the pinned runtime = change `version` + `hash` in `nix/zcode.nix`
 (hash via `nix store prefetch-file <tarball-url>`) and re-verify the bridge
 against the new runtime before deploying.
+
+#### Option B — manual
+
+There's no npm-published zcode build with a working `npm install` at the
+time of writing (arborist bug against the vendor tree), so the runtime has
+to be fetched and prepared by hand from the `zcode-app-cli` npm tarball.
+`ZCODE_BIN` in `.env` points at `bin/zcode.js` inside that extracted
+package; `ZCODE_NODE_BIN` points at a plain Node 22.19+ (no other
+toolchain needed). The bridge itself has zero npm dependencies:
+
+```
+node bridge/index.js    # foreground, for testing
+```
+
+### 4. Persistent service (either path)
+
+`deploy/zcode-bridge.service` is a `systemd --user` unit template — no
+root needed since the bridge binds no privileged port and only long-polls
+Telegram outbound. Adjust `WorkingDirectory` and `ExecStart` to your
+install:
+
+```
+# Nix: point straight at the built wrapper (the repo checkout is not needed)
+ExecStart=$(nix build --no-link --print-out-paths github:georgeee/zcode-tg)/bin/zcode-tg
+
+# Manual: repo checkout + your node
+ExecStart=/usr/bin/env node bridge/index.js
+```
+
+```
+mkdir -p ~/.config/systemd/user
+cp deploy/zcode-bridge.service ~/.config/systemd/user/   # edit as above
+systemctl --user daemon-reload
+systemctl --user enable --now zcode-bridge.service
+```
+
+`systemctl --user` needs `XDG_RUNTIME_DIR=/run/user/<uid>` set if your
+shell doesn't already have it (e.g. a bare SSH session vs. a full login).
+Requires lingering enabled for the account (`loginctl show-user <user>` —
+look for `State=lingering`) so the service survives logout/reboot without
+an active session; enabling it if it's not already on needs root
+(`loginctl enable-linger <user>`).
+
+The shipped unit only enables prctl/seccomp-based hardening
+(`NoNewPrivileges`, `RestrictSUIDSGID`, `RestrictRealtime`). The
+mount-namespace-based directives (`PrivateTmp`, `ProtectClock`,
+`ProtectHostname`, `ProtectKernelLogs`, `ProtectKernelModules`,
+`ProtectKernelTunables`, `ProtectControlGroups`) were tried and removed:
+under an unprivileged `systemctl --user` manager they can fail the whole
+service with `status=218/CAPABILITIES` — creating those namespaces needs
+privileges a user session manager may not have. Confirmed empirically on
+at least one host; don't re-add without testing on the target host first.
+
+Only one bridge instance may run against a given store path at a time —
+`store.js` takes an exclusive lock file at startup and fails fast with a
+clear error if another process already holds it (stale locks from a
+killed process are detected and reclaimed automatically). This matters
+because the natural way to test a change (running the bridge in the
+foreground) can target the exact same default store path as the systemd
+service — without the lock, two processes would silently clobber each
+other's topic/session mappings and Telegram update offset.
+
+Logs: `data/bridge.log` when run from a checkout (the unit template
+appends there; `journalctl --user -u zcode-bridge` picks it up), or your
+journal directly under the Nix wrapper.
 
 ## Permissions / safety model
 

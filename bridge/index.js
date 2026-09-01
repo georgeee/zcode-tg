@@ -56,6 +56,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { loadEnv, resolveEnvPath } from './env.js';
+import { existsSync } from 'node:fs';
 import { ZcodeClient } from './zcodeClient.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
@@ -138,7 +139,26 @@ const BOT_COMMANDS = [
 
 function need(key) {
   const v = process.env[key];
-  if (!v) throw new Error(`missing required env var: ${key}`);
+  if (!v) {
+    // The first var every fresh install trips on is TELEGRAM_BOT_TOKEN, and
+    // a bare "missing required env var" sent people digging through the
+    // README. Point at the config path actually being searched (honoring
+    // ZCODE_TG_ENV / the pre-rename fallbacks) and say what to do about it.
+    if (key.startsWith('TELEGRAM_')) {
+      const cfgPath = resolveEnvPath({ override: process.env.ZCODE_TG_ENV || process.env.ZCODE_MOBILE_ENV });
+      const have = existsSync(cfgPath);
+      const lines = [
+        `missing required env var: ${key}`,
+        have
+          ? `${cfgPath} exists but doesn't define ${key} -- fill it in (see .env.example in the repo).`
+          : `No config found. Create ${cfgPath} (template: .env.example in the repo) with at least TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID and TELEGRAM_ALLOWED_USER_ID.`,
+        `To use a different location, set ZCODE_TG_ENV=/path/to/.env (the pre-rename ZCODE_MOBILE_ENV and ~/.config/zcode-mobile-bridge/ path still work).`,
+      ];
+      console.error(lines.join('\n'));
+      process.exit(1);
+    }
+    throw new Error(`missing required env var: ${key}`);
+  }
   return v;
 }
 
