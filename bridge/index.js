@@ -61,7 +61,7 @@ import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
-import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage } from './usage.js';
+import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages } from './usage.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
 // a session running in this same directory could read that file as part of
@@ -1094,14 +1094,46 @@ function parseModelRef(ref) {
 //     deleted, new posted + pinned + id re-stored) so exactly one exists.
 const topicStatus = new Map(); // threadId -> { messageId, pinned, gone }
 
-function topicStatusText(threadId, entry, state) {
-  return [
-    '📌 Topic status',
-    `model: ${entry.model || cfg.defaultModel}`,
-    `mode: ${entry.mode || cfg.defaultSessionMode}`,
-    `state: ${state === 'busy' ? '⌛ busy — turn running' : 'idle'}`,
-    `queued: ${store.getQueue(threadId).length}`,
-  ].join('\n');
+// Usage percentages for the status line, from the same quota endpoint
+// /usage reads. Cached with a TTL: status writes fire on every turn
+// start/end across every topic, and that endpoint is the account's
+// rate-limit-sensitive monitor -- one call per 5 minutes regardless of
+// traffic. The refresh is fire-and-forget, so a given write renders the
+// PREVIOUS cache; figures lag by at most one refresh cycle.
+let usagePct = { at: 0, shortPct: null, weekPct: null, warned: false };
+function refreshUsagePercentages() {
+  if (Date.now() - usagePct.at < 5 * 60_000) return;
+  usagePct.at = Date.now(); // set eagerly: concurrent writers don't stampede
+  fetchUsage({ apiKey: readZaiApiKey(cfg.zaiConfigPath) })
+    .then((data) => {
+      usagePct = { ...usagePct, ...usagePercentages(data), warned: false };
+    })
+    .catch((e) => {
+      // Log once per failure streak, not per turn: this endpoint 429s when
+      // the account runs hot (observed live), and stale percentages are a
+      // degradation, not an emergency.
+      if (!usagePct.warned) {
+        usagePct.warned = true;
+        console.error(`[bridge] status usage refresh failed (percentages will lag or be omitted): ${e.message}`);
+      }
+    });
+}
+
+function statusUsageText() {
+  const seg = [];
+  if (usagePct.shortPct != null) seg.push(`${usagePct.shortPct}% session`);
+  if (usagePct.weekPct != null) seg.push(`${usagePct.weekPct}% week`);
+  return seg.length ? seg.join(' / ') : null;
+}
+
+// Owner-specified format (2026-09-01): one compact line -- one-word state,
+// "N queued" / "no queued", and usage as percentages only. Model and mode
+// are deliberately not here; /model and /mode each confirm their own effect.
+function topicStatusText(threadId, state) {
+  const parts = [state === 'busy' ? 'busy' : 'idle', `${store.getQueue(threadId).length || 'no'} queued`];
+  const usage = statusUsageText();
+  if (usage) parts.push(usage);
+  return `📌 ${parts.join(' · ')}`;
 }
 
 async function tryPinTopicStatus(threadId, st) {
@@ -1123,7 +1155,8 @@ async function tryPinTopicStatus(threadId, st) {
 async function updateTopicStatus(threadId, state) {
   const entry = store.getTopic(threadId);
   if (!entry) return; // topic never used (no store entry) -- nothing to report
-  const text = topicStatusText(threadId, entry, state);
+  refreshUsagePercentages(); // fire-and-forget; this write uses the last cache
+  const text = topicStatusText(threadId, state);
   let st = topicStatus.get(threadId);
   if (st?.gone) return;
   if (st?.messageId) {
@@ -1703,6 +1736,7 @@ async function handleCallbackQuery(cq) {
 async function main() {
   console.log(`[bridge] starting. chat=${cfg.chatId} workspace=${cfg.workspaceDir} model=${cfg.defaultModel}`);
   restoreTopicStatuses();
+  refreshUsagePercentages(); // warm the cache so the first status write has figures
   await cleanupOrphanedPermissionRequests();
 
   // Command autocomplete: idempotent, safe on every boot. The chat scope is

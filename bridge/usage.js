@@ -73,6 +73,18 @@ export function renderUsage(data, now = Date.now()) {
   return `📊 Z.ai usage\n\n${table}${level}`;
 }
 
+// Percentages-only digest for the per-topic status line ("11% session /
+// 5% week" -- owner format, 2026-09-01): short-term window (unit 3) is the
+// "session" figure, weekly (unit 6) the "week" one. Either is null when the
+// response doesn't carry that window; callers render only what exists.
+export function usagePercentages(data) {
+  const limits = Array.isArray(data?.limits) ? data.limits : [];
+  const short = limits.find((l) => l.unit === 3);
+  const week = limits.find((l) => l.unit === 6);
+  const pct = (l) => (l && Number.isFinite(l.percentage) ? Math.round(l.percentage) : null);
+  return { shortPct: pct(short), weekPct: pct(week) };
+}
+
 function utc(epochMs) {
   return new Date(epochMs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
 }

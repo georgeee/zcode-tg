@@ -6,7 +6,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderUsage } from '../bridge/usage.js';
+import { renderUsage, usagePercentages } from '../bridge/usage.js';
 
 const LIVE_PAYLOAD = {
   code: 200,
@@ -53,4 +53,17 @@ test('columns are aligned (every data row is exactly as wide as its content)', (
   const out = renderUsage(LIVE_PAYLOAD.data, NOW);
   const lines = out.split('\n').filter((l) => l.includes(' cr '));
   assert.equal(lines.length, 2);
+});
+
+// --- usagePercentages: the status line's percentages-only digest ---
+
+test('usagePercentages maps short-term -> session, weekly -> week', () => {
+  assert.deepEqual(usagePercentages(LIVE_PAYLOAD.data), { shortPct: 6, weekPct: 1 });
+});
+
+test('usagePercentages rounds, and tolerates missing windows / junk input', () => {
+  assert.deepEqual(usagePercentages({ limits: [{ unit: 3, percentage: 11.4 }] }), { shortPct: 11, weekPct: null });
+  assert.deepEqual(usagePercentages({ limits: [{ unit: 6, percentage: 5 }] }), { shortPct: null, weekPct: 5 });
+  assert.deepEqual(usagePercentages({}), { shortPct: null, weekPct: null });
+  assert.deepEqual(usagePercentages(null), { shortPct: null, weekPct: null });
 });

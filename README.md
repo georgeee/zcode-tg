@@ -194,15 +194,20 @@ through to the model as ordinary input):
   questions are single-pick — a Telegram-buttons limitation). No answer
   within `USER_INPUT_TIMEOUT_MS` (default 10 min) → auto-declined so the
   turn keeps moving.
-- **Each topic gets a status message** (`📌 Topic status`: model · mode ·
-  busy/idle · queue depth), created at topic creation (the topic's first
-  message, so it never occupies conversational space near the latest
-  messages) and edited in place on every state change after that. It's
-  pinned when the bot has admin `can_pin_messages` rights — promote the bot
-  if you want the pin; until then the bridge retries quietly on every state
-  change. Deleting the message disables it for that topic; past Telegram's
-  48-hour edit window it's replaced (old deleted, new posted + pinned) so
-  exactly one exists.
+- **Each topic gets a status message** — one compact line in the owner's
+  specified format: `📌 idle · no queued · 11% session / 5% week` (one-word
+  state, queue depth as `N queued`/`no queued`, Z.ai plan usage as
+  percentages only: short-term "session" window and weekly window). Created
+  at topic creation (the topic's first message, so it never occupies
+  conversational space near the latest messages) and edited in place on
+  every state change after that. The usage figures come from the same quota
+  endpoint as `/usage`, cached for 5 minutes (status writes fire per turn
+  and the monitor endpoint is rate-limit-sensitive) and omitted while
+  unavailable. It's pinned when the bot has admin `can_pin_messages` rights
+  — promote the bot if you want the pin; until then the bridge retries
+  quietly on every state change. Deleting the message disables it for that
+  topic; past Telegram's 48-hour edit window it's replaced (old deleted,
+  new posted + pinned) so exactly one exists.
 - **The model can attach files**: a `[file: <path>]` marker in a reply is
   stripped by the bridge and the path is sent as a document (workspace
   subtree only, `MAX_FILE_MB` cap, max 5 per reply) — the protocol has no
