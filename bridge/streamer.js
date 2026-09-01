@@ -23,16 +23,17 @@ import { renderReply } from './format.js';
 const PREVIEW_BUDGET = 3200;
 
 export class ReplyStreamer {
-  // ({ tg, chatId, messageId, threadId, minEditIntervalMs })
+  // ({ tg, chatId, messageId, threadId, minEditIntervalMs, heartbeatMs })
   // messageId may be null for "adopted" turns (see index.js) whose
   // placeholder message is still being sent; edits simply wait until it
   // shows up.
-  constructor({ tg, chatId, messageId, threadId, minEditIntervalMs = 5000 }) {
+  constructor({ tg, chatId, messageId, threadId, minEditIntervalMs = 5000, heartbeatMs = 60000 }) {
     this.tg = tg;
     this.chatId = chatId;
     this.messageId = messageId;
     this.threadId = threadId;
     this.minEditIntervalMs = minEditIntervalMs;
+    this.heartbeatMs = heartbeatMs;
     this.text = '';
     this.status = null; // e.g. '🔧 Bash' / '💭 thinking' / '❓ waiting for your answer'
     this.startedAt = Date.now();
@@ -41,6 +42,23 @@ export class ReplyStreamer {
     this.dirty = false;
     this.dead = false; // placeholder deleted / unrecoverable -- stop trying
     this._timer = null;
+    // update() -- and so a fresh elapsed-time render -- is only ever called
+    // from a real protocol event (index.js). A single long-running tool call
+    // (a VM boot, a slow test suite, ...) can go many minutes between two
+    // such events, and _render()'s "elapsed" is only ever recomputed when a
+    // flush actually runs -- so with no heartbeat the displayed "· 117s"
+    // just freezes at whatever it was on the LAST event, even though the
+    // turn is still genuinely running. Found the hard way (2026-09-01): a
+    // task 130+ minutes and 28 tool-call iterations in, one Bash call away
+    // from its next update, looked abandoned from a frozen counter that
+    // hadn't moved in a long while. This timer periodically marks the state
+    // dirty with no new content, purely so elapsed keeps advancing --
+    // same throttle/dedupe path as a real update, just self-triggered.
+    this._heartbeat = heartbeatMs > 0 ? setInterval(() => {
+      if (this.dead) return;
+      this.dirty = true;
+      this._schedule();
+    }, heartbeatMs) : null;
   }
 
   // Record new streaming state. `text` is the FULL accumulated buffer so far
@@ -58,6 +76,8 @@ export class ReplyStreamer {
   stop() {
     if (this._timer) clearTimeout(this._timer);
     this._timer = null;
+    if (this._heartbeat) clearInterval(this._heartbeat);
+    this._heartbeat = null;
     this.dirty = false;
   }
 

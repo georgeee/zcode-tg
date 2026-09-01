@@ -86,6 +86,13 @@ const cfg = {
   // (one edit per message per interval, per the agreed Telegram-side
   // contract -- the 20 msg/min group cap is explicitly not a constraint).
   streamEditIntervalMs: Number(process.env.STREAM_EDIT_INTERVAL_MS || 5000),
+  // A turn stuck inside ONE long tool call (VM boot, a slow test run, ...)
+  // gets no update() calls between the tool starting and finishing -- the
+  // placeholder's displayed elapsed time would otherwise freeze for the
+  // whole stretch and a genuinely-running turn looks abandoned. This is
+  // the "still alive" pulse period, independent of and coarser than
+  // streamEditIntervalMs above (which paces REAL content). 0 disables it.
+  streamHeartbeatMs: Number(process.env.STREAM_HEARTBEAT_MS ?? 60000),
   // How long a posted AskUserQuestion prompt waits for a button tap before
   // being declined (the turn keeps going either way).
   userInputTimeoutMs: Number(process.env.USER_INPUT_TIMEOUT_MS || 10 * 60 * 1000),
@@ -692,7 +699,7 @@ async function adoptUnclaimedTurn(sessionId, params) {
     return;
   }
   entry.placeholderMessageId = msg.message_id;
-  entry.streamer = new ReplyStreamer({ tg, chatId: cfg.chatId, messageId: msg.message_id, threadId: topic.threadId, minEditIntervalMs: cfg.streamEditIntervalMs });
+  entry.streamer = new ReplyStreamer({ tg, chatId: cfg.chatId, messageId: msg.message_id, threadId: topic.threadId, minEditIntervalMs: cfg.streamEditIntervalMs, heartbeatMs: cfg.streamHeartbeatMs });
   entry.streamer.update({ text: entry.textBuffer, status: '🌀 processing' });
   updateTopicStatus(topic.threadId, 'busy').catch(() => {});
   console.log(`[bridge] adopted auto-started turn ${params.turnId} on session ${sessionId}`);
@@ -1560,7 +1567,7 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
     textBuffer: '',
     startedAt: Date.now(),
     toolNames: new Map(), // toolCallId -> toolName (result events don't repeat the name)
-    streamer: new ReplyStreamer({ tg, chatId: cfg.chatId, messageId: placeholderMessageId, threadId, minEditIntervalMs: cfg.streamEditIntervalMs }),
+    streamer: new ReplyStreamer({ tg, chatId: cfg.chatId, messageId: placeholderMessageId, threadId, minEditIntervalMs: cfg.streamEditIntervalMs, heartbeatMs: cfg.streamHeartbeatMs }),
   };
   activeTurns.set(sessionId, turn);
   updateTopicStatus(threadId, 'busy').catch(() => {});
@@ -1601,12 +1608,13 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
         const fresh = await getOrCreateSession(threadId, { forceFresh: true });
         freshSessionId = fresh.sessionId;
         busySessions.add(freshSessionId);
+        const freshStreamer = new ReplyStreamer({ tg, chatId: cfg.chatId, messageId: placeholderMessageId, threadId, minEditIntervalMs: cfg.streamEditIntervalMs, heartbeatMs: cfg.streamHeartbeatMs });
         activeTurns.set(freshSessionId, {
           placeholderMessageId,
           textBuffer: '',
           startedAt: Date.now(),
           toolNames: new Map(),
-          streamer: new ReplyStreamer({ tg, chatId: cfg.chatId, messageId: placeholderMessageId, threadId, minEditIntervalMs: cfg.streamEditIntervalMs }),
+          streamer: freshStreamer,
         });
         await zcode.call('session/send', { sessionId: freshSessionId, content: text });
         return; // retry accepted -- the normal event-driven flow takes it from here
@@ -1620,6 +1628,13 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
           busySessions.delete(freshSessionId);
           activeTurns.delete(freshSessionId);
         }
+        // Stop it explicitly -- it's no longer reachable through
+        // activeTurns for anything else to stop it, and since the
+        // heartbeat timer (added 2026-09-01) runs unconditionally from
+        // construction, an unstopped one would keep firing forever and
+        // periodically clobber the "Failed to send" notice below with a
+        // stale re-render of a turn that never actually started.
+        freshStreamer?.stop();
         console.error(`[bridge] topic ${threadId}: retry with a fresh session also failed:`, retryErr);
         e = retryErr;
       }

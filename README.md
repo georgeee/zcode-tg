@@ -188,6 +188,18 @@ through to the model as ordinary input):
   preview is replaced by the authoritative full render plus a small usage
   footer (`⏱ duration · tokens in/out · tool calls`). `bridge/streamer.js`
   owns the throttling.
+- **The elapsed-time counter has its own heartbeat, separate from real
+  content.** `update()` — and so a fresh render of "elapsed" — only ever
+  fires from an actual protocol event; a turn stuck inside ONE long tool
+  call (a VM boot, a slow test run, ...) can go many minutes with none.
+  Without a heartbeat the displayed `· 117s` freezes at whatever it was on
+  the last event, and a turn that's genuinely still working looks
+  abandoned from the chat. Found live (2026-09-01): a task 130+ minutes and
+  28 tool-call iterations in — confirmed still active via a fresh
+  `tool.call.started` in zcode's own structured log — looked dead from a
+  placeholder whose counter hadn't moved in a long while. `STREAM_HEARTBEAT_MS`
+  (default 60s) nudges a re-render on a timer independent of real events;
+  0 disables it and restores the old behavior.
 - **The model can ask questions**: `interaction/requestUserInput` (the
   AskUserQuestion tool) is posted to the topic as inline-button prompts and
   genuinely answered from Telegram (one tap per question; multi-select
