@@ -1136,7 +1136,12 @@ async function updateTopicStatus(threadId, state) {
         st.gone = true; // deleted (most likely deliberately) -- let it go
         return;
       }
-      if (/can't be edited|too old/i.test(m)) {
+      if (/message is not modified/i.test(m)) {
+        // Two consecutive writes with identical content (e.g. /model then
+        // /mode while idle). Not an error -- but treating it as one (the old
+        // behavior) logged noise on every no-op write AND skipped the pin
+        // retry below. Fall through to tryPinTopicStatus like a success.
+      } else if (/can't be edited|too old/i.test(m)) {
         // Aged past the 48h edit window: replace, keeping exactly one.
         await tg.deleteMessage({ chatId: cfg.chatId, messageId: st.messageId }).catch(() => {});
         topicStatus.delete(threadId);
@@ -1408,10 +1413,14 @@ async function handleMessage(message) {
   // Replying to an earlier message quotes it into the prompt (agreed tier-3
   // item): the model otherwise has no way to know which of the topic's many
   // messages the user is pointing at. Composed before the busy-queue branch
-  // so a queued reply-to keeps its quote too.
+  // so a queued reply-to keeps its quote too. Quoting is skipped for the
+  // bridge's own chrome (status/queued/notice messages and still-streaming
+  // ⌛ placeholders) -- quoting "📌 Topic status" into a prompt is noise,
+  // and a mid-stream reply's ⌛-prefixed preview is an incomplete text the
+  // model can't usefully act on.
   let promptText = message.text;
   const quoted = message.reply_to_message?.text;
-  if (quoted && quoted.trim()) {
+  if (quoted && quoted.trim() && !/^(📌|📥|⌛|🌀|🔓|⚠️)/.test(quoted.trim())) {
     const q = truncate(quoted, 600);
     promptText = `[replying to this earlier message in the topic]\n${q.split('\n').map((l) => `> ${l}`).join('\n')}\n\n${message.text}`;
   }

@@ -123,3 +123,11 @@ test('markers never render into a reply chunk', () => {
   assert.ok(!chunks.join('\n').includes('some/path.log'));
   assert.ok(chunks[0].includes('reply text'));
 });
+
+test('inline [file: …] mentions in prose or fences do NOT trigger or strip', () => {
+  // The model explaining the convention in writing must not send files.
+  const inline = 'Use the marker `[file: x.log]` to attach.';
+  assert.deepEqual(extractFileMarkers(inline).paths, []);
+  assert.ok(extractFileMarkers(inline).cleaned.includes('[file: x.log]'));
+  assert.ok(stripFileMarkers('mid-sentence [file: a.txt] mention') .includes('[file: a.txt]'));
+});

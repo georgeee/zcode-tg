@@ -27,7 +27,12 @@ export function renderReply(text, chunkLimit = CHUNK_LIMIT) {
 // document (see sendWorkspaceFile in index.js) and the marker is stripped
 // from both the final reply and the streaming preview, so it never reaches
 // Telegram as visible text.
-const FILE_MARKER = /\[file:\s*([^\]\n]+?)\s*\]/g;
+// LINE-ANCHORED deliberately: the model routinely *mentions* the convention
+// in prose or code fences when explaining it (an earlier version matched
+// `[file: …]` anywhere, and any such mention would have been silently
+// stripped from the render AND triggered a bogus document send for whatever
+// path-like text sat inside the brackets).
+const FILE_MARKER = /^[ \t]*\[file:\s*([^\]\n]+?)\s*\][ \t]*$/gm;
 
 export function stripFileMarkers(text) {
   return (text ?? '').replace(FILE_MARKER, '');
