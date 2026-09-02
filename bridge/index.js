@@ -62,6 +62,7 @@ import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
+import { ProgressReporter } from './progress.js';
 import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages } from './usage.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
@@ -88,6 +89,12 @@ const cfg = {
   // (one edit per message per interval, per the agreed Telegram-side
   // contract -- the 20 msg/min group cap is explicitly not a constraint).
   streamEditIntervalMs: Number(process.env.STREAM_EDIT_INTERVAL_MS || 5000),
+  // Turn-progress presentation. 'messages' (branch default): one Telegram
+  // message per milestone, last one live-updating, steps listed inside
+  // (bridge/progress.js). 'preview': the pre-branch single-placeholder
+  // streaming (bridge/streamer.js). 'off': a bare placeholder, edits only
+  // at completion.
+  streamProgress: process.env.STREAM_PROGRESS || 'messages',
   // A turn stuck inside ONE long tool call (VM boot, a slow test run, ...)
   // gets no update() calls between the tool starting and finishing -- the
   // placeholder's displayed elapsed time would otherwise freeze for the
@@ -242,11 +249,13 @@ async function shutdown(signal) {
   // outlive us as an orphaned, still-authenticated zcode process.
   const notifications = [...activeTurns.values()].map((turn) => {
     turn.streamer?.stop();
-    if (!turn.placeholderMessageId) return Promise.resolve();
+    turn.progress?.stop();
+    const liveId = turnLiveMessageId(turn);
+    if (!liveId) return Promise.resolve();
     return tg
       .editMessageText({
         chatId: cfg.chatId,
-        messageId: turn.placeholderMessageId,
+        messageId: liveId,
         text: "⚠️ Bridge is restarting (deploying an update) — this turn was interrupted. Send your message again once it's back (usually a few seconds).",
       })
       .catch((e) => console.error('[bridge] failed to notify an in-flight turn of shutdown:', e.message));
@@ -639,7 +648,21 @@ zcode.on('event', (msg) => {
       return;
     }
 
-    if (payload?.kind === 'text_delta' && typeof payload.delta === 'string') {
+    if (turn.progress) {
+      // Milestone mode (STREAM_PROGRESS=messages, branch experiment
+      // 2026-09-02): narration blocks become per-milestone messages, tool
+      // calls become the steps listed inside them -- see bridge/progress.js.
+      // textBuffer still accumulates for the final-text fallback below.
+      if (payload?.kind === 'text_delta' && typeof payload.delta === 'string') {
+        turn.textBuffer += payload.delta;
+        turn.progress.narration(payload.delta);
+      } else if (payload?.kind === 'tool_call') {
+        if (payload.toolCallId) turn.toolNames.set(payload.toolCallId, payload.toolName);
+        turn.progress.toolCall(payload);
+      } else if (payload?.kind === 'result') {
+        turn.progress.toolResult(payload);
+      }
+    } else if (payload?.kind === 'text_delta' && typeof payload.delta === 'string') {
       turn.textBuffer += payload.delta;
       turn.streamer?.update({ text: turn.textBuffer, status: null });
     } else if (payload?.kind === 'reasoning_delta') {
@@ -723,8 +746,7 @@ async function adoptUnclaimedTurn(sessionId, params) {
     return;
   }
   entry.placeholderMessageId = msg.message_id;
-  entry.streamer = new ReplyStreamer({ tg, chatId: cfg.chatId, messageId: msg.message_id, threadId: topic.threadId, minEditIntervalMs: cfg.streamEditIntervalMs, heartbeatMs: cfg.streamHeartbeatMs });
-  entry.streamer.update({ text: entry.textBuffer, status: '🌀 processing' });
+  attachTurnView(entry, { placeholderMessageId: msg.message_id, threadId: topic.threadId });
   updateTopicStatus(topic.threadId, 'busy').catch(() => {});
   console.log(`[bridge] adopted auto-started turn ${params.turnId} on session ${sessionId}`);
 }
@@ -753,6 +775,11 @@ async function finalizeTurn(sessionId, terminalParams) {
     const topic = sessionToTopic.get(sessionId);
     if (turn) {
       turn.streamer?.stop();
+      // Milestone mode: freeze the last milestone message; settle() says
+      // which message the final reply may REPLACE (the degenerate tool-less
+      // single-placeholder case) -- otherwise the reply goes out as its own
+      // message after the milestone trail.
+      const replaceId = turn.progress ? await turn.progress.settle() : turn.placeholderMessageId;
       let text;
       if (terminalParams.status === 'success') {
         text = turn.finalText ?? turn.textBuffer ?? '';
@@ -763,14 +790,15 @@ async function finalizeTurn(sessionId, terminalParams) {
       if (turn.adopted && !text.trim()) {
         // Auto-started notification turns sometimes produce no user-facing
         // text; a quiet label beats spamming "(no reply text)".
-        if (turn.placeholderMessageId) {
+        const quietId = replaceId ?? turnLiveMessageId(turn);
+        if (quietId) {
           await tg
-            .editMessageText({ chatId: cfg.chatId, messageId: turn.placeholderMessageId, text: '🌀 Background task notification processed.' })
+            .editMessageText({ chatId: cfg.chatId, messageId: quietId, text: '🌀 Background task notification processed.' })
             .catch(() => {});
         }
       } else {
         const footer = terminalParams.status === 'success' ? usageFooter(turn, terminalParams) : '';
-        await deliverReply(turn.placeholderMessageId, topic?.threadId, text.trim() ? text : '(no reply text)', footer);
+        await deliverReply(replaceId, topic?.threadId, text.trim() ? text : '(no reply text)', footer);
       }
     }
     if (topic) {
@@ -923,6 +951,7 @@ setInterval(() => {
     if (now - turn.startedAt <= cfg.turnTimeoutMs) continue;
     console.error(`[bridge] turn on session ${sessionId} exceeded ${cfg.turnTimeoutMs}ms with no turn.terminal event -- stopping it and force-clearing`);
     turn.streamer?.stop();
+    turn.progress?.stop();
     zcode.call('session/stop', { sessionId }).catch((e) => console.error(`[bridge] session/stop on watchdog timeout failed for ${sessionId} (state is cleared locally regardless):`, e.message));
     activeTurns.delete(sessionId);
     busySessions.delete(sessionId);
@@ -1607,11 +1636,12 @@ async function handleMessage(message) {
       busySessions.delete(sessionId);
       activeTurns.delete(sessionId);
       turn?.streamer?.stop();
+      turn?.progress?.stop();
       updateTopicStatus(threadId, 'idle').catch(() => {});
       const queued = store.getQueue(threadId).length;
       const label = `🛑 Cancelled.${queued ? ` ${queued} queued message(s) will run next.` : ''}`;
-      if (turn) {
-        await tg.editMessageText({ chatId: cfg.chatId, messageId: turn.placeholderMessageId, text: label }).catch((e) => console.error('[bridge] failed to edit cancelled placeholder:', e.message));
+      if (turn && turnLiveMessageId(turn)) {
+        await tg.editMessageText({ chatId: cfg.chatId, messageId: turnLiveMessageId(turn), text: label }).catch((e) => console.error('[bridge] failed to edit cancelled placeholder:', e.message));
       } else {
         await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: label });
       }
@@ -1650,6 +1680,26 @@ async function handleMessage(message) {
   await startTurn(threadId, session, promptText, placeholder.message_id);
 }
 
+
+// Attaches the turn's progress view, per cfg.streamProgress: the milestone
+// reporter (bridge/progress.js) or the classic streaming preview
+// (bridge/streamer.js). Exactly one of turn.progress / turn.streamer is set.
+function attachTurnView(turn, { placeholderMessageId, threadId }) {
+  const common = { tg, chatId: cfg.chatId, threadId, minEditIntervalMs: cfg.streamEditIntervalMs };
+  if (cfg.streamProgress === 'messages') {
+    turn.progress = new ProgressReporter({ ...common, seedMessageId: placeholderMessageId, editIntervalMs: cfg.streamEditIntervalMs });
+  } else if (cfg.streamProgress !== 'off') {
+    turn.streamer = new ReplyStreamer({ ...common, messageId: placeholderMessageId, heartbeatMs: cfg.streamHeartbeatMs });
+  }
+}
+
+// The message id currently representing a live turn (for /stop labels,
+// drain notifications): in milestone mode the newest milestone message,
+// otherwise the placeholder.
+function turnLiveMessageId(turn) {
+  return turn?.progress?.currentMessageId() ?? turn?.placeholderMessageId ?? null;
+}
+
 // Send one turn's prompt to its session and own every failure path of the
 // send -- including the one-shot fresh-session retry for the known zcode
 // "resumed session rejects sends" quirk (see getOrCreateSession). Split out
@@ -1663,8 +1713,8 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
     textBuffer: '',
     startedAt: Date.now(),
     toolNames: new Map(), // toolCallId -> toolName (result events don't repeat the name)
-    streamer: new ReplyStreamer({ tg, chatId: cfg.chatId, messageId: placeholderMessageId, threadId, minEditIntervalMs: cfg.streamEditIntervalMs, heartbeatMs: cfg.streamHeartbeatMs }),
   };
+  attachTurnView(turn, { placeholderMessageId, threadId });
   activeTurns.set(sessionId, turn);
   updateTopicStatus(threadId, 'busy').catch(() => {});
 
@@ -1686,6 +1736,7 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
     busySessions.delete(sessionId);
     activeTurns.delete(sessionId);
     turn.streamer?.stop();
+    turn.progress?.stop();
     updateTopicStatus(threadId, 'idle').catch(() => {});
 
     if (session.resumed) {
@@ -1704,14 +1755,14 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
         const fresh = await getOrCreateSession(threadId, { forceFresh: true });
         freshSessionId = fresh.sessionId;
         busySessions.add(freshSessionId);
-        const freshStreamer = new ReplyStreamer({ tg, chatId: cfg.chatId, messageId: placeholderMessageId, threadId, minEditIntervalMs: cfg.streamEditIntervalMs, heartbeatMs: cfg.streamHeartbeatMs });
-        activeTurns.set(freshSessionId, {
+        const freshTurn = {
           placeholderMessageId,
           textBuffer: '',
           startedAt: Date.now(),
           toolNames: new Map(),
-          streamer: freshStreamer,
-        });
+        };
+        attachTurnView(freshTurn, { placeholderMessageId, threadId });
+        activeTurns.set(freshSessionId, freshTurn);
         await zcode.call('session/send', { sessionId: freshSessionId, content: text });
         return; // retry accepted -- the normal event-driven flow takes it from here
       } catch (retryErr) {
@@ -1722,7 +1773,10 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
         // topic-wedging bug this restructure fixes.)
         if (freshSessionId) {
           busySessions.delete(freshSessionId);
+          const freshTurn = activeTurns.get(freshSessionId);
           activeTurns.delete(freshSessionId);
+          freshTurn?.streamer?.stop();
+          freshTurn?.progress?.stop();
         }
         // Stop it explicitly -- it's no longer reachable through
         // activeTurns for anything else to stop it, and since the
