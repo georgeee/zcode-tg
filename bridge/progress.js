@@ -90,14 +90,26 @@ export class ProgressReporter {
     this._touch();
   }
 
-  // Close everything at turn end. Returns (after all freeze edits have been
-  // sent, so ordering vs the final reply message is deterministic) the
-  // message id the final reply should REPLACE -- the degenerate
-  // single-milestone, tool-less case -- or null when the reply should go
-  // out as its own message after the milestone trail.
+  // Close everything at turn end. Returns (after any freeze edits have been
+  // sent, so ordering vs the final reply is deterministic) the message id
+  // the final reply should REPLACE, or null when the reply should go out as
+  // its own message after the milestone trail.
+  //
+  // A trailing tool-less milestone is the turn's FINAL narration -- the
+  // reply text itself. Its message becomes the reply's replace target, so
+  // the reply lands properly markdown-rendered on the message the user
+  // watched streaming. Freezing it instead would duplicate the reply as a
+  // plain-text "✅ <label>" where **bold** and `code` render literally --
+  // exactly the bug reported live on the first milestone-mode turn.
   async settle() {
-    this._freezeCurrent();
     this._cancelTimer();
+    const last = this.current;
+    if (last && !last.steps.length && last.messageId != null) {
+      last.closed = true;
+      await this._postChain.catch(() => {});
+      return last.messageId;
+    }
+    this._freezeCurrent();
     await this._postChain.catch(() => {});
     const only = this.milestones.length === 1 && this.milestones[0].steps.length === 0;
     return only ? this.milestones[0].messageId : null;

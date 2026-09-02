@@ -146,8 +146,9 @@ try {
     'final reply with footer',
   );
   check('final reply delivered with usage footer', !!final);
-  const finalIsSeparate = final.message_id !== seed.message_id;
-  check('final reply is its own message after the milestone trail', finalIsSeparate);
+  const lastMilestoneSend = [...calls.send].reverse().find((s) => s.text === '⏳ …');
+  check('final reply REPLACES the trailing (tool-less) milestone message, properly rendered', final.message_id === lastMilestoneSend.message_id, `final=${final.message_id} lastMilestone=${lastMilestoneSend?.message_id}`);
+  check('no duplicate frozen copy of the reply text', !calls.edit.some((e) => e.text.startsWith('✅') && /PROGRESS-DONE/.test(e.text)));
 
   const liveEdits = calls.edit.filter((e) => e.text.startsWith('⏳'));
   check('live milestone messages showed steps (⏳ + ▶/✓ tool lines)', liveEdits.some((e) => /▪/.test(e.text)), JSON.stringify(liveEdits.slice(0, 2).map((e) => e.text.slice(0, 80))));
