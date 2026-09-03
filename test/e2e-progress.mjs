@@ -12,8 +12,9 @@ import path from 'node:path';
 const NODE = process.env.ZCODE_NODE_BIN || '/srv/agent-cage/etheron-bare/agent/etheron-bare/work/toolchain/node/bin/node';
 const ZCODE_BIN = process.env.ZCODE_BIN || '/srv/agent-cage/etheron-bare/agent/etheron-bare/work/zcode-probe/package/bin/zcode.js';
 const REPO = path.dirname(path.dirname(new URL(import.meta.url).pathname));
-const WS = '/tmp/zbridge-e2eprog-ws';
-const STORE = '/tmp/zbridge-e2eprog-store.json';
+const SCRATCH = `${process.env.HOME}/.cache/e2e-progress`;
+const WS = `${SCRATCH}-ws`;
+const STORE = `${SCRATCH}-store.json`;
 const CHAT = -100777, USER = 42, THREAD = 92;
 
 rmSync(WS, { recursive: true, force: true });
@@ -90,6 +91,8 @@ let bridgeLog = '';
 bridge.stdout.on('data', (c) => { bridgeLog += c; });
 bridge.stderr.on('data', (c) => { bridgeLog += c; process.stderr.write(`[bridge-err] ${c}`); });
 process.on('unhandledRejection', (e) => console.error('[harness] unhandled rejection:', e));
+process.on('SIGTERM', () => { try { bridge.kill('SIGKILL'); } catch {} process.exit(1); });
+process.on('SIGINT', () => { try { bridge.kill('SIGKILL'); } catch {} process.exit(1); });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(fn, timeoutMs, label) {

@@ -95,6 +95,12 @@ const cfg = {
   // streaming (bridge/streamer.js). 'off': a bare placeholder, edits only
   // at completion.
   streamProgress: process.env.STREAM_PROGRESS || 'messages',
+  // Telegram splits long input into several near-simultaneous messages; a
+  // burst within this window (measured from the LAST part, hard-capped by
+  // inputMergeMaxMs from the first) is treated as ONE prompt. Also applies
+  // to consecutive queue additions. 0 disables merging.
+  inputMergeMs: Number(process.env.INPUT_MERGE_MS ?? 800),
+  inputMergeMaxMs: Number(process.env.INPUT_MERGE_MAX_MS ?? 3000),
   // A turn stuck inside ONE long tool call (VM boot, a slow test run, ...)
   // gets no update() calls between the tool starting and finishing -- the
   // placeholder's displayed elapsed time would otherwise freeze for the
@@ -296,6 +302,7 @@ let pendingFinalize = 0;
 const pendingPermissions = new Map(); // requestId -> { resolve, tokenMap: Map(token->response), chatId, threadId }
 const pendingUserInputs = new Map(); // requestId -> { resolve, timer, questions, answers, tokenToChoice, chatId, threadId }
 const tokenToRequestId = new Map(); // callback_data token -> requestId ('p_' permissions, 'u_' user input)
+const pendingPrompts = new Map(); // threadId -> { parts: [promptText...], firstAt, timer } -- burst-merge window
 
 // interaction/requestUserInput (the model's "AskUserQuestion" tool, asking a
 // mid-turn clarifying question). The server sends
@@ -1588,6 +1595,70 @@ async function handleMessage(message) {
     promptText = `[replying to this earlier message in the topic]\n${q.split('\n').map((l) => `> ${l}`).join('\n')}\n\n${promptText}`;
   }
 
+  // Telegram's client splits long input into several near-simultaneous
+  // messages; treating each as its own prompt (or queue entry) turns one
+  // user message into a burst of turns. Sit in a short merge window before
+  // anything is sent to the model: further parts within the window join
+  // this one, then the combined prompt goes through the ordinary dispatch.
+  // /stop and /cancel bypass the window -- they must act immediately.
+  if (command !== 'stop' && command !== 'cancel' && cfg.inputMergeMs > 0) {
+    const pending = pendingPrompts.get(threadId);
+    if (pending) {
+      pending.parts.push(promptText);
+      if (Date.now() - pending.firstAt < cfg.inputMergeMaxMs) {
+        clearTimeout(pending.timer);
+        pending.timer = setTimeout(() => firePendingPrompt(threadId), cfg.inputMergeMs);
+      }
+      return; // folded into the burst; dispatched when the window closes
+    }
+    const entry = { parts: [promptText], firstAt: Date.now(), timer: null };
+    entry.timer = setTimeout(() => firePendingPrompt(threadId), cfg.inputMergeMs);
+    pendingPrompts.set(threadId, entry);
+    return;
+  }
+
+  await dispatchUserPrompt(threadId, promptText, command);
+}
+
+function firePendingPrompt(threadId) {
+  const entry = pendingPrompts.get(threadId);
+  if (!entry) return;
+  pendingPrompts.delete(threadId);
+  void dispatchUserPrompt(threadId, entry.parts.join('\n\n'), null);
+}
+
+// Queue an incoming prompt, merging into the newest entry when it landed
+// within the input-merge window -- the queue-side half of the Telegram
+// split-message defense (see the merge window in handleMessage).
+async function enqueuePrompt(threadId, promptText, noticeText) {
+  const queue = store.getQueue(threadId);
+  if (queue.length >= cfg.maxQueuePerTopic) {
+    await tg.sendMessage({
+      chatId: cfg.chatId,
+      messageThreadId: threadId,
+      text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. /stop to cancel the running turn.`,
+    });
+    return;
+  }
+  const last = queue[queue.length - 1];
+  if (last && Date.now() - (last.at ?? 0) < cfg.inputMergeMs) {
+    last.text += `\n\n${promptText}`;
+    last.at = Date.now();
+    store.setQueue(threadId, queue);
+    refreshTopicStatusForQueue(threadId);
+    return;
+  }
+  const notice = await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: noticeText });
+  store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id, at: Date.now() }]);
+  refreshTopicStatusForQueue(threadId);
+}
+
+// Everything that happens AFTER a prompt is composed (merge window closed):
+// drain-check, session resolution, /stop handling, queueing, placeholder,
+// turn start. Split out of handleMessage so the merge window can hand it
+// one combined prompt -- and so live-typed messages and debounced bursts
+// flow through the exact same code path.
+async function dispatchUserPrompt(threadId, promptText, command) {
   // A redeploy is draining: don't start anything new (getOrCreateSession
   // below can itself call session/create, work an about-to-restart process
   // has no way to see through to completion). /stop and /cancel are exempt
@@ -1603,13 +1674,7 @@ async function handleMessage(message) {
       });
       return;
     }
-    const notice = await tg.sendMessage({
-      chatId: cfg.chatId,
-      messageThreadId: threadId,
-      text: `📥 Queued (position ${queue.length + 1}) — the bridge is deploying an update and will run this once it's back (usually a few seconds).`,
-    });
-    store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id }]);
-    refreshTopicStatusForQueue(threadId);
+    await enqueuePrompt(threadId, promptText, `📥 Queued (position ${queue.length + 1}) — the bridge is deploying an update and will run this once it's back (usually a few seconds).`);
     return;
   }
 
@@ -1651,23 +1716,9 @@ async function handleMessage(message) {
 
     // Busy + ordinary message: queue it. The notice we post becomes the
     // turn's placeholder when the message is dequeued, so the reply lands on
-    // the message the user already saw accepted.
-    const queue = store.getQueue(threadId);
-    if (queue.length >= cfg.maxQueuePerTopic) {
-      await tg.sendMessage({
-        chatId: cfg.chatId,
-        messageThreadId: threadId,
-        text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. /stop to cancel the running turn.`,
-      });
-      return;
-    }
-    const notice = await tg.sendMessage({
-      chatId: cfg.chatId,
-      messageThreadId: threadId,
-      text: `📥 Queued (position ${queue.length + 1}) — runs when the current message finishes. /clearqueue to drop.`,
-    });
-    store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id }]);
-    refreshTopicStatusForQueue(threadId);
+    // the message the user already saw accepted. Rapid consecutive parts
+    // merge into the newest entry (Telegram split-message defense).
+    await enqueuePrompt(threadId, promptText, `📥 Queued (position ${store.getQueue(threadId).length + 1}) — runs when the current message finishes. /clearqueue to drop.`);
     return;
   }
 
@@ -1679,7 +1730,6 @@ async function handleMessage(message) {
   const placeholder = await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: '⌛ …' });
   await startTurn(threadId, session, promptText, placeholder.message_id);
 }
-
 
 // Attaches the turn's progress view, per cfg.streamProgress: the milestone
 // reporter (bridge/progress.js) or the classic streaming preview
