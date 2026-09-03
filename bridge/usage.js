@@ -28,8 +28,17 @@ export function readZaiProvider(configPath) {
   return { providerId: 'zai', kind: zai.kind, label: zai.name, baseURL: zai.options.baseURL, apiKey };
 }
 
+// BOUNDED, AND THAT IS NOT OPTIONAL. The monitoring endpoint is on the hot
+// path of the topic status line -- an endpoint that hangs (TLS stall, dead
+// upstream) would otherwise hold every status refresh for minutes with no
+// error and no data. 10s is generous for a JSON quota check.
+const USAGE_TIMEOUT_MS = 10_000;
+
 export async function fetchUsage({ apiKey, url = USAGE_URL, fetchImpl = fetch }) {
-  const res = await fetchImpl(url, { headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' } });
+  const res = await fetchImpl(url, {
+    headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' },
+    signal: AbortSignal.timeout(USAGE_TIMEOUT_MS),
+  });
   const json = await res.json().catch(() => null);
   if (!res.ok || !json?.success || !Array.isArray(json.data?.limits)) {
     throw new Error(json?.msg || `HTTP ${res.status}`);

@@ -260,7 +260,7 @@ async function shutdown(signal) {
     if (!liveId) return Promise.resolve();
     return tg
       .editMessageText({
-        chatId: cfg.chatId,
+        chatId: chatOf(threadId),
         messageId: liveId,
         text: "⚠️ Bridge is restarting (deploying an update) — this turn was interrupted. Send your message again once it's back (usually a few seconds).",
       })
@@ -336,7 +336,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
   const state = {
     resolve: null,
     timer: null,
-    chatId: cfg.chatId,
+    chatId: chatOf(threadId),
     threadId: topic.threadId,
     questions: [],
     answers: {},
@@ -361,7 +361,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
     let msg;
     try {
       msg = await tg.sendMessage({
-        chatId: cfg.chatId,
+        chatId: chatOf(threadId),
         messageThreadId: topic.threadId,
         text: lines.join('\n'),
         replyMarkup: TG.inlineKeyboard(buttons),
@@ -372,7 +372,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
       // and decline cleanly rather than leave half a prompt behind.
       console.error('[bridge] failed to post user-input prompt:', e.message);
       for (const posted of state.questions) {
-        await tg.editMessageText({ chatId: cfg.chatId, messageId: posted.messageId, text: '⚠️ Not deliverable — question declined.', replyMarkup: { inline_keyboard: [] } }).catch(() => {});
+        await tg.editMessageText({ chatId: chatOf(threadId), messageId: posted.messageId, text: '⚠️ Not deliverable — question declined.', replyMarkup: { inline_keyboard: [] } }).catch(() => {});
         store.removePendingPermission(userInputStoreKey(params.requestId, posted.index));
       }
       return { action: 'decline', reason: `bridge: failed to deliver the question to Telegram (${e.message})` };
@@ -380,7 +380,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
     state.questions.push({ index: qi, key: q.question, messageId: msg.message_id, header: q.header || '' });
     // Reused pendingPermissions storage (see its comment): entries orphaned by
     // a restart get their buttons swept and cleared at next startup.
-    store.addPendingPermission(userInputStoreKey(params.requestId, qi), { chatId: cfg.chatId, messageId: msg.message_id, threadId: topic.threadId, kind: 'userInput' });
+    store.addPendingPermission(userInputStoreKey(params.requestId, qi), { chatId: chatOf(threadId), messageId: msg.message_id, threadId: topic.threadId, kind: 'userInput' });
   }
 
   // The turn is now blocked on this answer -- say so on the ⌛ placeholder.
@@ -483,7 +483,7 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
   let msg;
   try {
     msg = await tg.sendMessage({
-      chatId: cfg.chatId,
+      chatId: chatOf(threadId),
       messageThreadId: topic.threadId,
       text,
       replyMarkup: TG.inlineKeyboard(buttons),
@@ -504,7 +504,7 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
   // Persisted so a request still awaiting a button press when the process
   // dies isn't left as an orphaned message with dead-but-still-clickable
   // buttons forever -- swept and cleaned up on the next startup, below.
-  store.addPendingPermission(params.requestId, { chatId: cfg.chatId, messageId: msg.message_id, threadId: topic.threadId });
+  store.addPendingPermission(params.requestId, { chatId: chatOf(threadId), messageId: msg.message_id, threadId: topic.threadId });
 
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -515,7 +515,7 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
     pendingPermissions.set(params.requestId, {
       resolve,
       tokenMap,
-      chatId: cfg.chatId,
+      chatId: chatOf(threadId),
       messageId: msg.message_id,
       timer,
     });
@@ -585,7 +585,7 @@ function pickAutoApproveOption(options) {
 let autoApproveNoticeQueue = Promise.resolve();
 function queueAutoApproveNotice(text, threadId) {
   autoApproveNoticeQueue = autoApproveNoticeQueue
-    .then(() => tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text }))
+    .then(() => tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text }))
     .catch((e) => console.error('[bridge] failed to post auto-approve notice:', e.message))
     .then(() => sleep(1100));
 }
@@ -745,7 +745,7 @@ async function adoptUnclaimedTurn(sessionId, params) {
   activeTurns.set(sessionId, entry);
   let msg;
   try {
-    msg = await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: topic.threadId, text: '⌛ 🌀 …' });
+    msg = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: topic.threadId, text: '⌛ 🌀 …' });
   } catch (e) {
     console.error(`[bridge] failed to post placeholder for auto-started turn ${params.turnId}; dropping it:`, e.message);
     activeTurns.delete(sessionId);
@@ -764,7 +764,7 @@ async function handleBackgroundTaskFinished(sessionId, payload) {
   const label = truncate(payload.description || payload.command || payload.taskId, 120);
   const icon = payload.status === 'completed' ? '✅' : '⚠️';
   await tg
-    .sendMessage({ chatId: cfg.chatId, messageThreadId: topic.threadId, text: `🌀 Background task ${icon} ${label} — ${payload.status}` })
+    .sendMessage({ chatId: chatOf(threadId), messageThreadId: topic.threadId, text: `🌀 Background task ${icon} ${label} — ${payload.status}` })
     .catch((e) => console.error('[bridge] failed to post background-task notice:', e.message));
 }
 
@@ -800,7 +800,7 @@ async function finalizeTurn(sessionId, terminalParams) {
         const quietId = replaceId ?? turnLiveMessageId(turn);
         if (quietId) {
           await tg
-            .editMessageText({ chatId: cfg.chatId, messageId: quietId, text: '🌀 Background task notification processed.' })
+            .editMessageText({ chatId: chatOf(threadId), messageId: quietId, text: '🌀 Background task notification processed.' })
             .catch(() => {});
         }
       } else {
@@ -888,9 +888,9 @@ async function deliverReply(placeholderMessageId, threadId, text, footerHtml = '
   if (footerHtml) chunks[chunks.length - 1] += footerHtml;
   try {
     if (placeholderMessageId) {
-      await tg.editMessageText({ chatId: cfg.chatId, messageId: placeholderMessageId, text: chunks[0], parseMode: 'HTML' });
+      await tg.editMessageText({ chatId: chatOf(threadId), messageId: placeholderMessageId, text: chunks[0], parseMode: 'HTML' });
     } else {
-      await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: chunks[0], parseMode: 'HTML' });
+      await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: chunks[0], parseMode: 'HTML' });
     }
   } catch (e) {
     await sendChunkFallback(placeholderMessageId ? 'edit' : 'send', placeholderMessageId, threadId, chunks[0], e);
@@ -898,7 +898,7 @@ async function deliverReply(placeholderMessageId, threadId, text, footerHtml = '
   for (let i = 1; i < chunks.length; i++) {
     await sleep(350);
     try {
-      await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: chunks[i], parseMode: 'HTML' });
+      await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: chunks[i], parseMode: 'HTML' });
     } catch (e) {
       await sendChunkFallback('send', null, threadId, chunks[i], e);
     }
@@ -926,8 +926,8 @@ async function sendChunkFallback(method, messageId, threadId, chunk, originalErr
   console.error('[bridge] Telegram rejected rendered HTML, falling back to plain text:', originalError.message);
   const plain = truncate(toPlainText(chunk), 4000);
   try {
-    if (method === 'edit') await tg.editMessageText({ chatId: cfg.chatId, messageId, text: plain });
-    else await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: plain });
+    if (method === 'edit') await tg.editMessageText({ chatId: chatOf(threadId), messageId, text: plain });
+    else await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: plain });
   } catch (e) {
     console.error('[bridge] plain-text fallback also failed:', e.message);
   }
@@ -965,7 +965,7 @@ setInterval(() => {
     const topic = sessionToTopic.get(sessionId);
     tg
       .editMessageText({
-        chatId: cfg.chatId,
+        chatId: chatOf(threadId),
         messageId: turn.placeholderMessageId,
         text: '⚠️ No response after a long time — the turn has been stopped. Send another message to try again (or /stop next time to cancel earlier).',
       })
@@ -1206,7 +1206,7 @@ function topicStatusText(threadId, state) {
 async function tryPinTopicStatus(threadId, st) {
   if (!st?.messageId || st.pinned) return;
   try {
-    await tg.pinChatMessage({ chatId: cfg.chatId, messageId: st.messageId });
+    await tg.pinChatMessage({ chatId: chatOf(threadId), messageId: st.messageId });
     st.pinned = true;
   } catch (e) {
     // Usually "not enough rights" -- the bot needs admin can_pin_messages.
@@ -1239,7 +1239,7 @@ async function updateTopicStatus(threadId, state) {
   if (st?.messageId) {
     let keep = true;
     try {
-      await tg.editMessageText({ chatId: cfg.chatId, messageId: st.messageId, text });
+      await tg.editMessageText({ chatId: chatOf(threadId), messageId: st.messageId, text });
     } catch (e) {
       const m = e.message || '';
       if (/message to edit not found|MESSAGE_ID_INVALID/i.test(m)) {
@@ -1253,7 +1253,7 @@ async function updateTopicStatus(threadId, state) {
         // retry below. Fall through to tryPinTopicStatus like a success.
       } else if (/can't be edited|too old/i.test(m)) {
         // Aged past the 48h edit window: replace, keeping exactly one.
-        await tg.deleteMessage({ chatId: cfg.chatId, messageId: st.messageId }).catch(() => {});
+        await tg.deleteMessage({ chatId: chatOf(threadId), messageId: st.messageId }).catch(() => {});
         topicStatus.delete(threadId);
         st = undefined;
         keep = false;
@@ -1270,7 +1270,7 @@ async function updateTopicStatus(threadId, state) {
   st = { messageId: null, pinned: false, gone: false };
   topicStatus.set(threadId, st);
   try {
-    const msg = await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text });
+    const msg = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text });
     st.messageId = msg.message_id;
     store.setTopic(threadId, { statusMessageId: msg.message_id });
     await tryPinTopicStatus(threadId, st);
@@ -1299,7 +1299,7 @@ async function handleModelCommand(threadId, arg) {
     const state = await zcode.call('workspace/readState', { workspace: { workspacePath: cfg.workspaceDir, workspaceKey } });
     available = state.modelCatalog?.available ?? [];
   } catch (e) {
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `⚠️ /model failed: ${e.message}` });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ /model failed: ${e.message}` });
     return;
   }
   const refs = available.map((m) => `${m.ref.providerId}/${m.ref.modelId}`);
@@ -1311,14 +1311,14 @@ async function handleModelCommand(threadId, arg) {
       const ctx = m.contextWindow >= 1000000 ? `${m.contextWindow / 1000000}M` : `${Math.round(m.contextWindow / 1000)}k`;
       return `${ref === current ? '▶' : '•'} ${ref} — ${m.label || m.ref.modelId} (${ctx} ctx)`;
     });
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: ['Models available:', ...rows, '', 'Switch: /model <name>'].join('\n') });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: ['Models available:', ...rows, '', 'Switch: /model <name>'].join('\n') });
     return;
   }
 
   // Accept both 'glm-5.3' (default provider) and 'zai/glm-5.3'.
   const ref = arg.includes('/') ? arg : `zai/${arg}`;
   if (!refs.includes(ref)) {
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `⚠️ Unknown model "${arg}". /model with no argument lists what's available.` });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Unknown model "${arg}". /model with no argument lists what's available.` });
     return;
   }
   const entry = store.getTopic(threadId) || {};
@@ -1330,12 +1330,12 @@ async function handleModelCommand(threadId, arg) {
     try {
       await zcode.call('session/setModel', { sessionId: entry.sessionId, model: parseModelRef(ref) });
     } catch (e) {
-      await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `⚠️ Stored for this topic, but the live session rejected the switch: ${e.message}` });
+      await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Stored for this topic, but the live session rejected the switch: ${e.message}` });
       return;
     }
   }
   await updateTopicStatus(threadId, busySessions.has(entry.sessionId) ? 'busy' : 'idle').catch(() => {});
-  await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `✅ Model for this topic: ${ref}` });
+  await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `✅ Model for this topic: ${ref}` });
 }
 
 // --- /mode: list / switch the topic's session mode ---
@@ -1355,11 +1355,11 @@ async function handleModeCommand(threadId, arg) {
   const current = entry.mode || cfg.defaultSessionMode;
   if (!arg) {
     const rows = MODES.map((m) => `• ${m}${MODE_NOTES[m] ? ` — ${MODE_NOTES[m]}` : ''}`);
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: [`Modes (current: ${current}):`, ...rows, '', 'Switch: /mode <name>'].join('\n') });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: [`Modes (current: ${current}):`, ...rows, '', 'Switch: /mode <name>'].join('\n') });
     return;
   }
   if (!MODES.includes(arg)) {
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `⚠️ Unknown mode "${arg}". /mode with no argument lists valid modes.` });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Unknown mode "${arg}". /mode with no argument lists valid modes.` });
     return;
   }
   store.setTopic(threadId, { ...entry, mode: arg });
@@ -1367,12 +1367,12 @@ async function handleModeCommand(threadId, arg) {
     try {
       await zcode.call('session/setMode', { sessionId: entry.sessionId, mode: arg });
     } catch (e) {
-      await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `⚠️ Stored for this topic, but the live session rejected the switch: ${e.message}` });
+      await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Stored for this topic, but the live session rejected the switch: ${e.message}` });
       return;
     }
   }
   await updateTopicStatus(threadId, busySessions.has(entry.sessionId) ? 'busy' : 'idle').catch(() => {});
-  await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `✅ Mode for this topic: ${arg}` });
+  await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `✅ Mode for this topic: ${arg}` });
 }
 
 // --- /file: send a workspace file into the topic as a document ---
@@ -1394,8 +1394,8 @@ async function sendWorkspaceFile(threadId, arg, { source }) {
   if (st.size > cfg.maxFileBytes) throw new Error(`file is ${Math.round(st.size / 1024 / 1024)} MB; cap is ${Math.round(cfg.maxFileBytes / 1024 / 1024)} MB`);
   const buf = await readFile(real);
   await tg.sendDocument({
-    chatId: cfg.chatId,
-    messageThreadId: threadId,
+    chatId: chatOf(threadId),
+    messageThreadId: threadOf(threadId),
     blob: new Blob([buf]),
     filename: path.basename(real),
     caption: `${arg} (${abbrev(st.size)} B)${source === 'model' ? ' — attached by the agent' : ''}`,
@@ -1404,7 +1404,7 @@ async function sendWorkspaceFile(threadId, arg, { source }) {
 
 async function handleFileCommand(threadId, arg) {
   if (!arg) {
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: 'Usage: /file <path-inside-workspace>' });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: 'Usage: /file <path-inside-workspace>' });
     return;
   }
   try {
@@ -1413,7 +1413,7 @@ async function handleFileCommand(threadId, arg) {
     const msg = /outside the workspace/.test(e.message || '')
       ? `⚠️ ${e.message}`
       : `⚠️ /file failed: ${/ENOENT/.test(e.message || '') ? 'not found' : e.message}`;
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: msg }).catch(() => {});
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: msg }).catch(() => {});
   }
 }
 
@@ -1447,7 +1447,7 @@ async function receiveInboundDocument(message, threadId) {
   } catch (e) {
     console.error('[bridge] inbound file failed:', e.message);
     await tg
-      .sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `⚠️ Couldn't receive "${doc.file_name || 'file'}": ${e.message}` })
+      .sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Couldn't receive "${doc.file_name || 'file'}": ${e.message}` })
       .catch(() => {});
     return null;
   }
@@ -1483,7 +1483,7 @@ async function handleUsageCommand(threadId) {
   } catch (e) {
     text = `⚠️ /usage failed: ${e.message}`;
   }
-  await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text, parseMode: 'HTML' }).catch((e) => console.error('[bridge] failed to post usage:', e.message));
+  await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text, parseMode: 'HTML' }).catch((e) => console.error('[bridge] failed to post usage:', e.message));
 }
 
 function helpText() {
@@ -1501,28 +1501,99 @@ function helpText() {
   ].join('\n');
 }
 
+// THE OWNER GATE IS THE ONLY GATE. The bridge serves whatever chat an owner
+// speaks in -- a DM, a group, any topic -- and ignores everyone else. The old
+// fixed TELEGRAM_CHAT_ID filter is gone: the chat id recorded at /auth time
+// (or in .env) is informational now, because the whole point of the bridge is
+// to follow its owner around rather than to own a room.
+// An unhandled rejection must not kill the bridge: one failed turn is a
+// message lost, a dead bridge is every message lost. Logged loudly instead.
+process.on('unhandledRejection', (reason) => {
+  console.error('[bridge] UNHANDLED REJECTION:', reason instanceof Error ? (reason.stack || reason.message) : reason);
+});
+
+const allowedOwners = new Set(
+  String(cfg.allowedUserId).split(',').map((s) => s.trim()).filter(Boolean).map(Number),
+);
+const isOwner = (id) => allowedOwners.has(Number(id));
+
+// A conversation key: stable per chat (+topic when there is one), so the
+// store, the queue and the session map can serve several chats at once.
+// Legacy shape preserved for the configured home chat (bare thread id), so an
+// speaks in -- a DM, a group, any topic -- and ignores everyone else. The old
+// fixed TELEGRAM_CHAT_ID filter is gone: the chat id in .env is informational
+// now (the default/home chat), because the bridge follows its owner around
+// rather than owning one room.
+
+// A conversation key: stable per chat (+topic when there is one), so the
+// store, the queue and the session map can serve several chats at once. The
+// configured home chat keeps its legacy bare-thread keys, so an existing
+// store's topic/session mappings survive this change untouched.
+function keyFor(chatId, threadId) {
+  if (Number(chatId) === Number(cfg.chatId)) return threadId ? String(threadId) : `c${chatId}`;
+  return `c${chatId}` + (threadId ? `:t${threadId}` : '');
+}
+// And back again: every outgoing call needs the real chat id and thread.
+function parseTopicKey(key) {
+  if (/^-?\d+$/.test(String(key))) return { chatId: Number(cfg.chatId), threadId: Number(key) };
+  const m = String(key).match(/^c(-?\d+)(?::t(\d+))?$/);
+  if (!m) return { chatId: Number(cfg.chatId), threadId: undefined };
+  return { chatId: Number(m[1]), threadId: m[2] ? Number(m[2]) : undefined };
+}
+const chatOf = (key) => {
+  const t = store.getTopic(key);
+  if (t?.chatId) return Number(t.chatId); // entries staged before composite keys
+  return parseTopicKey(key).chatId;
+};
+const threadOf = (key) => parseTopicKey(key).threadId;
+
+// ADDED SOMEWHERE BY A NON-OWNER: say why and leave, exactly as the cage's
+// own bot does. Exiting the process would only crash-loop under the service
+// supervisor (the bot is still a member of the foreign chat on every
+// restart); leaving is final and tells the truth once.
+function handleMyChatMember(m) {
+  const status = m.new_chat_member?.status;
+  if (!['member', 'restricted'].includes(status)) return;
+  if (isOwner(m.from?.id)) return;
+  const chatId = m.chat?.id;
+  if (!String(chatId).startsWith('-')) return; // a private chat needs no check
+  console.warn(`[bridge] added to chat ${chatId} by non-owner ${m.from?.id} -- leaving`);
+  tg.sendMessage({ chatId: String(chatId), text: '⛔ I only serve my owner. Leaving.' })
+    .catch(() => {})
+    .then(() => tg.leaveChat({ chatId: String(chatId) }))
+    .catch((e) => console.error('[bridge] leaveChat failed:', e.message));
+}
+
 async function handleMessage(message) {
+  try {
   if (message.from?.is_bot) return;
-  if (message.chat?.id !== cfg.chatId) return;
-  if (message.from?.id !== cfg.allowedUserId) {
-    console.warn(`[bridge] ignoring message from unauthorized user ${message.from?.id}`);
+  if (!isOwner(message.from?.id)) {
+    console.warn(`[bridge] ignoring message from unauthorized user ${message.from?.id} in chat ${message.chat?.id}`);
     return;
   }
-  const threadId = message.message_thread_id;
+  const chatId = message.chat.id;
+  const messageThread = message.message_thread_id;
+  // FROM HERE, `threadId` IS THE CONVERSATION KEY (chat+topic), not the raw
+  // Telegram thread id: the callees below key the store and resolve their
+  // sends through chatOf/threadOf, so a topicless DM or group is just another
+  // conversation rather than a message that silently dies.
+  const topicKey = keyFor(chatId, messageThread);
+  const threadId = topicKey;
   if (message.forum_topic_created) {
-    console.log(`[bridge] topic created: "${message.forum_topic_created.name}" (thread ${threadId})`);
+    console.log(`[bridge] topic created: "${message.forum_topic_created.name}" (thread ${threadId}) in chat ${chatId}`);
     if (!threadId) return; // service message outside any topic -- nothing to do
     // Create the 📌 status message NOW, as the topic's first message, so it
     // never occupies conversational space near later messages (owner
     // preference 2026-09-01). A minimal store entry is seeded so the status
     // has somewhere to live; getOrCreateSession merges the session in later.
-    if (!store.getTopic(threadId)) {
-      store.setTopic(threadId, { model: cfg.defaultModel, mode: cfg.defaultSessionMode });
+    if (!store.getTopic(topicKey)) {
+      store.setTopic(topicKey, { chatId, model: cfg.defaultModel, mode: cfg.defaultSessionMode });
     }
-    updateTopicStatus(threadId, 'idle').catch(() => {});
+    updateTopicStatus(topicKey, 'idle').catch(() => {});
     return;
   }
-  if (!threadId) return; // ignore messages outside any topic
+  // DMs and topicless groups carry no thread and are served whole (the
+  // conversation key is the chat alone); topics keep their per-topic session.
   if (!message.text && !message.document) return; // stickers, photos, voice, ... still ignored
 
   // An inbound document becomes a turn: the bridge downloads it into the
@@ -1556,7 +1627,7 @@ async function handleMessage(message) {
     return;
   }
   if (command === 'help') {
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: helpText() });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: helpText() });
     return;
   }
   if (command === 'queue') {
@@ -1564,7 +1635,7 @@ async function handleMessage(message) {
     const text = q.length
       ? ['📥 Queued in this topic:', ...q.map((it, i) => `${i + 1}. ${truncate((it.text || '').split('\n')[0], 80)}`)].join('\n')
       : 'Queue for this topic is empty.';
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text });
     return;
   }
   if (command === 'clearqueue') {
@@ -1572,9 +1643,9 @@ async function handleMessage(message) {
     store.setQueue(threadId, []);
     refreshTopicStatusForQueue(threadId);
     for (const it of q) {
-      await tg.editMessageText({ chatId: cfg.chatId, messageId: it.placeholderMessageId, text: '🗑 Dropped from queue.' }).catch(() => {});
+      await tg.editMessageText({ chatId: chatOf(threadId), messageId: it.placeholderMessageId, text: '🗑 Dropped from queue.' }).catch(() => {});
     }
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: q.length ? `🗑 Dropped ${q.length} queued message(s).` : 'Queue was already empty.' });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: q.length ? `🗑 Dropped ${q.length} queued message(s).` : 'Queue was already empty.' });
     return;
   }
   // /stop and /cancel are NOT handled here: they need the topic's sessionId,
@@ -1618,6 +1689,17 @@ async function handleMessage(message) {
   }
 
   await dispatchUserPrompt(threadId, promptText, command);
+  } catch (e) {
+    // CONTAINED, AND NAMED. A message whose handling throws must not take
+    // the update loop (and with it every conversation the bridge serves)
+    // down with it -- measured on the multichat e2e: one conversation's
+    // session-create failure killed the whole process, silently, while the
+    // owner watched a bot that never answered.
+    console.error(`[bridge] message handling failed for chat ${message.chat?.id}:`, e);
+    try {
+      await tg.sendMessage({ chatId: String(message.chat?.id ?? cfg.chatId), text: `⚠️ message handling failed: ${e.message}` });
+    } catch {}
+  }
 }
 
 function firePendingPrompt(threadId) {
@@ -1634,8 +1716,8 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
   const queue = store.getQueue(threadId);
   if (queue.length >= cfg.maxQueuePerTopic) {
     await tg.sendMessage({
-      chatId: cfg.chatId,
-      messageThreadId: threadId,
+      chatId: chatOf(threadId),
+      messageThreadId: threadOf(threadId),
       text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. /stop to cancel the running turn.`,
     });
     return;
@@ -1648,7 +1730,7 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
     refreshTopicStatusForQueue(threadId);
     return;
   }
-  const notice = await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: noticeText });
+  const notice = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: noticeText });
   store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id, at: Date.now() }]);
   refreshTopicStatusForQueue(threadId);
 }
@@ -1668,8 +1750,8 @@ async function dispatchUserPrompt(threadId, promptText, command) {
     const queue = store.getQueue(threadId);
     if (queue.length >= cfg.maxQueuePerTopic) {
       await tg.sendMessage({
-        chatId: cfg.chatId,
-        messageThreadId: threadId,
+        chatId: chatOf(threadId),
+        messageThreadId: threadOf(threadId),
         text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. Try again once the bridge is back.`,
       });
       return;
@@ -1688,7 +1770,7 @@ async function dispatchUserPrompt(threadId, promptText, command) {
     // but was never going to tell them anything.
     console.error(`[bridge] topic ${threadId}: failed to get/create session:`, e);
     await tg
-      .sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: `⚠️ Couldn't start a session: ${e.message}` })
+      .sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Couldn't start a session: ${e.message}` })
       .catch((sendErr) => console.error('[bridge] failed to post session-creation failure notice:', sendErr.message));
     return;
   }
@@ -1706,9 +1788,9 @@ async function dispatchUserPrompt(threadId, promptText, command) {
       const queued = store.getQueue(threadId).length;
       const label = `🛑 Cancelled.${queued ? ` ${queued} queued message(s) will run next.` : ''}`;
       if (turn && turnLiveMessageId(turn)) {
-        await tg.editMessageText({ chatId: cfg.chatId, messageId: turnLiveMessageId(turn), text: label }).catch((e) => console.error('[bridge] failed to edit cancelled placeholder:', e.message));
+        await tg.editMessageText({ chatId: chatOf(threadId), messageId: turnLiveMessageId(turn), text: label }).catch((e) => console.error('[bridge] failed to edit cancelled placeholder:', e.message));
       } else {
-        await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: label });
+        await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: label });
       }
       void drainQueue(threadId);
       return;
@@ -1723,11 +1805,11 @@ async function dispatchUserPrompt(threadId, promptText, command) {
   }
 
   if (command === 'stop' || command === 'cancel') {
-    await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: 'Nothing is running in this topic.' });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: 'Nothing is running in this topic.' });
     return;
   }
 
-  const placeholder = await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text: '⌛ …' });
+  const placeholder = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '⌛ …' });
   await startTurn(threadId, session, promptText, placeholder.message_id);
 }
 
@@ -1735,7 +1817,7 @@ async function dispatchUserPrompt(threadId, promptText, command) {
 // reporter (bridge/progress.js) or the classic streaming preview
 // (bridge/streamer.js). Exactly one of turn.progress / turn.streamer is set.
 function attachTurnView(turn, { placeholderMessageId, threadId }) {
-  const common = { tg, chatId: cfg.chatId, threadId, minEditIntervalMs: cfg.streamEditIntervalMs };
+  const common = { tg, chatId: chatOf(threadId), threadId, minEditIntervalMs: cfg.streamEditIntervalMs };
   if (cfg.streamProgress === 'messages') {
     turn.progress = new ProgressReporter({ ...common, seedMessageId: placeholderMessageId, editIntervalMs: cfg.streamEditIntervalMs });
   } else if (cfg.streamProgress !== 'off') {
@@ -1841,7 +1923,7 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
     }
 
     await tg
-      .editMessageText({ chatId: cfg.chatId, messageId: placeholderMessageId, text: `⚠️ Failed to send: ${e.message}` })
+      .editMessageText({ chatId: chatOf(threadId), messageId: placeholderMessageId, text: `⚠️ Failed to send: ${e.message}` })
       .catch((editErr) => console.error('[bridge] failed to edit failure notice:', editErr.message));
     // The message behind this failed one doesn't deserve to wait forever
     // just because its predecessor's send was rejected.
@@ -1872,7 +1954,7 @@ async function drainQueue(threadId) {
   } catch (e) {
     console.error(`[bridge] topic ${threadId}: failed to get/create session for a queued message:`, e);
     await tg
-      .editMessageText({ chatId: cfg.chatId, messageId: next.placeholderMessageId, text: `⚠️ Couldn't start a session: ${e.message}` })
+      .editMessageText({ chatId: chatOf(threadId), messageId: next.placeholderMessageId, text: `⚠️ Couldn't start a session: ${e.message}` })
       .catch(() => {});
     await drainQueue(threadId); // give the one behind it the same chance
     return;
@@ -1885,7 +1967,7 @@ async function drainQueue(threadId) {
     return;
   }
   await tg
-    .editMessageText({ chatId: cfg.chatId, messageId: next.placeholderMessageId, text: '⌛ …' })
+    .editMessageText({ chatId: chatOf(threadId), messageId: next.placeholderMessageId, text: '⌛ …' })
     .catch((e) => console.error('[bridge] failed to promote queued notice to placeholder:', e.message));
   await startTurn(threadId, session, next.text, next.placeholderMessageId);
 }
@@ -1987,6 +2069,7 @@ async function main() {
     let updates;
     try {
       updates = await tg.getUpdates({ offset, timeout: 30 });
+      console.log(`[bridge] DEBUG poll got ${updates.length} update(s) at offset ${offset}`);
     } catch (e) {
       console.error('[bridge] getUpdates failed, retrying in 5s:', e.message);
       await sleep(5000);
@@ -1994,6 +2077,7 @@ async function main() {
     }
     for (const update of updates) {
       try {
+        if (update.my_chat_member) handleMyChatMember(update.my_chat_member);
         if (update.message) await handleMessage(update.message);
         else if (update.callback_query) await handleCallbackQuery(update.callback_query);
       } catch (e) {

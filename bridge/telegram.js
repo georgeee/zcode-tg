@@ -32,13 +32,17 @@ export class TelegramClient {
   // Long-poll. Telegram holds the connection open up to `timeout` seconds
   // waiting for something to happen -- this is what makes polling cheap and
   // near-real-time without a webhook or any inbound port.
-  getUpdates({ offset, timeout = 30, allowedUpdates = ['message', 'callback_query'] } = {}) {
+  getUpdates({ offset, timeout = 30, allowedUpdates = ['message', 'callback_query', 'my_chat_member'] } = {}) {
     return this._call('getUpdates', { offset, timeout, allowed_updates: allowedUpdates });
   }
 
   // parseMode is opt-in per call: model output goes through bridge/format.js
   // and is sent as 'HTML'; everything the bridge composes itself stays plain
   // text so an accidental entity in our own strings can't bounce a notice.
+  leaveChat({ chatId }) {
+    return this._call('leaveChat', { chat_id: chatId });
+  }
+
   sendMessage({ chatId, messageThreadId, text, replyMarkup, replyToMessageId, parseMode }) {
     return this._call('sendMessage', {
       chat_id: chatId,
