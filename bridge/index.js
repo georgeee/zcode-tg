@@ -1483,7 +1483,7 @@ async function handleUsageCommand(threadId) {
   } catch (e) {
     text = `⚠️ /usage failed: ${e.message}`;
   }
-  await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text }).catch((e) => console.error('[bridge] failed to post usage:', e.message));
+  await tg.sendMessage({ chatId: cfg.chatId, messageThreadId: threadId, text, parseMode: 'HTML' }).catch((e) => console.error('[bridge] failed to post usage:', e.message));
 }
 
 function helpText() {

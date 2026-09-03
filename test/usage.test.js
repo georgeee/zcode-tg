@@ -24,24 +24,34 @@ const LIVE_PAYLOAD = {
 // 10 minutes before the short-term reset, so both durations are stable to assert
 const NOW = 1788233217027 - 10 * 60 * 1000;
 
-test('renders both windows with cap-as-usage disambiguated', () => {
+test('renders both windows as Telegram HTML: used / cap disambiguated, grouped', () => {
   const out = renderUsage(LIVE_PAYLOAD.data, NOW);
   assert.ok(out.includes('Short-term (~5h)'), out);
   assert.ok(out.includes('Weekly'), out);
-  assert.ok(out.includes('127 / 2000 cr'), out); // used / cap, not cap / used
-  assert.ok(out.includes('127 / 10000 cr'), out);
-  assert.ok(out.includes('1872'), out);
-  assert.ok(out.includes('9872'), out);
-  assert.ok(out.includes('6%'), out);
-  assert.ok(out.includes('1%'), out);
-  assert.ok(out.includes('Plan level: lite'), out);
+  assert.ok(out.includes('127 / 2,000 cr'), out); // used / cap, not cap / used
+  assert.ok(out.includes('127 / 10,000 cr'), out);
+  assert.ok(out.includes('(6%)'), out);
+  assert.ok(out.includes('(1%)'), out);
+  assert.ok(out.includes('plan <i>lite</i>'), out);
+  assert.ok(!out.includes('&lt;i&gt;'), out); // the level is rendered, not escaped into text
 });
 
-test('reset column: relative + absolute UTC, matching the requested format', () => {
+test('reset line: remaining, relative and absolute UTC', () => {
   const out = renderUsage(LIVE_PAYLOAD.data, NOW);
-  assert.ok(out.includes('~10m'), out);
-  assert.ok(out.includes('(2026-09-01 03:26 UTC)'), out);
-  assert.ok(out.includes('(2026-09-07 22:05 UTC)'), out);
+  assert.ok(out.includes('1,872 cr left · resets in ~10m · 2026-09-01 03:26 UTC'), out);
+  assert.ok(out.includes('9,872 cr left · resets in ~'), out);
+  assert.ok(out.includes('2026-09-07 22:05 UTC'), out);
+});
+
+test('pressure dot and bar follow the percentage', () => {
+  const out = renderUsage(LIVE_PAYLOAD.data, NOW);
+  assert.ok(out.includes('🟢'), out); // 6% and 1% are green
+  assert.ok(out.includes('<code>▰▱▱▱▱▱▱▱▱▱</code>'), out); // ~1/10 filled
+  const hot = renderUsage({
+    limits: [{ unit: 3, number: 5, usage: 100, currentValue: 92, percentage: 92, nextResetTime: NOW + 3600_000 }],
+  }, NOW);
+  assert.ok(hot.includes('🔴'), hot); // 92% is red
+  assert.ok(hot.includes('<code>▰▰▰▰▰▰▰▰▰▱</code>'), hot);
 });
 
 test('unknown window unit degrades to a literal label, not a wrong friendly one', () => {
@@ -49,10 +59,10 @@ test('unknown window unit degrades to a literal label, not a wrong friendly one'
   assert.ok(out.includes('unit 9 x 2'), out);
 });
 
-test('columns are aligned (every data row is exactly as wide as its content)', () => {
-  const out = renderUsage(LIVE_PAYLOAD.data, NOW);
-  const lines = out.split('\n').filter((l) => l.includes(' cr '));
-  assert.equal(lines.length, 2);
+test('the level string is HTML-escaped, never trusted', () => {
+  const out = renderUsage({ limits: LIVE_PAYLOAD.data.limits, level: '<b>pwn</b>' }, NOW);
+  assert.ok(out.includes('&lt;b&gt;pwn&lt;/b&gt;'), out);
+  assert.ok(!out.includes('<b>pwn</b>'), out);
 });
 
 // --- usagePercentages: the status line's percentages-only digest ---

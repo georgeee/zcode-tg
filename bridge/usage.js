@@ -55,22 +55,42 @@ function humanRemaining(ms) {
   return `${m}m`;
 }
 
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// Telegram messages render in a proportional font: an ASCII column table
+// collapses into ragged text the moment any cell changes width. So /usage
+// speaks Telegram HTML instead -- one block per window, a status dot by
+// pressure, and a 10-cell bar that is decoration only (the numbers carry the
+// data, so nothing depends on glyph alignment).
+function bar(pct) {
+  const filled = Math.max(0, Math.min(10, Math.round(pct / 10)));
+  return '▰'.repeat(filled) + '▱'.repeat(10 - filled);
+}
+
+function dot(pct) {
+  if (pct >= 85) return '🔴';
+  if (pct >= 60) return '🟡';
+  return '🟢';
+}
+
+// Grouping by hand rather than toLocaleString: the result must be identical
+// whatever ICU build the runtime node carries.
+function grouped(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
 export function renderUsage(data, now = Date.now()) {
-  const rows = data.limits.map((l) => ({
-    window: windowLabel(l),
-    used: `${l.currentValue} / ${l.usage} cr`,
-    remaining: String(l.remaining ?? '—'),
-    pct: `${l.percentage}%`,
-    resets: `in ~${humanRemaining(l.nextResetTime - now)} (${utc(l.nextResetTime)})`,
-  }));
-  const head = ['Window', 'Used', 'Remaining', '% used', 'Resets'];
-  const widths = head.map((_, i) => Math.max(head[i].length, ...rows.map((r) => r[Object.keys(r)[i]].length)));
-  const line = (cells) => cells.map((c, i) => c.padEnd(widths[i])).join('  ').trimEnd();
-  // ASCII hyphens for the rule: an em-dash is ambiguous-width in several
-  // monospace fonts and visibly breaks the column alignment it's measuring.
-  const table = [line(head), widths.map((w) => '-'.repeat(w)).join('  '), ...rows.map((r) => line(Object.values(r)))].join('\n');
-  const level = data.level ? `\n\nPlan level: ${data.level}` : '';
-  return `📊 Z.ai usage\n\n${table}${level}`;
+  const head = `📊 <b>Z.ai usage</b>${data.level ? ` · plan <i>${esc(data.level)}</i>` : ''}`;
+  const blocks = data.limits.map((l) => {
+    const pct = Number.isFinite(l.percentage) ? Math.round(l.percentage) : 0;
+    const remaining = Number.isFinite(l.remaining) ? `${grouped(l.remaining)} cr left · ` : '';
+    return [
+      `${dot(pct)} <b>${windowLabel(l)}</b> — ${grouped(l.currentValue)} / ${grouped(l.usage)} cr (${pct}%)`,
+      `<code>${bar(pct)}</code>`,
+      `${remaining}resets in ~${humanRemaining(l.nextResetTime - now)} · ${utc(l.nextResetTime)}`,
+    ].join('\n');
+  });
+  return [head, '', ...blocks].join('\n\n');
 }
 
 // Percentages-only digest for the per-topic status line ("11% session /
