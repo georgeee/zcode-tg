@@ -86,7 +86,6 @@ const cfg = {
   permissionTimeoutMs: Number(process.env.PERMISSION_TIMEOUT_MS || 10 * 60 * 1000), // 10 min
   // Empty string is "off"; a bare 0 means an ephemeral listen (what the e2e uses).
   mcpHttpPort: process.env.MCP_HTTP_PORT?.trim() ? Number(process.env.MCP_HTTP_PORT) : null,
-  mcpToken: process.env.MCP_TOKEN || '',
   autoApprovePermissions: process.env.AUTO_APPROVE_PERMISSIONS !== 'false', // default: on
   defaultSessionMode: process.env.ZCODE_DEFAULT_MODE || 'yolo',
   // Turns STREAM their reply into the placeholder; this paces those edits
@@ -2043,15 +2042,14 @@ async function handleCallbackQuery(cq) {
 async function main() {
   console.log(`[bridge] starting. chat=${cfg.chatId} workspace=${cfg.workspaceDir} model=${cfg.defaultModel}`);
 
-  // THE MCP GATEWAY: lets a second model drive these conversations from a
-  // laptop (over ssh -L or WireGuard -- the listener binds loopback) with
-  // every prompt and reply mirrored into the Telegram chat from the bot's
-  // identity. Off unless MCP_HTTP_PORT is set; MCP_TOKEN gates it when set.
+  // THE MCP GATEWAY: lets a second model running on the same host (inside
+  // the same agent) drive these conversations over loopback, with every
+  // prompt and reply mirrored into the Telegram chat from the bot's
+  // identity. Off unless MCP_HTTP_PORT is set.
   if (cfg.mcpHttpPort != null) {
     mcp = createMcpGateway({
       port: cfg.mcpHttpPort,
       host: process.env.MCP_BIND || '127.0.0.1',
-      token: cfg.mcpToken,
       log: (m) => console.log(`[bridge] ${m}`),
     });
     mcp.wire({

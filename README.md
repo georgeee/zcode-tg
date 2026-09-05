@@ -236,9 +236,9 @@ account needs root).
 
 `MCP_HTTP_PORT` turns on a small **MCP (Model Context Protocol) server
 inside the bridge process** (Streamable HTTP, `POST /mcp`, JSON-RPC 2.0).
-Its purpose: let another model — say, Opus running on your laptop — drive
-the very same conversations the Telegram frontend serves. Every prompt sent
-through MCP is mirrored into the topic **from the bot's identity**, and
+Its purpose: let another model — say, Opus running inside the same agent —
+drive the very same conversations the Telegram frontend serves. Every prompt
+sent through MCP is mirrored into the topic **from the bot's identity**, and
 every reply is both delivered to the topic and returned to the MCP caller,
 so the Telegram chat stays the shared log no matter which frontend typed.
 
@@ -251,17 +251,16 @@ Four tools:
 | `replies_get` | Catch-up read: replies already collected for a conversation since a sequence number (the in-memory log keeps the last 200 per conversation). |
 | `session_close` | Close the session and its Telegram topic; further `message_send` to the key names the error. |
 
-Configuration (all in the bridge's env, off by default):
+Configuration (in the bridge's env, off by default):
 
 - `MCP_HTTP_PORT` — port to listen on. **Off unless set.** `0` picks an
   ephemeral port (what the e2e uses; the bound port is in the boot log).
-- `MCP_TOKEN` — when set, every request must carry
-  `Authorization: Bearer <token>` (checked before the body is read).
-- `MCP_BIND` — bind address, default `127.0.0.1`. Keep it loopback and
-  reach the box over `ssh -L 8377:127.0.0.1:<port>`; then on the laptop:
+- `MCP_BIND` — bind address, default `127.0.0.1`. The client runs on the
+  same host inside the same agent, so loopback is the whole surface and no
+  auth is layered on top — the listener deliberately carries no token.
 
   ```
-  claude mcp add --transport http cage-zcode http://127.0.0.1:8377/mcp
+  claude mcp add --transport http cage-zcode http://127.0.0.1:<port>/mcp
   ```
 
 The reply wait is bounded (10 minutes per `message_send`); a turn still

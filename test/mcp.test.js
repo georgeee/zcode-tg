@@ -6,8 +6,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createMcpGateway } from '../bridge/mcp.js';
 
-async function startGateway(t, impl, { token = '' } = {}) {
-  const gw = createMcpGateway({ port: 0, token, log: () => {} });
+async function startGateway(t, impl) {
+  const gw = createMcpGateway({ port: 0, log: () => {} });
   gw.wire(impl);
   await gw.ready;
   const port = gw.address().port;
@@ -21,10 +21,10 @@ async function startGateway(t, impl, { token = '' } = {}) {
   };
 }
 
-async function rpc(url, body, token = '') {
+async function rpc(url, body) {
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
   return { status: res.status, body: res.status === 204 ? null : JSON.parse(await res.text()) };
@@ -106,11 +106,4 @@ test('unknown tool names an error', async (t) => {
   const r = await rpc(h.url, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'nope', arguments: {} } });
   assert.equal(r.body.result.isError, true);
   assert.match(r.body.result.content[0].text, /unknown tool/);
-});
-
-test('token auth rejects mismatches before the body is read', async (t) => {
-  const h = await startGateway(t, {}, { token: 'sekrit' });
-  t.after(() => h.close());
-  const res = await fetch(h.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) });
-  assert.equal(res.status, 401);
 });

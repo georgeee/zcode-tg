@@ -6,10 +6,11 @@
 //
 // Transport: HTTP POST /mcp with a JSON-RPC 2.0 body; the response is the
 // JSON-RPC result (no SSE -- tools/call blocks until the answer is known,
-// which is what an MCP client waiting for a reply wants). Bound to
-// 127.0.0.1 unless MCP_BIND is set; MCP_TOKEN, when set, requires a
-// matching Authorization: Bearer header. Reachable from a laptop via
-// `ssh -L` or WireGuard without exposing anything publicly.
+// which is what an MCP client waiting for a reply wants). The client --
+// the second model -- runs on the SAME host, inside the same agent, so the
+// listener binds loopback and carries no auth of its own: the trust
+// boundary is the host account, the same one that can read the bridge's
+// credentials anyway.
 //
 // The server runs INSIDE the bridge process (wired from index.js) so its
 // tools drive the bridge's own machinery -- the same topic store, the same
@@ -24,7 +25,7 @@ const MAX_BODY = 1 << 20; // 1 MiB of JSON-RPC is far beyond any tool call
 const WAIT_TIMEOUT_MS = 10 * 60 * 1000; // a real model turn can take minutes
 const REPLY_LOG_LIMIT = 200; // per conversation, in memory
 
-export function createMcpGateway({ port, host = '127.0.0.1', token = '', log = () => {} }) {
+export function createMcpGateway({ port, host = '127.0.0.1', log = () => {} }) {
   // port 0 (an ephemeral listen) is how the tests start the gateway.
   if (port == null) throw new Error('mcp gateway needs a port');
 
@@ -182,14 +183,6 @@ export function createMcpGateway({ port, host = '127.0.0.1', token = '', log = (
       res.end(JSON.stringify({ error: 'not found -- POST JSON-RPC to /mcp' }));
       return;
     }
-    if (token) {
-      const auth = req.headers.authorization ?? '';
-      if (auth !== `Bearer ${token}`) {
-        res.writeHead(401, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'unauthorized' }));
-        return;
-      }
-    }
     let raw = '';
     let oversized = false;
     req.on('data', (c) => {
@@ -256,7 +249,6 @@ export function createMcpGateway({ port, host = '127.0.0.1', token = '', log = (
     waitReply,
     repliesSince,
     wire,
-    __test: { dispatchRpc, callTool, replyLog, server, host, port },
     address: () => server.address(),
   };
 }
