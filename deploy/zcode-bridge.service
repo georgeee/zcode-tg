@@ -17,6 +17,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/zcode-tg
+# THE JUNIOR AGENT'S MCP ENDPOINT: the MCP gateway rides this same process
+# on loopback at the fleet-fixed port, and the agent's seeded MCP config
+# (claude.Seed) points at exactly this URL. Loopback only: the consumer
+# shares the host.
+Environment=MCP_HTTP_PORT=8390
+Environment=MCP_BIND=127.0.0.1
 # /usr/bin/env because systemd requires an absolute path for the first
 # ExecStart token; swap for your node's absolute path if you don't want to
 # depend on PATH (e.g. a toolchain node in a nonstandard location).

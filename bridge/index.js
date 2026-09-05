@@ -86,6 +86,11 @@ const cfg = {
   permissionTimeoutMs: Number(process.env.PERMISSION_TIMEOUT_MS || 10 * 60 * 1000), // 10 min
   // Empty string is "off"; a bare 0 means an ephemeral listen (what the e2e uses).
   mcpHttpPort: process.env.MCP_HTTP_PORT?.trim() ? Number(process.env.MCP_HTTP_PORT) : null,
+  // The production transport: a per-fleet unix socket. Its PARENT directory
+  // is the agent's own state dir (0700), so the socket file is connectable
+  // by the agent account alone — that is the authentication, and there is
+  // no wire to encrypt.
+  mcpUnixSocket: process.env.MCP_UNIX_SOCKET || '',
   autoApprovePermissions: process.env.AUTO_APPROVE_PERMISSIONS !== 'false', // default: on
   defaultSessionMode: process.env.ZCODE_DEFAULT_MODE || 'yolo',
   // Turns STREAM their reply into the placeholder; this paces those edits
@@ -2045,10 +2050,13 @@ async function main() {
   // THE MCP GATEWAY: lets a second model running on the same host (inside
   // the same agent) drive these conversations over loopback, with every
   // prompt and reply mirrored into the Telegram chat from the bot's
-  // identity. Off unless MCP_HTTP_PORT is set.
-  if (cfg.mcpHttpPort != null) {
+  // identity. The production transport is a PER-FLEET UNIX SOCKET
+  // (MCP_UNIX_SOCKET) whose file permissions are the authentication; the
+  // TCP listener is a test/dev convenience, off unless MCP_HTTP_PORT is set.
+  if (cfg.mcpUnixSocket || cfg.mcpHttpPort != null) {
     mcp = createMcpGateway({
-      port: cfg.mcpHttpPort,
+      port: cfg.mcpHttpPort ?? null,
+      unixSocket: cfg.mcpUnixSocket,
       host: process.env.MCP_BIND || '127.0.0.1',
       log: (m) => console.log(`[bridge] ${m}`),
     });

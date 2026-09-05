@@ -18,16 +18,25 @@
 // duplicated; MCP messages and Telegram messages are peers by the time they
 // reach dispatchUserPrompt.
 
+import fs from 'node:fs';
 import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 
 const PROTOCOL_VERSION = '2024-11-05';
 const MAX_BODY = 1 << 20; // 1 MiB of JSON-RPC is far beyond any tool call
 const WAIT_TIMEOUT_MS = 10 * 60 * 1000; // a real model turn can take minutes
 const REPLY_LOG_LIMIT = 200; // per conversation, in memory
 
-export function createMcpGateway({ port, host = '127.0.0.1', log = () => {} }) {
-  // port 0 (an ephemeral listen) is how the tests start the gateway.
-  if (port == null) throw new Error('mcp gateway needs a port');
+export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = () => {} }) {
+  // Two listeners, one JSON-RPC core:
+  // - unixSocket: a per-fleet unix domain socket speaking LINE-delimited
+  //   JSON-RPC (the stdio-MCP wire format, one request per line, one response
+  //   per line). This is the production transport: the socket file lives in
+  //   the agent's own state directory, so its permissions ARE the
+  //   authentication — only the account that runs the bridge can connect,
+  //   there is no wire to encrypt, and per-fleet paths cannot collide.
+  // - port: loopback HTTP POST /mcp, for tests and curl. Off unless set.
+  if (port == null && !unixSocket) throw new Error('mcp gateway needs a port or a unixSocket');
 
   // Per-conversation state: the reply log (for replies_get) and the waiters
   // that message_send parked until the agent's final reply lands.
@@ -241,16 +250,81 @@ export function createMcpGateway({ port, host = '127.0.0.1', log = () => {} }) {
     });
   });
 
-  // listen is asynchronous: `ready` resolves once the socket is bound, and
-  // is what callers (and tests) await before the first request.
-  const ready = new Promise((resolve, reject) => {
-    server.once('listening', () => resolve(server.address()));
-    server.once('error', (e) => reject(e));
-  });
-  server.listen(port, host, () => {
-    const a = server.address(); // the BOUND address -- port 0 (tests) logs the ephemeral port
-    log(`mcp gateway listening on http://${a.address}:${a.port}/mcp`);
-  });
+  // The TCP listener is conditional: production runs on the unix socket
+  // alone, and a fixed port on a multi-fleet host would both collide and
+  // hand the endpoint to every local account.
+  let tcpReady = null;
+  if (port != null) {
+    tcpReady = new Promise((resolve, reject) => {
+      server.once('listening', () => resolve(server.address()));
+      server.once('error', (e) => reject(e));
+    });
+    server.listen(port, host, () => {
+      const a = server.address(); // the BOUND address -- port 0 (tests) logs the ephemeral port
+      log(`mcp gateway listening on http://${a.address}:${a.port}/mcp`);
+    });
+  }
+
+  // THE UNIX LISTENER: line-delimited JSON-RPC, the stdio-MCP wire format,
+  // so the client side is a dumb pipe (cage zcode-mcp <socket>) and Claude
+  // sees a stdio server it already knows how to spawn. One request per
+  // line; one response per line, except notifications, which are answered
+  // with nothing. Permissions on the socket file are the authentication:
+  // the listener chmods it 0600 and the parent directory is the agent's.
+  let unixReady = null;
+  let unixSrv = null;
+  const unixConns = new Set();
+  if (unixSocket) {
+    unixSrv = createNetServer((conn) => {
+      unixConns.add(conn);
+      let buf = '';
+      conn.on('data', (chunk) => {
+        buf += chunk;
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          let body;
+          try {
+            body = JSON.parse(line);
+          } catch {
+            conn.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }) + '\n');
+            continue;
+          }
+          dispatchRpc(body)
+            .then((res) => {
+              if (res !== undefined) conn.write(JSON.stringify({ jsonrpc: '2.0', id: body.id ?? null, ...(res.error ? { error: res.error } : { result: res.result ?? res }) }) + '\n');
+            })
+            .catch(() => {
+              conn.write(JSON.stringify({ jsonrpc: '2.0', id: body.id ?? null, error: { code: -32603, message: 'internal error' } }) + '\n');
+            });
+        }
+      });
+      conn.on('error', () => {});
+      conn.on('close', () => unixConns.delete(conn));
+    });
+    try {
+      fs.rmSync(unixSocket, { force: true }); // a stale socket from a killed bridge would fail bind
+    } catch {}
+    unixReady = new Promise((resolve, reject) => {
+      unixSrv.once('error', (e) => reject(e));
+      unixSrv.listen(unixSocket, () => {
+        try {
+          fs.chmodSync(unixSocket, 0o600); // owner read/write, nobody else
+        } catch {}
+        log(`mcp gateway listening on unix:${unixSocket}`);
+        resolve(unixSocket);
+      });
+    });
+    unixSrv.on('error', () => {}); // handled through unixReady
+  }
+
+  // ready resolves when EVERY requested listener is bound.
+  const listeners = [];
+  if (tcpReady) listeners.push(tcpReady);
+  if (unixReady) listeners.push(unixReady);
+  const ready = Promise.all(listeners).then(([first]) => first);
 
   return {
     // closeAllConnections: undici keep-alive sockets would hold server.close()
@@ -258,7 +332,13 @@ export function createMcpGateway({ port, host = '127.0.0.1', log = () => {} }) {
     // should not wait on idle clients.
     close: () => {
       server.closeAllConnections();
-      return new Promise((r) => server.close(r));
+      for (const conn of unixConns) conn.destroy();
+      if (unixSocket) {
+        try { fs.rmSync(unixSocket, { force: true }); } catch {}
+      }
+      const jobs = [new Promise((r) => server.close(r))];
+      if (unixSrv) jobs.push(new Promise((r) => unixSrv.close(() => r())));
+      return Promise.all(jobs).then(() => undefined);
     },
     ready,
     noteReply,
@@ -266,5 +346,6 @@ export function createMcpGateway({ port, host = '127.0.0.1', log = () => {} }) {
     repliesSince,
     wire,
     address: () => server.address(),
+    unixSocket,
   };
 }
