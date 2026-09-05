@@ -20,9 +20,15 @@
 // single-placeholder streaming, still available) | off.
 
 const MAX_MILESTONES = 10; // flood guard: beyond this, narrations fold into the last message
-const LABEL_LIVE_BUDGET = 400; // chars of narration shown while the milestone runs
-const LABEL_FROZEN_BUDGET = 120; // chars kept when the milestone message freezes
-const STEP_DETAIL_BUDGET = 60;
+// Narration budgets sized from the real session DB (2026-09-03): text blocks
+// run p50=198 / p95=1848 / p99=3467 chars, and the >2k tail is almost
+// entirely FINAL replies -- which are delivered as the reply, not as labels.
+// 2000 keeps 95% of milestone narrations whole (owner ask: the narration is
+// the human-readable material; don't cap it into '…') while leaving room
+// for the steps block under Telegram's 4096-char message limit.
+const LABEL_LIVE_BUDGET = 2000;
+const LABEL_FROZEN_BUDGET = 2000;
+const STEP_DETAIL_BUDGET = 80;
 const LIVE_STEPS = 3; // steps shown on the live message
 const FROZEN_STEPS = 6; // steps kept when the milestone message freezes
 
@@ -193,31 +199,45 @@ export class ProgressReporter {
   }
 }
 
-function liveText(m, turnStartedAt) {
+export function liveText(m, turnStartedAt) {
   const elapsed = elapsedLabel(Date.now() - turnStartedAt);
-  const label = oneLine(m.label) || 'Working…';
+  const label = normalizeLabel(m.label) || 'Working…';
   const steps = m.steps.slice(-LIVE_STEPS).map((s) => `▪ ${s.done ? '✓' : '▶'} ${s.tool}${s.detail ? ` · ${s.detail}` : ''}`);
   return [`⏳ ${label}`, ...steps, elapsed].join('\n');
 }
 
-function frozenText(m) {
-  const label = oneLine(m.label) || 'Working…';
+export function frozenText(m) {
+  const label = normalizeLabel(m.label) || 'Working…';
   const steps = m.steps.slice(-FROZEN_STEPS).map((s) => `▪ ${s.tool}${s.detail ? ` · ${s.detail}` : ''}${s.durationMs ? ` (${Math.max(1, Math.round(s.durationMs / 1000))}s)` : ''}`);
   const more = m.steps.length > FROZEN_STEPS ? [`▪ +${m.steps.length - FROZEN_STEPS} more`] : [];
   return [`✅ ${truncate(label, LABEL_FROZEN_BUDGET)}`, ...steps, ...more].join('\n');
 }
 
-function stepDetail(toolName, input) {
+// The step's human-readable detail. The model's own call description comes
+// FIRST (owner ask 2026-09-03: a capped raw command is noise -- 'cd <dir>
+// && ...' mostly; the description is the explanation). Verified against
+// the session DB: 100% of Bash calls carry a description. A raw command is
+// used only as the last-resort fallback, with the cd-boilerplate prefix
+// stripped.
+export function stepDetail(toolName, input) {
   if (!input || typeof input !== 'object') return '';
-  const t = (toolName || '').toLowerCase();
-  if (t === 'bash' && typeof input.command === 'string') return truncate(input.command.split('\n')[0], STEP_DETAIL_BUDGET);
+  if (typeof input.description === 'string' && input.description.trim()) return truncate(oneLine(input.description), STEP_DETAIL_BUDGET);
   if (typeof input.file_path === 'string') return truncate(input.file_path.split('/').slice(-2).join('/'), STEP_DETAIL_BUDGET);
   if (typeof input.path === 'string') return truncate(input.path.split('/').slice(-2).join('/'), STEP_DETAIL_BUDGET);
   if (typeof input.pattern === 'string') return truncate(input.pattern, STEP_DETAIL_BUDGET);
   if (typeof input.query === 'string') return truncate(input.query, STEP_DETAIL_BUDGET);
-  if (typeof input.description === 'string') return truncate(input.description, STEP_DETAIL_BUDGET);
   if (typeof input.url === 'string') return truncate(input.url, STEP_DETAIL_BUDGET);
+  if (typeof input.command === 'string') {
+    const cmd = input.command.split('\n')[0].replace(/^\s*cd\s+\S+\s*&&\s*/i, '');
+    return truncate(cmd, STEP_DETAIL_BUDGET);
+  }
   return '';
+}
+
+// Narrations keep their own line structure (a 2k-char single line is a
+// wall); only runs of blank lines are collapsed and the edges trimmed.
+function normalizeLabel(s) {
+  return (s || '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function oneLine(s) {
