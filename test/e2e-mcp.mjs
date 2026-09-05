@@ -72,7 +72,7 @@ const bridge = spawn(NODE, [path.join(REPO, 'bridge/index.js')], {
     ZCODE_NODE_BIN: NODE,
     ZCODE_BIN,
     ZCODE_WORKSPACE_DIR: WS,
-    ZCODE_DEFAULT_MODEL: 'zai/glm-5.3',
+    ZCODE_DEFAULT_MODEL: 'zai/glm-5.3-flash',
     ZCODE_DEFAULT_MODE: 'yolo',
     STORE_PATH: STORE,
     MCP_HTTP_PORT: '0', // ephemeral; the e2e reads the bound port from the boot log
@@ -126,7 +126,7 @@ try {
   check('initialize handshake', init.body?.result?.protocolVersion === '2024-11-05', JSON.stringify(init));
   await mcp(mcpPort, { jsonrpc: '2.0', method: 'notifications/initialized' });
   const list = await mcp(mcpPort, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
-  check('tools/list advertises the four tools', list.body?.result?.tools?.length === 4, JSON.stringify(list.body));
+  check('tools/list advertises the five tools', list.body?.result?.tools?.length === 5, JSON.stringify(list.body));
 
   // session_create: a named topic appears in the chat, a session is born.
   step('session_create');
@@ -134,6 +134,7 @@ try {
   const c1 = JSON.parse(created.body.result.content[0].text);
   // Home-chat topics key as just the thread id (keyFor's legacy-home shape).
   check('session_create returns key/chat/thread', c1.key === String(nextThreadId) && c1.thread_id === nextThreadId, JSON.stringify(c1));
+  check('session_create names the fixed model (read-only)', c1.model === 'zai/glm-5.3-flash', JSON.stringify(c1));
   check('session_create created a Telegram topic', calls.topicCreated.length === 1 && calls.topicCreated[0].name === 'mcp-e2e', JSON.stringify(calls.topicCreated));
 
   // message_send with wait: the prompt is mirrored into the topic from the

@@ -135,7 +135,7 @@ const bridge = spawn(NODE, [path.join(REPO, 'bridge/index.js')], {
     ZCODE_NODE_BIN: NODE,
     ZCODE_BIN: ZCODE_BIN,
     ZCODE_WORKSPACE_DIR: WS,
-    ZCODE_DEFAULT_MODEL: 'zai/glm-5.3',
+    ZCODE_DEFAULT_MODEL: 'zai/glm-5.3-flash',
     ZCODE_DEFAULT_MODE: 'yolo',
     STORE_PATH: STORE,
     STREAM_EDIT_INTERVAL_MS: '1500',

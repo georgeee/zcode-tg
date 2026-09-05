@@ -81,7 +81,7 @@ const cfg = {
   nodeBin: process.env.ZCODE_NODE_BIN || process.execPath,
   zcodeBin: need('ZCODE_BIN'),
   workspaceDir: need('ZCODE_WORKSPACE_DIR'),
-  defaultModel: process.env.ZCODE_DEFAULT_MODEL || 'zai/glm-5.3',
+  defaultModel: process.env.ZCODE_DEFAULT_MODEL || 'zai/glm-5.3-flash',
   storePath: process.env.STORE_PATH || new URL('../data/sessions.json', import.meta.url).pathname,
   permissionTimeoutMs: Number(process.env.PERMISSION_TIMEOUT_MS || 10 * 60 * 1000), // 10 min
   // Empty string is "off"; a bare 0 means an ephemeral listen (what the e2e uses).
@@ -2060,7 +2060,10 @@ async function main() {
         const key = keyFor(chatId, threadId);
         store.setTopic(key, { chatId, threadId, name, model: cfg.defaultModel, mode: cfg.defaultSessionMode });
         await getOrCreateSession(key);
-        return { key, chat_id: chatId, thread_id: threadId };
+        // model is READ-ONLY information: MCP sessions always run this
+        // bridge's default model, and there is deliberately no way to
+        // switch it from here.
+        return { key, chat_id: chatId, thread_id: threadId, model: cfg.defaultModel };
       },
       sessionClose: async (key) => {
         const t = store.getTopic(key) ?? {};
@@ -2094,6 +2097,7 @@ async function main() {
         return { reply: reply.text, at: reply.at };
       },
       repliesGet: (key, afterSeq) => ({ replies: mcp.repliesSince(key, afterSeq) }),
+      modelGet: () => ({ model: cfg.defaultModel, switchable: false }),
     });
   }
   restoreTopicStatuses();

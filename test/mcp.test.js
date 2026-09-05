@@ -40,13 +40,27 @@ test('initialize handshake returns the protocol version and capabilities', async
   assert.equal(r.body.result.serverInfo.name, 'cage-pod-zcode-mcp');
 });
 
-test('tools/list advertises the four tools with schemas', async (t) => {
+test('tools/list advertises the five tools with schemas', async (t) => {
   const h = await startGateway(t, {});
   t.after(() => h.close());
   const r = await rpc(h.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const names = r.body.result.tools.map((x) => x.name).sort();
-  assert.deepEqual(names, ['message_send', 'replies_get', 'session_close', 'session_create']);
+  assert.deepEqual(names, ['message_send', 'model_get', 'replies_get', 'session_close', 'session_create']);
   for (const tool of r.body.result.tools) assert.ok(tool.inputSchema, `${tool.name} carries a schema`);
+});
+
+test('model_get is read-only and names the default model', async (t) => {
+  const h = await startGateway(t, { modelGet: () => ({ model: 'zai/glm-5.3-flash', switchable: false }) });
+  t.after(() => h.close());
+  const r = await rpc(h.url, {
+    jsonrpc: '2.0', id: 5, method: 'tools/call',
+    params: { name: 'model_get', arguments: {} },
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.result.isError, false);
+  const payload = JSON.parse(r.body.result.content[0].text);
+  assert.equal(payload.model, 'zai/glm-5.3-flash');
+  assert.equal(payload.switchable, false);
 });
 
 test('unknown methods return a JSON-RPC error; notifications return no body', async (t) => {

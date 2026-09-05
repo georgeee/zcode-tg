@@ -130,6 +130,12 @@ export function createMcpGateway({ port, host = '127.0.0.1', log = () => {} }) {
         required: ['key'],
       },
     },
+    {
+      name: 'model_get',
+      description:
+        'Return the model this bridge runs — READ-ONLY. Sessions created through this MCP server always use this model (the bridge default, zai/glm-5.3-flash); there is deliberately no way to switch models from here.',
+      inputSchema: { type: 'object', properties: {} },
+    },
   ];
 
   async function callTool(name, args) {
@@ -143,6 +149,8 @@ export function createMcpGateway({ port, host = '127.0.0.1', log = () => {} }) {
         return handlers.messageSend(String(args.key), String(args.text), args.wait !== false);
       case 'replies_get':
         return handlers.repliesGet(String(args.key), Number(args.after_seq) || 0);
+      case 'model_get':
+        return handlers.modelGet();
       default:
         throw new Error(`unknown tool: ${name}`);
     }
