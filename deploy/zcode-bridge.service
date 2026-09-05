@@ -18,11 +18,12 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/zcode-tg
 # THE JUNIOR AGENT'S MCP ENDPOINT: the MCP gateway rides this same process
-# on loopback at the fleet-fixed port, and the agent's seeded MCP config
-# (claude.Seed) points at exactly this URL. Loopback only: the consumer
-# shares the host.
-Environment=MCP_HTTP_PORT=8390
-Environment=MCP_BIND=127.0.0.1
+# on a PER-FLEET UNIX SOCKET. The socket file's 0600 permissions are the
+# authentication — only this account (the agent's) can connect, there is no
+# wire to encrypt, and per-fleet paths cannot collide across fleets. The
+# agent's seeded MCP config (claude.Seed) points a stdio pipe at exactly
+# this path, so both halves must name the same file.
+Environment=MCP_UNIX_SOCKET=%h/.local/state/agent-cage/zcode-tg/mcp.sock
 # /usr/bin/env because systemd requires an absolute path for the first
 # ExecStart token; swap for your node's absolute path if you don't want to
 # depend on PATH (e.g. a toolchain node in a nonstandard location).

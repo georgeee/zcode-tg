@@ -234,34 +234,45 @@ account needs root).
 
 ## MCP gateway: a second model driving the same conversations
 
-`MCP_HTTP_PORT` turns on a small **MCP (Model Context Protocol) server
-inside the bridge process** (Streamable HTTP, `POST /mcp`, JSON-RPC 2.0).
-Its purpose: let another model — say, Opus running inside the same agent —
-drive the very same conversations the Telegram frontend serves. Every prompt
-sent through MCP is mirrored into the topic **from the bot's identity**, and
-every reply is both delivered to the topic and returned to the MCP caller,
-so the Telegram chat stays the shared log no matter which frontend typed.
+`MCP_UNIX_SOCKET` turns on a small **MCP (Model Context Protocol) server
+inside the bridge process** (JSON-RPC 2.0, one request per line — the
+stdio-MCP wire format, served over a **per-fleet unix domain socket**).
+Its purpose: let another model — a junior agent — drive the very same
+conversations the Telegram frontend serves. Every prompt sent through MCP
+is mirrored into the topic **from the bot's identity**, and every reply is
+both delivered to the topic and returned to the MCP caller, so the Telegram
+chat stays the shared log no matter which frontend typed.
 
-Four tools:
+Five tools:
 
 | tool | what it does |
 |---|---|
-| `session_create` | Create a named session: a new forum topic + a fresh agent session; returns the conversation `key`. |
+| `session_create` | Create a named session: a new forum topic + a fresh agent session; returns the conversation `key` and the `model` it runs. |
 | `message_send` | Send a prompt to a session and (by default, `wait: true`) block until the final reply — a real turn, streamed into the topic meanwhile. `wait: false` queues and returns at once. |
 | `replies_get` | Catch-up read: replies already collected for a conversation since a sequence number (the in-memory log keeps the last 200 per conversation). |
 | `session_close` | Close the session and its Telegram topic; further `message_send` to the key names the error. |
+| `model_get` | Read-only: the model this bridge runs. **There is deliberately no way to switch models over MCP** — sessions always run the bridge default (`zai/glm-5.3-flash`). |
 
 Configuration (in the bridge's env, off by default):
 
-- `MCP_HTTP_PORT` — port to listen on. **Off unless set.** `0` picks an
-  ephemeral port (what the e2e uses; the bound port is in the boot log).
-- `MCP_BIND` — bind address, default `127.0.0.1`. The client runs on the
-  same host inside the same agent, so loopback is the whole surface and no
-  auth is layered on top — the listener deliberately carries no token.
+- `MCP_UNIX_SOCKET` — the per-fleet unix socket to listen on. **Off unless
+  set.** The socket file is created 0600 inside the bridge's own state
+  directory, and those permissions ARE the authentication: only the account
+  running the bridge can connect, there is no wire to encrypt (the
+  conversation never leaves the kernel), and per-fleet paths cannot collide
+  the way a fixed loopback port does across fleets. A loopback TCP port
+  would hand the junior agent to every local account — including an
+  executor running model-authored commands — which is why the TCP listener
+  (`MCP_HTTP_PORT`) is a test/dev convenience only.
 
-  ```
-  claude mcp add --transport http cage-zcode http://127.0.0.1:<port>/mcp
-  ```
+- `MCP_HTTP_PORT` — loopback HTTP POST `/mcp`, for tests and curl. Off
+  unless set; never used in production.
+
+The senior model's side is a stdio MCP server that pipes to the socket:
+`cage zcode-mcp <socket>` (part of agent-cage). On a cage fleet it is
+seeded automatically — claude's MCP config gains a `cage-zcode` stdio
+server whose command is the fleet's own `cage` binary, pre-approved, with
+the socket path pointing at this bridge.
 
 The reply wait is bounded (10 minutes per `message_send`); a turn still
 running past that returns a timeout error pointing at `replies_get`. A
