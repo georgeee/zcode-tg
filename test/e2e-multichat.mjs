@@ -46,7 +46,7 @@ const srv = createServer(async (req, res) => {
   if (method === 'getUpdates') {
     const p = JSON.parse(body || '{}');
     while (updateQueue.length && updateQueue[0].update_id < p.offset) updateQueue.shift();
-    if (updateQueue.length) { const batch = updateQueue.splice(0, 10); console.log(`[fake] responded with ${batch.length} update(s) (ids ${batch.map((u) => u.update_id)})`); return ok(batch); }
+    if (updateQueue.length) { return ok(updateQueue.splice(0, 10)); }
     // A done flag per long poll: the timeout and a pushed update must not
     // both write a response (node throws on the second -- measured).
     let done = false;

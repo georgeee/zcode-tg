@@ -53,6 +53,7 @@
 // unit); it does not daemonize itself.
 
 import { randomBytes } from 'node:crypto';
+import { createMcpGateway } from './mcp.js';
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { loadEnv, resolveEnvPath } from './env.js';
@@ -83,6 +84,9 @@ const cfg = {
   defaultModel: process.env.ZCODE_DEFAULT_MODEL || 'zai/glm-5.3',
   storePath: process.env.STORE_PATH || new URL('../data/sessions.json', import.meta.url).pathname,
   permissionTimeoutMs: Number(process.env.PERMISSION_TIMEOUT_MS || 10 * 60 * 1000), // 10 min
+  // Empty string is "off"; a bare 0 means an ephemeral listen (what the e2e uses).
+  mcpHttpPort: process.env.MCP_HTTP_PORT?.trim() ? Number(process.env.MCP_HTTP_PORT) : null,
+  mcpToken: process.env.MCP_TOKEN || '',
   autoApprovePermissions: process.env.AUTO_APPROVE_PERMISSIONS !== 'false', // default: on
   defaultSessionMode: process.env.ZCODE_DEFAULT_MODE || 'yolo',
   // Turns STREAM their reply into the placeholder; this paces those edits
@@ -135,6 +139,10 @@ const cfg = {
   // does. Set to 0 to skip draining and go straight to notify-and-kill.
   shutdownDrainMs: Number(process.env.SHUTDOWN_DRAIN_MS ?? 25 * 60 * 1000), // 25 min
 };
+
+// The MCP gateway handle (module-level because finalizeTurn's reply hook
+// notes replies into it); created in main() when MCP_HTTP_PORT is set.
+let mcp = null;
 
 // Registered with Telegram on boot so these show as / autocomplete in the
 // client. Keep in sync with the command handling in handleMessage().
@@ -805,7 +813,9 @@ async function finalizeTurn(sessionId, terminalParams) {
         }
       } else {
         const footer = terminalParams.status === 'success' ? usageFooter(turn, terminalParams) : '';
-        await deliverReply(replaceId, topic?.threadId, text.trim() ? text : '(no reply text)', footer);
+        const replyText = text.trim() ? text : '(no reply text)';
+        if (mcp && topic) mcp.noteReply(topic.threadId, replyText);
+        await deliverReply(replaceId, topic?.threadId, replyText, footer);
       }
     }
     if (topic) {
@@ -2032,6 +2042,62 @@ async function handleCallbackQuery(cq) {
 // --- main poll loop ---
 async function main() {
   console.log(`[bridge] starting. chat=${cfg.chatId} workspace=${cfg.workspaceDir} model=${cfg.defaultModel}`);
+
+  // THE MCP GATEWAY: lets a second model drive these conversations from a
+  // laptop (over ssh -L or WireGuard -- the listener binds loopback) with
+  // every prompt and reply mirrored into the Telegram chat from the bot's
+  // identity. Off unless MCP_HTTP_PORT is set; MCP_TOKEN gates it when set.
+  if (cfg.mcpHttpPort != null) {
+    mcp = createMcpGateway({
+      port: cfg.mcpHttpPort,
+      host: process.env.MCP_BIND || '127.0.0.1',
+      token: cfg.mcpToken,
+      log: (m) => console.log(`[bridge] ${m}`),
+    });
+    mcp.wire({
+      sessionCreate: async (name, chatIdNum) => {
+        const chatId = chatIdNum ?? cfg.chatId;
+        const created = await tg.createForumTopic({ chatId, name });
+        const threadId = created.message_thread_id;
+        const key = keyFor(chatId, threadId);
+        store.setTopic(key, { chatId, threadId, name, model: cfg.defaultModel, mode: cfg.defaultSessionMode });
+        await getOrCreateSession(key);
+        return { key, chat_id: chatId, thread_id: threadId };
+      },
+      sessionClose: async (key) => {
+        const t = store.getTopic(key) ?? {};
+        await tg.closeForumTopic({ chatId: chatOf(key), messageThreadId: Number(t.threadId) }).catch(() => {});
+        store.setTopic(key, { closed: true });
+        return { ok: true };
+      },
+      messageSend: async (key, text, wait) => {
+        // MIRROR THE PROMPT INTO THE TOPIC FIRST (the bot's identity, per
+        // the MCP contract), then dispatch through the SAME pipeline a
+        // Telegram message uses: queue/deploy-drain semantics, session
+        // creation, the turn, and the reply delivered back to the topic by
+        // the ordinary reply flow.
+        if (store.getTopic(key)?.closed) throw new Error(`session ${key} is closed`);
+        await tg.sendMessage({ chatId: chatOf(key), messageThreadId: threadOf(key), text });
+        if (!wait) {
+          await dispatchUserPrompt(key, text);
+          return { queued: true, key };
+        }
+        // Register the waiter BEFORE dispatching: finalizeTurn's noteReply
+        // fires the moment the turn lands, which can beat a waiter
+        // registered only after dispatch resolves.
+        const pending = mcp.waitReply(key);
+        try {
+          await dispatchUserPrompt(key, text);
+        } catch (e) {
+          pending.catch(() => {}); // abandoned waiter times out quietly
+          throw e;
+        }
+        const reply = await pending;
+        return { reply: reply.text, at: reply.at };
+      },
+      repliesGet: (key, afterSeq) => ({ replies: mcp.repliesSince(key, afterSeq) }),
+    });
+  }
   restoreTopicStatuses();
   refreshUsagePercentages(); // warm the cache so the first status write has figures
   await cleanupOrphanedPermissionRequests();
@@ -2069,7 +2135,6 @@ async function main() {
     let updates;
     try {
       updates = await tg.getUpdates({ offset, timeout: 30 });
-      console.log(`[bridge] DEBUG poll got ${updates.length} update(s) at offset ${offset}`);
     } catch (e) {
       console.error('[bridge] getUpdates failed, retrying in 5s:', e.message);
       await sleep(5000);

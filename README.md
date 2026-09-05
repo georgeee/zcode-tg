@@ -232,6 +232,45 @@ isolation, give the bridge a dedicated OS account with its own `$HOME`
 (and its own `systemctl --user` instance; enabling lingering for a new
 account needs root).
 
+## MCP gateway: a second model driving the same conversations
+
+`MCP_HTTP_PORT` turns on a small **MCP (Model Context Protocol) server
+inside the bridge process** (Streamable HTTP, `POST /mcp`, JSON-RPC 2.0).
+Its purpose: let another model — say, Opus running on your laptop — drive
+the very same conversations the Telegram frontend serves. Every prompt sent
+through MCP is mirrored into the topic **from the bot's identity**, and
+every reply is both delivered to the topic and returned to the MCP caller,
+so the Telegram chat stays the shared log no matter which frontend typed.
+
+Four tools:
+
+| tool | what it does |
+|---|---|
+| `session_create` | Create a named session: a new forum topic + a fresh agent session; returns the conversation `key`. |
+| `message_send` | Send a prompt to a session and (by default, `wait: true`) block until the final reply — a real turn, streamed into the topic meanwhile. `wait: false` queues and returns at once. |
+| `replies_get` | Catch-up read: replies already collected for a conversation since a sequence number (the in-memory log keeps the last 200 per conversation). |
+| `session_close` | Close the session and its Telegram topic; further `message_send` to the key names the error. |
+
+Configuration (all in the bridge's env, off by default):
+
+- `MCP_HTTP_PORT` — port to listen on. **Off unless set.** `0` picks an
+  ephemeral port (what the e2e uses; the bound port is in the boot log).
+- `MCP_TOKEN` — when set, every request must carry
+  `Authorization: Bearer <token>` (checked before the body is read).
+- `MCP_BIND` — bind address, default `127.0.0.1`. Keep it loopback and
+  reach the box over `ssh -L 8377:127.0.0.1:<port>`; then on the laptop:
+
+  ```
+  claude mcp add --transport http cage-zcode http://127.0.0.1:8377/mcp
+  ```
+
+The reply wait is bounded (10 minutes per `message_send`); a turn still
+running past that returns a timeout error pointing at `replies_get`. A
+session-creation failure surfaces to the MCP caller as the same failure
+notice the Telegram user would see. `message_send` rides the ordinary
+dispatch pipeline: queueing behind a running turn, deploy-drain semantics,
+and the reply footer are all shared with the Telegram path.
+
 ## Commands & turn lifecycle from Telegram
 
 The bridge intercepts its own commands before anything reaches the model

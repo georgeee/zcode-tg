@@ -54,6 +54,19 @@ export class TelegramClient {
     });
   }
 
+  createForumTopic({ chatId, name, iconColor, iconCustomEmojiId }) {
+    return this._call('createForumTopic', {
+      chat_id: chatId,
+      name,
+      icon_color: iconColor,
+      icon_custom_emoji_id: iconCustomEmojiId,
+    });
+  }
+
+  closeForumTopic({ chatId, messageThreadId }) {
+    return this._call('closeForumTopic', { chat_id: chatId, message_thread_id: messageThreadId });
+  }
+
   editMessageText({ chatId, messageId, text, replyMarkup, parseMode }) {
     return this._call('editMessageText', {
       chat_id: chatId,
