@@ -178,9 +178,17 @@ export function createMcpGateway({ port, host = '127.0.0.1', log = () => {} }) {
   }
 
   const server = createServer((req, res) => {
-    if (req.method !== 'POST' || req.url.split('?')[0] !== '/mcp') {
+    if (req.url.split('?')[0] !== '/mcp') {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'not found -- POST JSON-RPC to /mcp' }));
+      return;
+    }
+    if (req.method !== 'POST') {
+      // The Streamable-HTTP spec: a server that offers no stream answers
+      // GET with 405. A 404 here reads to real MCP clients (the vendored
+      // SDK included) as "endpoint dead".
+      res.writeHead(405, { allow: 'POST', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'POST JSON-RPC to /mcp' }));
       return;
     }
     let raw = '';

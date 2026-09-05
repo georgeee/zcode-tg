@@ -11,8 +11,9 @@ import path from 'node:path';
 const NODE = process.env.ZCODE_NODE_BIN || '/srv/agent-cage/etheron-bare/agent/etheron-bare/work/toolchain/node/bin/node';
 const ZCODE_BIN = process.env.ZCODE_BIN || '/srv/agent-cage/etheron-bare/agent/etheron-bare/work/zcode-probe/package/bin/zcode.js';
 const REPO = path.dirname(path.dirname(new URL(import.meta.url).pathname));
-const WS = '/tmp/zbridge-e2efile-ws';
-const STORE = '/tmp/zbridge-e2efile-store.json';
+const SCRATCH = `${process.env.HOME}/.cache/e2e-file`;
+const WS = `${SCRATCH}-ws`;
+const STORE = `${SCRATCH}-store.json`;
 const CHAT = -100777, USER = 42, THREAD = 91;
 const FILE_TEXT = 'hello-inbound this is the rest of the file\nsecond line\n';
 
@@ -120,6 +121,8 @@ let bridgeLog = '';
 bridge.stdout.on('data', (c) => { bridgeLog += c; process.stdout.write(`[bridge] ${c}`); });
 bridge.stderr.on('data', (c) => { bridgeLog += c; process.stderr.write(`[bridge-err] ${c}`); });
 process.on('unhandledRejection', (e) => console.error('[harness] unhandled rejection:', e));
+process.on('SIGTERM', () => { try { bridge.kill('SIGKILL'); } catch {} process.exit(1); });
+process.on('SIGINT', () => { try { bridge.kill('SIGKILL'); } catch {} process.exit(1); });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function waitFor(fn, timeoutMs, label) {
@@ -167,8 +170,10 @@ try {
   check('file saved under inbox/telegram/ with timestamp prefix + original name', /-\d{2}T\d{2}-\d{2}-\d{2}-note\.txt$/.test(saved), saved);
   check('saved content matches what was sent', readFileSync(saved, 'utf8') === FILE_TEXT);
 
+  // Milestone mode delivers the reply on the trailing milestone's message
+  // (not necessarily the seed placeholder) -- match on content, any id.
   const final = await waitFor(
-    () => calls.edit.filter((e) => e.message_id === ph.message_id).find((e) => /hello-inbound/.test(e.text) && !e.text.startsWith('⌛')),
+    () => calls.edit.concat(calls.send.map((x) => ({ message_id: x.message_id, text: x.text }))).find((e) => /hello-inbound/.test(e.text) && !/⏳|⌛/.test(e.text)),
     120000,
     'agent reply echoing the file first word',
   );
