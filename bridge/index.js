@@ -2146,7 +2146,7 @@ async function main() {
     try {
       updates = await tg.getUpdates({ offset, timeout: 30 });
     } catch (e) {
-      console.error('[bridge] getUpdates failed, retrying in 5s:', e.message);
+      console.error('[bridge] getUpdates failed, retrying in 5s:', e.message, '— cause:', e.cause?.code || e.cause?.message || '(none)');
       await sleep(5000);
       continue;
     }
