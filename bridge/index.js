@@ -663,6 +663,7 @@ zcode.on('event', (msg) => {
       // session is idle is the one thing worth acting on here: post the 🌀
       // notice; the notification turn the runtime auto-starts next is picked
       // up by adoptUnclaimedTurn below.
+      if (payload?.taskId && payload.status) noteTaskLifecycle(sessionId, payload);
       if (payload?.taskId && payload.status && payload.status !== 'running') void handleBackgroundTaskFinished(sessionId, payload);
       return;
     }
@@ -694,7 +695,8 @@ zcode.on('event', (msg) => {
       // learned at started/scheduled time.
       const name = payload.toolName ?? (payload.toolCallId && turn.toolNames.get(payload.toolCallId)) ?? 'tool';
       turn.streamer?.update({ status: `🔧 ${name} ✓` });
-    } else if (payload?.taskId && payload.status && payload.status !== 'running') {
+    } else if (payload?.taskId && payload.status) {
+      noteTaskLifecycle(sessionId, payload);
       // Task finished while THIS turn is still running: the notification is
       // injected into the model's next request anyway; a status hint on the
       // placeholder is enough.
@@ -1478,6 +1480,88 @@ function sanitizeFileName(name, fallbackId) {
   return base || `file-${fallbackId || 'unnamed'}`;
 }
 
+
+// --- /stop is a HARD interrupt (owner ask 2026-09-06) ---
+// session/stop aborts the turn's AbortController, which interrupts the model
+// stream and FUTURE steps -- but a tool that is EXECUTING right now (a
+// blocking TaskOutput, a long bash) does not check that signal, so the turn
+// idles until the tool returns on its own. To actually stop "everything,
+// immediately, with interruption", the bridge additionally:
+//   1. kills the session's in-flight tool processes -- found via /proc by
+//      the session id embedded in every command the runtime launches (the
+//      shell-snapshot/bootstrap paths name sess_<id> on the bash command
+//      line) -- as a full process TREE (the bash's children, e.g. the sleep
+//      it wraps, would otherwise be orphaned and keep running), SIGTERM
+//      first and SIGKILL for stragglers;
+//   2. cancels the session's known background tasks via
+//      session/cancelBackgroundTask (taskIds tracked from the task
+//      lifecycle events the bridge already receives).
+// Scoped by the exact session id, which is unique; the bridge's own
+// processes and other sessions' tools never match.
+import { readdirSync, readFileSync } from 'node:fs';
+
+const sessionBackgroundTasks = new Map(); // sessionId -> Set(taskId) currently running
+
+function noteTaskLifecycle(sessionId, payload) {
+  if (!payload?.taskId) return;
+  const set = sessionBackgroundTasks.get(sessionId) ?? new Set();
+  if (payload.status === 'running') set.add(payload.taskId);
+  else set.delete(payload.taskId);
+  if (set.size) sessionBackgroundTasks.set(sessionId, set);
+  else sessionBackgroundTasks.delete(sessionId);
+}
+
+function processCmdline(pid) {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
+  } catch {
+    return '';
+  }
+}
+
+function collectTree(rootPid) {
+  // pid -> ppid for everything, then descendants of rootPid (inclusive).
+  const children = new Map();
+  for (const pid of readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
+    try {
+      const ppid = Number(readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]?.split(' ')[1]);
+      if (Number.isFinite(ppid)) {
+        if (!children.has(ppid)) children.set(ppid, []);
+        children.get(ppid).push(Number(pid));
+      }
+    } catch {}
+  }
+  const out = [];
+  const walk = (p) => {
+    out.push(p);
+    for (const c of children.get(p) ?? []) walk(c);
+  };
+  walk(rootPid);
+  return out;
+}
+
+function killSessionToolProcesses(sessionId) {
+  try {
+    for (const pid of readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
+      const p = Number(pid);
+      if (p === process.pid) continue;
+      if (!processCmdline(pid).includes(sessionId)) continue;
+      // A tool process for THIS session. TERM the whole tree now; KILL
+      // whatever is still alive shortly after.
+      const tree = collectTree(p);
+      for (const t of tree) { try { process.kill(t, 'SIGTERM'); } catch {} }
+      console.log(`[bridge] /stop: SIGTERM ${tree.length} process(es) of session ${sessionId} (root ${p})`);
+      setTimeout(() => {
+        for (const t of tree) {
+          try { process.kill(t, 0); process.kill(t, 'SIGKILL'); } catch {}
+        }
+      }, 400).unref();
+    }
+  } catch (e) {
+    console.error('[bridge] /stop: tool-process sweep failed:', e.message);
+  }
+}
+
 // --- Telegram message handling ---
 
 // '/usage@botname arg' -> 'usage'; null for anything that isn't a command.
@@ -1792,7 +1876,14 @@ async function dispatchUserPrompt(threadId, promptText, command) {
 
   if (busySessions.has(sessionId)) {
     if (command === 'stop' || command === 'cancel') {
+      // HARD stop: abort the turn AND kill what it is currently executing
+      // (see killSessionToolProcesses above for why session/stop alone is
+      // not "immediate" from the user's side).
       await zcode.call('session/stop', { sessionId }).catch((e) => console.error('[bridge] session/stop failed:', e.message));
+      killSessionToolProcesses(sessionId);
+      for (const taskId of sessionBackgroundTasks.get(sessionId) ?? []) {
+        zcode.call('session/cancelBackgroundTask', { sessionId, taskId }).catch(() => {});
+      }
       const turn = activeTurns.get(sessionId);
       busySessions.delete(sessionId);
       activeTurns.delete(sessionId);

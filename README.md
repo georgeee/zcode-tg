@@ -362,9 +362,16 @@ through to the model as ordinary input):
   (`data/sessions.json`) and drained in order when the current turn ends,
   fails, or is cancelled; they're also restored and drained on
   startup after a restart. Capped at `MAX_QUEUE_PER_TOPIC` (default 20).
-- **`/stop` or `/cancel`** in a topic with a turn in progress calls
-  `session/stop` and clears the busy state immediately, instead of waiting
-  for it to finish — then the next queued message (if any) runs.
+- **`/stop` or `/cancel`** in a topic with a turn in progress is a HARD
+  interrupt. It calls `session/stop` (aborting the model stream and future
+  steps), kills the session's in-flight tool processes — found via `/proc`
+  by the session id on their command lines, as a full process tree so
+  nothing is orphaned — and cancels its known background tasks
+  (`session/cancelBackgroundTask`). Without the kill, a tool that's
+  executing right now (a blocking `TaskOutput`, a long bash) holds the turn
+  until it returns on its own: the runtime's abort only lands at the next
+  boundary. Then the busy state clears and the next queued message (if any)
+  runs.
 - **The turn-timeout watchdog is off by default** (`TURN_TIMEOUT_MS=0` —
   the old 20-minute default killed real, merely-slow turns, and long turns
   are normal for agentic work). `/stop` is the
