@@ -43,6 +43,7 @@ export class ProgressReporter {
     this.milestones = [{ messageId: seedMessageId, label: '', steps: [], closed: false }];
     this.startedAt = Date.now();
     this._toolsSinceText = false;
+    this._inNarration = false; // true while narration deltas append to the current stamped line
     this._dirty = false;
     this._dead = false;
     this._timer = null;
@@ -60,6 +61,11 @@ export class ProgressReporter {
 
   // A narration text delta. If tools ran since the last text, this delta
   // opens the next milestone; otherwise it just extends the current label.
+  // Narration text. Each contiguous narration segment becomes its own
+  // timestamped line (owner ask 2026-09-06: '19:31 <this thing happened>') --
+  // the live message reads as an event log instead of one run-on wall, which
+  // is what folding post-cap narrations into the last message used to
+  // produce (segments joined with no separator at all).
   narration(delta) {
     if (this._dead || typeof delta !== 'string' || !delta) return;
     if (this._toolsSinceText && this.milestones.length < MAX_MILESTONES) {
@@ -68,7 +74,13 @@ export class ProgressReporter {
       this._toolsSinceText = false;
     }
     const m = this.current;
-    m.label = (m.label + delta).slice(0, LABEL_LIVE_BUDGET);
+    if (this._inNarration) {
+      m.label = (m.label + delta).slice(0, LABEL_LIVE_BUDGET);
+    } else {
+      const stamp = hhmm();
+      m.label = ((m.label ? m.label.replace(/\s+$/, '') + '\n' : '') + stamp + ' ' + delta).slice(0, LABEL_LIVE_BUDGET);
+      this._inNarration = true;
+    }
     this._touch();
   }
 
@@ -77,6 +89,7 @@ export class ProgressReporter {
   toolCall({ toolName, input, toolCallId }) {
     if (this._dead) return;
     this._toolsSinceText = true;
+    this._inNarration = false; // the next narration opens a fresh stamped line
     const m = this.current;
     m.steps = m.steps.filter((s) => s.toolCallId !== toolCallId); // idempotent per call id
     m.steps.push({ tool: toolName || 'tool', detail: stepDetail(toolName, input), toolCallId, startedAt: Date.now(), done: false });
@@ -247,6 +260,11 @@ function oneLine(s) {
 function truncate(s, max) {
   const chars = Array.from(s);
   return chars.length > max ? chars.slice(0, max).join('') + '…' : s;
+}
+
+function hhmm() {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
 function elapsedLabel(ms) {
