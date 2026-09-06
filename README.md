@@ -372,6 +372,7 @@ through to the model as ordinary input):
   until it returns on its own: the runtime's abort only lands at the next
   boundary. Then the busy state clears and the next queued message (if any)
   runs.
+- **Blocking TaskOutput waits have a circuit breaker**: a turn whose current tool has been `TaskOutput(block=true)` for longer than `TASK_BLOCK_LIMIT_MS` (default 15 min) is auto-interrupted with an explanatory notice, while its background tasks keep running — their completion notifications are the mechanism the model should have waited for instead of blocking. Ends the multi-hour TaskOutput camps observed live; 0 disables.
 - **The turn-timeout watchdog is off by default** (`TURN_TIMEOUT_MS=0` —
   the old 20-minute default killed real, merely-slow turns, and long turns
   are normal for agentic work). `/stop` is the
