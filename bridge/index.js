@@ -108,6 +108,14 @@ const cfg = {
   // inputMergeMaxMs from the first) is treated as ONE prompt. Also applies
   // to consecutive queue additions. 0 disables merging.
   inputMergeMs: Number(process.env.INPUT_MERGE_MS ?? 800),
+  // Circuit breaker for blocking TaskOutput waits: a turn whose CURRENT
+  // tool is TaskOutput(block=true) for longer than this is auto-interrupted
+  // (session/stop; background tasks keep running and will still notify).
+  // The anti-pattern this ends -- an agent camping through 10-minute
+  // TaskOutput timeouts for hours -- was observed live three separate times
+  // before the guidance landed, and old-context sessions never read the
+  // guidance at all. 0 disables.
+  taskBlockLimitMs: Number(process.env.TASK_BLOCK_LIMIT_MS ?? 15 * 60 * 1000),
   inputMergeMaxMs: Number(process.env.INPUT_MERGE_MAX_MS ?? 3000),
   // A turn stuck inside ONE long tool call (VM boot, a slow test run, ...)
   // gets no update() calls between the tool starting and finishing -- the
@@ -668,6 +676,15 @@ zcode.on('event', (msg) => {
       return;
     }
 
+    // Blocking-wait tracking for the circuit breaker: set when the turn's
+    // current tool is TaskOutput(block=true), cleared on any other event
+    // kind (a new tool starting, text resuming, or the wait returning).
+    if (payload?.kind === 'tool_call' && /taskoutput/i.test(payload.toolName || '') && payload.input?.block !== false) {
+      turn.blockSince = turn.blockSince ?? Date.now();
+    } else if (payload?.kind === 'result' || payload?.kind === 'text_delta' || (payload?.kind === 'tool_call' && !/taskoutput/i.test(payload.toolName || ''))) {
+      turn.blockSince = null;
+    }
+
     if (turn.progress) {
       // Milestone mode (STREAM_PROGRESS=messages, branch experiment
       // 2026-09-02): narration blocks become per-milestone messages, tool
@@ -744,6 +761,16 @@ zcode.on('event', (msg) => {
       return;
     }
     if (kind === 'turn.terminal') {
+      // Straggler guard: a terminal for a turn that never saw ITS turnId
+      // started (turn.turnId unset), when that turn began after a recent
+      // interrupt of the same session, is the INTERRUPTED turn's death
+      // rattle -- finalizing on it would kill the brand-new turn (seen
+      // live: the post-breaker follow-up reply never arrived).
+      const interruptedAt = lastInterruptedAt.get(sessionId) ?? 0;
+      if (turn && !turn.turnId && turn.startedAt > interruptedAt && Date.now() - interruptedAt < 30_000) {
+        console.log(`[bridge] ignoring terminal straggler from the interrupted turn on session ${sessionId}`);
+        return;
+      }
       void finalizeTurn(sessionId, msg.params);
     }
   }
@@ -967,7 +994,41 @@ async function sendChunkFallback(method, messageId, threadId, chunk, originalErr
 // mode this was built to prevent, just relocated one level deeper. Calling
 // session/stop here makes a watchdog timeout behave like /stop: the turn
 // actually ends, instead of continuing to run unobserved.
-setInterval(() => {
+setInterval(async () => {
+  // Circuit breaker for blocking TaskOutput camps (owner ask 2026-09-06:
+  // 'ensure such behavior will be fixed in full' after the third live
+  // occurrence). Old-context sessions never read the guidance, and even a
+  // hard /stop needs a human to notice first. This ends the TURN after
+  // TASK_BLOCK_LIMIT_MS of a continuously blocking TaskOutput; background
+  // tasks deliberately keep running -- their completion notifications are
+  // the mechanism the model should have used instead of blocking.
+  if (cfg.taskBlockLimitMs > 0) {
+    for (const [sessionId, turn] of activeTurns) {
+      if (!turn.blockSince || Date.now() - turn.blockSince < cfg.taskBlockLimitMs) continue;
+      const mins = Math.round((Date.now() - turn.blockSince) / 60000);
+      console.log(`[bridge] circuit breaker: session ${sessionId} blocked on TaskOutput for ${mins}m -- interrupting the turn (background tasks keep running)`);
+      turn.blockSince = null;
+      const topic = sessionToTopic.get(sessionId);
+      await interruptTurn(sessionId, { killEverything: false }).catch(() => {});
+      if (topic) {
+        // Bookkeeping mirrors /stop: clear busy, label the live message,
+        // drain the queue.
+        busySessions.delete(sessionId);
+        activeTurns.delete(sessionId);
+        turn.streamer?.stop();
+        turn.progress?.stop();
+        updateTopicStatus(topic.threadId, 'idle').catch(() => {});
+        const liveId = turnLiveMessageId(turn);
+        const text = `⚠️ Auto-interrupted after ${mins} min blocked on TaskOutput. Background tasks were NOT cancelled -- they keep running and will notify on completion; send a message to continue.`;
+        if (liveId) {
+          await tg.editMessageText({ chatId: chatOf(topic.threadId), messageId: liveId, text }).catch(() => {});
+        } else {
+          await tg.sendMessage({ chatId: chatOf(topic.threadId), messageThreadId: threadOf(topic.threadId), text }).catch(() => {});
+        }
+        void drainQueue(topic.threadId);
+      }
+    }
+  }
   if (!cfg.turnTimeoutMs) return; // default: watchdog off, /stop is the hatch
   const now = Date.now();
   for (const [sessionId, turn] of activeTurns) {
@@ -1501,6 +1562,12 @@ function sanitizeFileName(name, fallbackId) {
 import { readdirSync, readFileSync } from 'node:fs';
 
 const sessionBackgroundTasks = new Map(); // sessionId -> Set(taskId) currently running
+// sessionId -> timestamp of the last interrupt (hard /stop or breaker). A
+// terminal event arriving for a turn that never learned ITS OWN turnId,
+// started after this timestamp, is the INTERRUPTED turn's straggler -- the
+// new turn's own turn.started always precedes its terminal, so an unknown
+// turnId at terminal time means the event cannot belong to the new turn.
+const lastInterruptedAt = new Map();
 
 function noteTaskLifecycle(sessionId, payload) {
   if (!payload?.taskId) return;
@@ -1559,6 +1626,25 @@ function killSessionToolProcesses(sessionId) {
     }
   } catch (e) {
     console.error('[bridge] /stop: tool-process sweep failed:', e.message);
+  }
+}
+
+// Shared interrupt core. Used by /stop (EVERYTHING dies: processes killed,
+// background tasks cancelled) and by the TaskOutput circuit breaker below
+// (session/stop only: the TURN dies, while background tasks and their
+// processes keep running so completion notifications still arrive later --
+// the process sweep must NOT run there, because a background task's
+// command line carries the same session id as any foreground tool's, and
+// killing "the session's processes" would silently kill the task the model
+// was waiting ON, defeating the breaker's whole point. Verified by
+// test/e2e-breaker.mjs after exactly that bug fired live in its first run).
+async function interruptTurn(sessionId, { killEverything }) {
+  lastInterruptedAt.set(sessionId, Date.now());
+  await zcode.call('session/stop', { sessionId }).catch((e) => console.error('[bridge] session/stop failed:', e.message));
+  if (!killEverything) return;
+  killSessionToolProcesses(sessionId);
+  for (const taskId of sessionBackgroundTasks.get(sessionId) ?? []) {
+    zcode.call('session/cancelBackgroundTask', { sessionId, taskId }).catch(() => {});
   }
 }
 
@@ -1878,12 +1964,9 @@ async function dispatchUserPrompt(threadId, promptText, command) {
     if (command === 'stop' || command === 'cancel') {
       // HARD stop: abort the turn AND kill what it is currently executing
       // (see killSessionToolProcesses above for why session/stop alone is
-      // not "immediate" from the user's side).
-      await zcode.call('session/stop', { sessionId }).catch((e) => console.error('[bridge] session/stop failed:', e.message));
-      killSessionToolProcesses(sessionId);
-      for (const taskId of sessionBackgroundTasks.get(sessionId) ?? []) {
-        zcode.call('session/cancelBackgroundTask', { sessionId, taskId }).catch(() => {});
-      }
+      // not "immediate" from the user's side). Background tasks are killed
+      // too -- a user-initiated stop means stop EVERYTHING.
+      await interruptTurn(sessionId, { killEverything: true });
       const turn = activeTurns.get(sessionId);
       busySessions.delete(sessionId);
       activeTurns.delete(sessionId);
