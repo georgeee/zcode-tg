@@ -1497,6 +1497,33 @@ async function handleModeCommand(threadId, arg) {
 // there is no way to carry conversation history across this switch (unlike
 // /model or /mode, which act on the SAME running session). ---
 const KNOWN_BACKENDS = ['zcode', 'codex'];
+
+// THE MCP-REACHABLE CODEX TIERS, AND ONLY THESE THREE -- Sol (flagship,
+// ~Opus), Terra (balanced, ~Sonnet, the strong default), Luna (fastest/
+// cheapest, ~Haiku). gpt-6-astra is Codex's newest and most expensive model
+// (confirmed live via model/list's isDefault flag -- it's what Codex's own
+// server picks absent an override) and is deliberately absent: MCP is not a
+// channel for reaching it, no matter what a caller asks for. An exact-match
+// allowlist rather than a pattern/prefix check on purpose -- a future model
+// name is refused by default until someone deliberately adds it here, not
+// silently admitted because it happens to start with "gpt-5.6-".
+const CODEX_MCP_MODELS = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'];
+
+// validateMcpModel enforces the MCP model policy for both session_create and
+// model_set, in one place, so the two can't drift: zcode refuses a model
+// argument outright (its own MCP contract has never offered one), Codex
+// accepts only CODEX_MCP_MODELS, omitted means "use the backend's own
+// default" (Terra, for Codex -- see cfg.codexDefaultModel).
+function validateMcpModel(backend, model) {
+  if (model == null) return undefined;
+  if (backend !== 'codex') {
+    throw new Error(`model may only be chosen for the codex backend over MCP (got backend=${backend}); zcode has no MCP-switchable model`);
+  }
+  if (!CODEX_MCP_MODELS.includes(model)) {
+    throw new Error(`model "${model}" is not offered over MCP; choose one of ${CODEX_MCP_MODELS.join(', ')}`);
+  }
+  return model;
+}
 async function handleBackendCommand(threadId, arg) {
   const entry = store.getTopic(threadId) || {};
   const current = entry.backend || cfg.defaultBackend;
@@ -2285,20 +2312,27 @@ async function main() {
       log: (m) => console.log(`[bridge] ${m}`),
     });
     mcp.wire({
-      sessionCreate: async (name, chatIdNum, backendName) => {
+      sessionCreate: async (name, chatIdNum, backendName, modelArg) => {
         const chatId = chatIdNum ?? cfg.chatId;
         const backend = backendName || cfg.defaultBackend;
         if (!KNOWN_BACKENDS.includes(backend)) throw new Error(`unknown backend: ${backend} (known: ${KNOWN_BACKENDS.join(', ')})`);
         getBackend(backend); // fail early (e.g. Codex misconfigured) before creating a Telegram topic for it
+        // MODEL IS OTHERWISE STILL LOCKED DOWN, JUST LOOSENED FOR CODEX: zcode
+        // keeps the original "no MCP-switchable model at all" rule (refuses a
+        // model argument outright rather than silently ignoring it, which
+        // would read as accepted); Codex gets a real, but bounded, choice
+        // among its three everyday tiers -- see CODEX_MCP_MODELS. Sol and
+        // Luna both cost real usage the same as Terra does, so nothing here
+        // is "free" to pick; what's refused is specifically Astra, Codex's
+        // newest and most expensive model, and any bare model that could
+        // resolve to it (only the four exact refs in this map are ever
+        // accepted, not arbitrary strings that pattern-match).
+        const model = validateMcpModel(backend, modelArg);
         const created = await tg.createForumTopic({ chatId, name });
         const threadId = created.message_thread_id;
         const key = keyFor(chatId, threadId);
-        store.setTopic(key, { chatId, threadId, name, backend, mode: cfg.defaultSessionMode });
+        store.setTopic(key, { chatId, threadId, name, backend, model, mode: cfg.defaultSessionMode });
         await getOrCreateSession(key);
-        // Model is otherwise READ-ONLY over MCP: a session always runs
-        // whatever the chosen backend's own default model is, and there is
-        // deliberately no way to switch it from here (model_get reports the
-        // real answer once the session actually exists).
         const entry = store.getTopic(key);
         return { key, chat_id: chatId, thread_id: threadId, model: entry.model, backend };
       },
@@ -2346,7 +2380,28 @@ async function main() {
         if (key && !entry) throw new Error(`unknown session: ${key}`);
         const backend = entry?.backend || cfg.defaultBackend;
         const model = entry?.model || (backend === 'codex' ? cfg.codexDefaultModel : cfg.defaultModel);
-        return { backend, model, switchable: false };
+        return { backend, model, switchable: backend === 'codex' };
+      },
+      // Mirrors the Telegram /model command's own switch path (store the new
+      // model, invalidate any per-workspace cache, push it to the live
+      // session if one is already subscribed) but through validateMcpModel's
+      // narrower allowlist instead of /model's "anything listModels() names".
+      modelSet: async (key, modelArg) => {
+        const entry = store.getTopic(key);
+        if (!entry) throw new Error(`unknown session: ${key}`);
+        const backend = entry.backend || cfg.defaultBackend;
+        const model = validateMcpModel(backend, modelArg);
+        if (model === undefined) throw new Error('model is required for model_set');
+        store.setTopic(key, { ...entry, model });
+        const b = getBackend(backend);
+        // Same workspaceKey shape /model's own switch path uses (see its
+        // `tg-topic-${threadId}` above) -- NOT the MCP `key` itself, which
+        // is a different string (keyFor's composite chat/thread encoding).
+        b.invalidateModelCache?.(`tg-topic-${entry.threadId}`);
+        if (entry.sessionId && subscribedSessions.has(entry.sessionId)) {
+          await b.setModel(entry.sessionId, model);
+        }
+        return { backend, model, switchable: true };
       },
     });
   }

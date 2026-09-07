@@ -243,15 +243,31 @@ is mirrored into the topic **from the bot's identity**, and every reply is
 both delivered to the topic and returned to the MCP caller, so the Telegram
 chat stays the shared log no matter which frontend typed.
 
-Five tools:
+Six tools:
 
 | tool | what it does |
 |---|---|
-| `session_create` | Create a named session: a new forum topic + a fresh agent session; returns the conversation `key` and the `model` it runs. |
+| `session_create` | Create a named session: a new forum topic + a fresh agent session; returns the conversation `key` and the `model` it runs. Takes an optional `backend` (`zcode` or `codex`) and, for `codex` only, an optional `model` — see below. |
 | `message_send` | Send a prompt to a session and (by default, `wait: true`) block until the final reply — a real turn, streamed into the topic meanwhile. `wait: false` queues and returns at once. |
 | `replies_get` | Catch-up read: replies already collected for a conversation since a sequence number (the in-memory log keeps the last 200 per conversation). |
 | `session_close` | Close the session and its Telegram topic; further `message_send` to the key names the error. |
-| `model_get` | Read-only: the model this bridge runs. **There is deliberately no way to switch models over MCP** — sessions always run the bridge default (`zai/glm-5.3-flash`). |
+| `model_get` | The backend and model a session runs, and whether `model_set` can change it (`true` for `codex`, always `false` for `zcode`). |
+| `model_set` | Switch an existing session's model. `codex` only, among the same three tiers `session_create` offers — `zcode` sessions refuse with a clear error, not a silent no-op. |
+
+**Model policy differs by backend, on purpose.** zcode sessions always run
+the bridge default (`zai/glm-5.3-flash`) — there is deliberately no way to
+switch it over MCP, unchanged from before Codex existed. Codex sessions may
+choose among exactly three of its four everyday tiers: `gpt-5.6-luna`
+(fastest/cheapest, ~Haiku), `gpt-5.6-terra` (balanced, ~Sonnet — **the
+strong default** if `model` is omitted), or `gpt-5.6-sol` (Codex's
+flagship, ~Opus). `gpt-6-astra` — Codex's newest and most expensive model,
+and confirmed to be Codex's own *server-side* default absent an override —
+is never offered here: neither `session_create`'s `model` argument nor
+`model_set` will accept it, by an exact-match allowlist rather than a
+pattern check, so a future Codex model name is refused by default rather
+than silently admitted for resembling one of these. Telegram's own
+`/model` command is unrestricted (a human may pick any model including
+Astra) unless the deployment sets `CODEX_DISALLOW_ASTRA`.
 
 Configuration (in the bridge's env, off by default):
 

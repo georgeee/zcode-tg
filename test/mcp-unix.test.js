@@ -46,7 +46,7 @@ test('the unix listener speaks line JSON-RPC and locks the socket to 0600', asyn
     c.on('error', reject);
   });
 
-  assert.equal(reply[0].result.tools.length, 5, 'tools/list over the socket');
+  assert.equal(reply[0].result.tools.length, 6, 'tools/list over the socket');
   assert.equal(reply[1].id, 2);
   assert.equal(reply[1].result.content[0].text.includes('zai/glm-5.3-flash'), true, 'model_get over the socket');
   // two requests, two responses: the notification in the middle produced none

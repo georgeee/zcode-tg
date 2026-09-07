@@ -105,6 +105,12 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
             enum: ['zcode', 'codex'],
             description: "Which backend runs this session. Defaults to the bridge's own default backend (normally 'zcode'). 'codex' requires the bridge to have CODEX_HOME configured.",
           },
+          model: {
+            type: 'string',
+            enum: ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'],
+            description:
+              "Codex only (ignored/rejected for zcode, which has no MCP-switchable model at all). Picks which of Codex's three everyday tiers this session runs -- Luna (fastest/cheapest), Terra (balanced, the strong default if omitted), or Sol (Codex's flagship). gpt-6-astra (Codex's newest, most expensive model) is deliberately NOT offered here: MCP is not a channel for reaching it.",
+          },
         },
         required: ['name'],
       },
@@ -147,10 +153,23 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
     {
       name: 'model_get',
       description:
-        'Return the backend and model a session runs — READ-ONLY (there is deliberately no way to switch either from here; use session_create\'s backend argument to choose at creation time). Omit `key` to get the bridge\'s own defaults instead of a specific session\'s.',
+        "Return the backend and model a session runs, and whether model_set can change it (true for codex, always false for zcode). The backend itself is still only chosen at session_create time. Omit `key` to get the bridge's own defaults instead of a specific session's.",
       inputSchema: {
         type: 'object',
         properties: { key: { type: 'string', description: 'Conversation key from session_create. Omit for the bridge-wide default backend/model.' } },
+      },
+    },
+    {
+      name: 'model_set',
+      description:
+        "Switch a session's model. Codex only, and only among the same three tiers session_create offers (gpt-5.6-luna/terra/sol) -- zcode sessions and gpt-6-astra both refuse with a clear error, not a silent no-op.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Conversation key from session_create.' },
+          model: { type: 'string', enum: ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'] },
+        },
+        required: ['key', 'model'],
       },
     },
   ];
@@ -159,7 +178,12 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
     if (!handlers) throw new Error('mcp gateway not wired to the bridge');
     switch (name) {
       case 'session_create':
-        return handlers.sessionCreate(String(args.name), args.chat_id != null ? Number(args.chat_id) : undefined, args.backend ? String(args.backend) : undefined);
+        return handlers.sessionCreate(
+          String(args.name),
+          args.chat_id != null ? Number(args.chat_id) : undefined,
+          args.backend ? String(args.backend) : undefined,
+          args.model ? String(args.model) : undefined,
+        );
       case 'session_close':
         return handlers.sessionClose(String(args.key));
       case 'message_send':
@@ -168,6 +192,8 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
         return handlers.repliesGet(String(args.key), Number(args.after_seq) || 0);
       case 'model_get':
         return handlers.modelGet(args.key ? String(args.key) : undefined);
+      case 'model_set':
+        return handlers.modelSet(String(args.key), String(args.model));
       default:
         throw new Error(`unknown tool: ${name}`);
     }
