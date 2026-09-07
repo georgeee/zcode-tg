@@ -90,7 +90,25 @@ const cfg = {
   // exactly as before this file learned about a second backend.
   codexBin: process.env.CODEX_BIN || 'codex',
   codexHome: process.env.CODEX_HOME || '',
-  codexDefaultModel: process.env.CODEX_DEFAULT_MODEL || '',
+  // Codex's OWN server-side default is currently gpt-6-astra (its newest,
+  // most expensive model, confirmed live via model/list's isDefault flag) --
+  // leaving this unset meant every Codex session silently ran Astra unless a
+  // human happened to /model away from it first. gpt-5.6-terra ("balanced
+  // agentic coding model for everyday work") is the junior/default tier --
+  // Codex's Sonnet-equivalent, positioned below Sol (its flagship, ≈Opus)
+  // and above Luna (fastest/cheapest, ≈Haiku). This is what every NEW
+  // session gets absent an explicit /model switch, and — because MCP's
+  // session_create has no model argument at all (see mcp.js) — it is also
+  // the ONLY model an MCP-driven Codex session can ever run: there is no
+  // code path by which an MCP caller could reach Sol or Astra.
+  codexDefaultModel: process.env.CODEX_DEFAULT_MODEL || 'gpt-5.6-terra',
+  // Set on a deployment that must never spend Astra-tier usage (e.g. this
+  // bridge's own test bots) — refuses `/model gpt-6-astra` in Telegram with
+  // a clear message rather than silently ignoring the switch. Off by
+  // default: a normal deployment's human owner may pick any model they
+  // like via Telegram, same as always. Codex-specific: zcode has no
+  // per-model cost tier this drastic to guard against.
+  codexDisallowAstra: /^(1|true|yes)$/i.test(process.env.CODEX_DISALLOW_ASTRA || ''),
   // Which backend a brand-new topic/session runs on absent an explicit
   // choice (a stored per-topic 'backend', or an MCP session_create
   // 'backend' argument). Left at 'zcode' so the live deployment's behavior
@@ -1212,9 +1230,12 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
     // own default model string ('zai/glm-5.3-flash') and forcing it onto a
     // Codex thread/start call is a real bug this refactor almost shipped
     // (caught live: Codex's own API rejected it outright -- "not supported
-    // when using Codex with a ChatGPT account"). Absent a configured
-    // CODEX_DEFAULT_MODEL, `undefined` here means "let Codex pick its own
-    // default", which createConversation()/thread/start already handles.
+    // when using Codex with a ChatGPT account"). cfg.codexDefaultModel
+    // carries its own junior-model reasoning (see its definition above) --
+    // `|| undefined` here is just JS's empty-string-is-falsy guard in case
+    // an operator explicitly sets CODEX_DEFAULT_MODEL='', which should mean
+    // "let Codex pick its own default" (currently Astra) rather than send
+    // an empty string as a model ref.
     const model = stored?.model || (backendName === 'codex' ? cfg.codexDefaultModel || undefined : cfg.defaultModel);
     const mode = stored?.mode || cfg.defaultSessionMode;
     const created = await backend.createConversation({ workspaceDir: cfg.workspaceDir, workspaceKey, model, mode });
@@ -1406,6 +1427,14 @@ async function handleModelCommand(threadId, arg) {
   const ref = backendName === 'zcode' && !arg.includes('/') ? `zai/${arg}` : arg;
   if (!refs.includes(ref)) {
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Unknown model "${arg}". /model with no argument lists what's available.` });
+    return;
+  }
+  // CODEX_DISALLOW_ASTRA is a deployment-level dial (see cfg.codexDisallowAstra's
+  // definition), not a permanent restriction on Telegram switching in general --
+  // a normal deployment reaches this ref === 'gpt-6-astra' check and simply
+  // never trips it.
+  if (backendName === 'codex' && ref === 'gpt-6-astra' && cfg.codexDisallowAstra) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ This deployment has CODEX_DISALLOW_ASTRA set; /model gpt-6-astra is refused here.` });
     return;
   }
   store.setTopic(threadId, { ...entry, model: ref });
