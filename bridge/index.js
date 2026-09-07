@@ -58,13 +58,15 @@ import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { loadEnv, resolveEnvPath } from './env.js';
 import { existsSync } from 'node:fs';
-import { ZcodeClient } from './zcodeClient.js';
+import { ZcodeBackend } from './backends/zcodeBackend.js';
+import { CodexBackend } from './backends/codexBackend.js';
+import { makeSessionId, backendNameOf, rawSessionId } from './backend.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
 import { ProgressReporter } from './progress.js';
-import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages } from './usage.js';
+import { readZaiApiKey, fetchUsage, renderUsage, usagePercentages } from './usage.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
 // a session running in this same directory could read that file as part of
@@ -82,6 +84,18 @@ const cfg = {
   zcodeBin: need('ZCODE_BIN'),
   workspaceDir: need('ZCODE_WORKSPACE_DIR'),
   defaultModel: process.env.ZCODE_DEFAULT_MODEL || 'zai/glm-5.3-flash',
+  // Codex support is opt-in and lazily started (see getBackend()): a topic
+  // never touches `codex app-server` unless something actually asks for the
+  // 'codex' backend, so a deployment that never sets these env vars behaves
+  // exactly as before this file learned about a second backend.
+  codexBin: process.env.CODEX_BIN || 'codex',
+  codexHome: process.env.CODEX_HOME || '',
+  codexDefaultModel: process.env.CODEX_DEFAULT_MODEL || '',
+  // Which backend a brand-new topic/session runs on absent an explicit
+  // choice (a stored per-topic 'backend', or an MCP session_create
+  // 'backend' argument). Left at 'zcode' so the live deployment's behavior
+  // is unchanged unless this is deliberately switched.
+  defaultBackend: process.env.DEFAULT_BACKEND || 'zcode',
   storePath: process.env.STORE_PATH || new URL('../data/sessions.json', import.meta.url).pathname,
   permissionTimeoutMs: Number(process.env.PERMISSION_TIMEOUT_MS || 10 * 60 * 1000), // 10 min
   // Empty string is "off"; a bare 0 means an ephemeral listen (what the e2e uses).
@@ -166,6 +180,7 @@ const BOT_COMMANDS = [
   { command: 'clearqueue', description: 'Drop queued messages in this topic' },
   { command: 'model', description: 'List / switch this topic’s model' },
   { command: 'mode', description: 'List / switch this topic’s mode' },
+  { command: 'backend', description: 'List / switch this topic’s backend (zcode/codex)' },
   { command: 'file', description: 'Send a workspace file into this topic' },
   { command: 'help', description: 'Bridge commands' },
 ];
@@ -197,18 +212,63 @@ function need(key) {
 
 const store = new Store(cfg.storePath);
 const tg = new TelegramClient({ token: cfg.telegramToken });
-const zcode = new ZcodeClient({
-  nodeBin: cfg.nodeBin,
-  zcodeBin: cfg.zcodeBin,
-  cwd: cfg.workspaceDir,
-}).start();
 
-zcode.on('exit', ({ code, signal }) => {
-  console.error(`[bridge] zcode app-server exited unexpectedly (code=${code} signal=${signal}); exiting so the service manager restarts us`);
-  process.exit(1);
-});
-zcode.on('stderr', (text) => process.stderr.write(`[zcode stderr] ${text}`));
-zcode.on('parseError', ({ line, error }) => console.error('[bridge] unparseable line from zcode:', error.message, line.slice(0, 200)));
+// --- backend registry ---
+// One long-lived instance per backend KIND (not per session/topic) --
+// exactly the "one process, many multiplexed sessions" shape zcode always
+// had. zcode starts eagerly, at the same point in startup it always did, so
+// a deployment that never touches Codex sees identical timing/behavior to
+// before this file knew about a second backend. Codex starts lazily, the
+// first time any topic actually asks for it (getBackend('codex') below) --
+// see wireBackend() for what "starts" wires up on every backend alike.
+const backends = {};
+
+function wireBackend(backend) {
+  backend.on('event', onBackendEvent);
+  backend.on('warn', (m) => console.error(`[bridge] [${backend.name}]`, m));
+  backend.on('stderr', (text) => process.stderr.write(`[${backend.name} stderr] ${text}`));
+  backend.on('parseError', ({ line, error }) => console.error(`[bridge] unparseable line from ${backend.name}:`, error.message, line.slice(0, 200)));
+  backend.onPermissionRequest(onPermissionRequest);
+  backend.onUserInputRequest(onUserInputRequest);
+  backend.on('exit', ({ code, signal }) => {
+    if (backend.name === 'zcode') {
+      // zcode has always been load-bearing for the whole process: every
+      // topic depends on it, so its death takes the bridge down for the
+      // service manager to restart, unchanged from before this refactor.
+      console.error(`[bridge] zcode app-server exited unexpectedly (code=${code} signal=${signal}); exiting so the service manager restarts us`);
+      process.exit(1);
+    }
+    // Codex is optional/secondary: its subprocess dying shouldn't take down
+    // topics running on zcode. Sessions currently on it will error on their
+    // next call (backends[name] still points at the dead instance) rather
+    // than silently hang; a fresh 'codex' getBackend() call after this is
+    // NOT auto-respawned by this handler on purpose -- restarting the whole
+    // bridge is the same "known good" recovery zcode already relies on.
+    console.error(`[bridge] codex app-server exited unexpectedly (code=${code} signal=${signal}); Codex-backed topics are unavailable until the bridge restarts`);
+  });
+  return backend;
+}
+
+backends.zcode = wireBackend(
+  new ZcodeBackend({ nodeBin: cfg.nodeBin, zcodeBin: cfg.zcodeBin, cwd: cfg.workspaceDir, zaiConfigPath: cfg.zaiConfigPath }),
+);
+backends.zcode.start();
+
+function getBackend(name) {
+  if (backends[name]) return backends[name];
+  if (name === 'codex') {
+    if (!cfg.codexHome) throw new Error("the 'codex' backend needs CODEX_HOME set (see README)");
+    backends.codex = wireBackend(new CodexBackend({ codexBin: cfg.codexBin, codexHome: cfg.codexHome, cwd: cfg.workspaceDir, autoApprovePermissions: cfg.autoApprovePermissions }));
+    backends.codex.start();
+    return backends.codex;
+  }
+  throw new Error(`unknown backend: ${name}`);
+}
+
+// Resolve the backend a given (prefixed) sessionId belongs to.
+function backendForSession(sessionId) {
+  return getBackend(backendNameOf(sessionId));
+}
 
 // Defense in depth only -- every await chain in this file is intended to be
 // caught somewhere already (per-update try/catch in main(), try/catches
@@ -273,21 +333,26 @@ async function shutdown(signal) {
   // regardless), and matters most for the foreground/dev-loop path
   // README.md documents, where nothing else guarantees the child doesn't
   // outlive us as an orphaned, still-authenticated zcode process.
-  const notifications = [...activeTurns.values()].map((turn) => {
+  const notifications = [...activeTurns.entries()].map(([sessionId, turn]) => {
     turn.streamer?.stop();
     turn.progress?.stop();
     const liveId = turnLiveMessageId(turn);
-    if (!liveId) return Promise.resolve();
+    // Fixed: was chatOf(threadId), a bare undefined module-global that
+    // happened to fall back to cfg.chatId (correct only for the single
+    // configured home chat) -- see the identical fix in onUserInputRequest
+    // above. sessionToTopic has this session's real conversation key.
+    const topic = sessionToTopic.get(sessionId);
+    if (!liveId || !topic) return Promise.resolve();
     return tg
       .editMessageText({
-        chatId: chatOf(threadId),
+        chatId: chatOf(topic.threadId),
         messageId: liveId,
         text: "⚠️ Bridge is restarting (deploying an update) — this turn was interrupted. Send your message again once it's back (usually a few seconds).",
       })
       .catch((e) => console.error('[bridge] failed to notify an in-flight turn of shutdown:', e.message));
   });
   await Promise.race([Promise.allSettled(notifications), sleep(8000)]);
-  zcode.stop();
+  for (const backend of Object.values(backends)) backend.stop();
   process.exit(0);
 }
 
@@ -345,7 +410,10 @@ const pendingPrompts = new Map(); // threadId -> { parts: [promptText...], first
 // decline (same as the old auto-decline behavior, just later). One tap per
 // question; multiSelect questions are answered single-pick (documented
 // limitation -- Telegram buttons don't toggle).
-zcode.onServerRequest('interaction/requestUserInput', async (params) => {
+// Registered on every backend that supports it (see wireBackend()) --
+// currently zcode only; Codex's nearest analog is experimental and unwired,
+// see bridge/backends/codexBackend.js.
+async function onUserInputRequest(params) {
   const topic = sessionToTopic.get(params.sessionId);
   const questions = Array.isArray(params.questions) ? params.questions : [];
   if (!topic || !questions.length || !questions.every((q) => Array.isArray(q.options) && q.options.length)) {
@@ -356,7 +424,13 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
   const state = {
     resolve: null,
     timer: null,
-    chatId: chatOf(threadId),
+    // Fixed: this used to read a bare `threadId` that doesn't exist in this
+    // scope (a module-global that was never declared) -- chatOf() fell back
+    // to its own "unparseable key" default, cfg.chatId, which happens to be
+    // correct for the single configured home chat but would misroute for
+    // any other chat (e.g. an MCP session_create with a custom chat_id).
+    // topic.threadId is this session's actual conversation key.
+    chatId: chatOf(topic.threadId),
     threadId: topic.threadId,
     questions: [],
     answers: {},
@@ -381,7 +455,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
     let msg;
     try {
       msg = await tg.sendMessage({
-        chatId: chatOf(threadId),
+        chatId: chatOf(topic.threadId),
         messageThreadId: topic.threadId,
         text: lines.join('\n'),
         replyMarkup: TG.inlineKeyboard(buttons),
@@ -392,7 +466,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
       // and decline cleanly rather than leave half a prompt behind.
       console.error('[bridge] failed to post user-input prompt:', e.message);
       for (const posted of state.questions) {
-        await tg.editMessageText({ chatId: chatOf(threadId), messageId: posted.messageId, text: '⚠️ Not deliverable — question declined.', replyMarkup: { inline_keyboard: [] } }).catch(() => {});
+        await tg.editMessageText({ chatId: chatOf(topic.threadId), messageId: posted.messageId, text: '⚠️ Not deliverable — question declined.', replyMarkup: { inline_keyboard: [] } }).catch(() => {});
         store.removePendingPermission(userInputStoreKey(params.requestId, posted.index));
       }
       return { action: 'decline', reason: `bridge: failed to deliver the question to Telegram (${e.message})` };
@@ -400,7 +474,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
     state.questions.push({ index: qi, key: q.question, messageId: msg.message_id, header: q.header || '' });
     // Reused pendingPermissions storage (see its comment): entries orphaned by
     // a restart get their buttons swept and cleared at next startup.
-    store.addPendingPermission(userInputStoreKey(params.requestId, qi), { chatId: chatOf(threadId), messageId: msg.message_id, threadId: topic.threadId, kind: 'userInput' });
+    store.addPendingPermission(userInputStoreKey(params.requestId, qi), { chatId: chatOf(topic.threadId), messageId: msg.message_id, threadId: topic.threadId, kind: 'userInput' });
   }
 
   // The turn is now blocked on this answer -- say so on the ⌛ placeholder.
@@ -414,7 +488,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
     }, cfg.userInputTimeoutMs);
     pendingUserInputs.set(params.requestId, state);
   });
-});
+}
 
 function userInputStoreKey(requestId, index) {
   return `${requestId}#q${index}`;
@@ -458,7 +532,12 @@ function handleUserInputTap(requestId, token, choice) {
 }
 
 // --- permission relay: server asks, we answer (auto-approve by default) ---
-zcode.onServerRequest('interaction/requestPermission', async (params) => {
+// Registered on every backend (see wireBackend()): zcode's own
+// interaction/requestPermission IS this shape already; Codex's approval
+// requests are translated into it by bridge/backends/codexBackend.js. Same
+// generic logic drives both -- this function doesn't know or care which
+// backend's session is asking.
+async function onPermissionRequest(params) {
   const topic = sessionToTopic.get(params.sessionId);
 
   if (cfg.autoApprovePermissions) {
@@ -503,7 +582,7 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
   let msg;
   try {
     msg = await tg.sendMessage({
-      chatId: chatOf(threadId),
+      chatId: chatOf(topic.threadId),
       messageThreadId: topic.threadId,
       text,
       replyMarkup: TG.inlineKeyboard(buttons),
@@ -524,7 +603,7 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
   // Persisted so a request still awaiting a button press when the process
   // dies isn't left as an orphaned message with dead-but-still-clickable
   // buttons forever -- swept and cleaned up on the next startup, below.
-  store.addPendingPermission(params.requestId, { chatId: chatOf(threadId), messageId: msg.message_id, threadId: topic.threadId });
+  store.addPendingPermission(params.requestId, { chatId: chatOf(topic.threadId), messageId: msg.message_id, threadId: topic.threadId });
 
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -535,12 +614,12 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
     pendingPermissions.set(params.requestId, {
       resolve,
       tokenMap,
-      chatId: chatOf(threadId),
+      chatId: chatOf(topic.threadId),
       messageId: msg.message_id,
       timer,
     });
   });
-});
+}
 
 function finishPermission(requestId, response, resultLabel) {
   const pending = pendingPermissions.get(requestId);
@@ -630,7 +709,11 @@ function safePreview(input) {
 }
 
 // --- session event routing: zcode -> Telegram ---
-zcode.on('event', (msg) => {
+// Wired to EVERY backend (see wireBackend()): both zcode's own wire events
+// and Codex's translated ones (bridge/backends/codexBackend.js) arrive here
+// in the exact same shape (bridge/backend.js documents it) -- this function
+// doesn't know or care which backend produced a given message.
+function onBackendEvent(msg) {
   if (process.env.BRIDGE_DEBUG_EVENTS) {
     console.log(`[dbg] ${msg.method} kind=${msg.params?.kind ?? msg.params?.payload?.kind ?? '-'} session=${String(msg.params?.sessionId ?? '').slice(-8)} turn=${String(msg.params?.turnId ?? '').slice(-8)}`);
   }
@@ -774,7 +857,7 @@ zcode.on('event', (msg) => {
       void finalizeTurn(sessionId, msg.params);
     }
   }
-});
+}
 
 async function adoptUnclaimedTurn(sessionId, params) {
   const topic = sessionToTopic.get(sessionId);
@@ -786,7 +869,9 @@ async function adoptUnclaimedTurn(sessionId, params) {
   activeTurns.set(sessionId, entry);
   let msg;
   try {
-    msg = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: topic.threadId, text: '⌛ 🌀 …' });
+    // Fixed: was chatOf(threadId), a bare undefined module-global -- see the
+    // identical fix + explanation in onUserInputRequest above.
+    msg = await tg.sendMessage({ chatId: chatOf(topic.threadId), messageThreadId: topic.threadId, text: '⌛ 🌀 …' });
   } catch (e) {
     console.error(`[bridge] failed to post placeholder for auto-started turn ${params.turnId}; dropping it:`, e.message);
     activeTurns.delete(sessionId);
@@ -805,7 +890,7 @@ async function handleBackgroundTaskFinished(sessionId, payload) {
   const label = truncate(payload.description || payload.command || payload.taskId, 120);
   const icon = payload.status === 'completed' ? '✅' : '⚠️';
   await tg
-    .sendMessage({ chatId: chatOf(threadId), messageThreadId: topic.threadId, text: `🌀 Background task ${icon} ${label} — ${payload.status}` })
+    .sendMessage({ chatId: chatOf(topic.threadId), messageThreadId: topic.threadId, text: `🌀 Background task ${icon} ${label} — ${payload.status}` })
     .catch((e) => console.error('[bridge] failed to post background-task notice:', e.message));
 }
 
@@ -840,8 +925,10 @@ async function finalizeTurn(sessionId, terminalParams) {
         // text; a quiet label beats spamming "(no reply text)".
         const quietId = replaceId ?? turnLiveMessageId(turn);
         if (quietId) {
+          // Fixed: was chatOf(threadId), a bare undefined module-global --
+          // see the identical fix in onUserInputRequest above.
           await tg
-            .editMessageText({ chatId: chatOf(threadId), messageId: quietId, text: '🌀 Background task notification processed.' })
+            .editMessageText({ chatId: chatOf(topic?.threadId), messageId: quietId, text: '🌀 Background task notification processed.' })
             .catch(() => {});
         }
       } else {
@@ -1036,13 +1123,17 @@ setInterval(async () => {
     console.error(`[bridge] turn on session ${sessionId} exceeded ${cfg.turnTimeoutMs}ms with no turn.terminal event -- stopping it and force-clearing`);
     turn.streamer?.stop();
     turn.progress?.stop();
-    zcode.call('session/stop', { sessionId }).catch((e) => console.error(`[bridge] session/stop on watchdog timeout failed for ${sessionId} (state is cleared locally regardless):`, e.message));
+    backendForSession(sessionId)
+      .cancel(sessionId)
+      .catch((e) => console.error(`[bridge] cancel on watchdog timeout failed for ${sessionId} (state is cleared locally regardless):`, e.message));
     activeTurns.delete(sessionId);
     busySessions.delete(sessionId);
     const topic = sessionToTopic.get(sessionId);
     tg
       .editMessageText({
-        chatId: chatOf(threadId),
+        // Fixed: was chatOf(threadId), a bare undefined module-global -- see
+        // the identical fix in onUserInputRequest above.
+        chatId: chatOf(topic?.threadId),
         messageId: turn.placeholderMessageId,
         text: '⚠️ No response after a long time — the turn has been stopped. Send another message to try again (or /stop next time to cancel earlier).',
       })
@@ -1051,177 +1142,93 @@ setInterval(async () => {
   }
 }, 60_000);
 
-// --- workspace model-catalog warm-up + explicit runtimeModel (the actual
-// fix for resumed sends -- see below for why warming the catalog ALONE,
-// which is what this used to do, is not sufficient) ---
-// A brand-new `zcode app-server` process starts with an EMPTY model catalog
-// for every workspace key: the per-workspace catalog is only ever filled by
-// `workspace/updateProviderRegistry`, which is part of the desktop app's
-// workspace-open flow -- a flow this bridge never runs. Without it,
-// `session/resume` (no runtimeModel param, persisted model not in the
-// catalog) takes its "deferred model adapter" path: resume reports success,
-// and every subsequent `session/send` on that session rejects with
-// ZCODE_RUNTIME_MODEL_UNAVAILABLE ("历史任务使用的模型已不可用") -- the bug this
-// used to be worked around with a fresh-session fallback (history lost).
-// session/setModel does NOT clear it.
+// --- get-or-create the session for a Telegram topic, on whichever backend
+// the topic is configured for ---
+// The zcode-specific "cold process has an empty model catalog, so a plain
+// resume takes zcode's deferred-model-adapter path and every send after it
+// rejects with ZCODE_RUNTIME_MODEL_UNAVAILABLE" fix (README's "Restart
+// continuity" section) now lives entirely inside
+// bridge/backends/zcodeBackend.js's resumeConversation() -- this function
+// doesn't know that bug exists, the same way it doesn't know anything else
+// backend-specific. See that file for the two costly-to-discover traps
+// recorded there.
 //
-// An EARLIER version of this fix only pushed the registry (via
-// workspace/updateProviderRegistry) and then called plain session/resume,
-// on the theory that a warmed catalog would be enough for resume's own
-// "is this model available" check to pass. It reported success in scratch
-// testing, shipped, and then still failed in production: reproduced by
-// hand afterward -- workspace/updateProviderRegistry visibly applies (the
-// returned workspaceState really does show the model as available) and yet
-// the very next session/resume + session/send on that same session still
-// hits the same ZCODE_RUNTIME_MODEL_UNAVAILABLE error. Root cause: the
-// deferred-adapter decision inside resume isn't re-evaluated against
-// whatever the catalog looks like at call time -- it's short-circuited
-// specifically by an *explicit* `runtimeModel` param on the resume call
-// itself. Passing one bypasses the broken availability check entirely,
-// and this path is the one actually confirmed to preserve conversation
-// context across a real process kill and restart (see git history).
-//
-// Two traps found empirically while building this, both costly to
-// discover, worth recording:
-// - The registry push must carry source:"user" -- the registry handler
-//   silently filters out pushes that claim source:"builtin".
-// - `runtimeModel.provider` must be OUR OWN provider object (the one we
-//   just pushed, which still has the real `apiKey`), not the one echoed
-//   back in updateProviderRegistry's response: the server converts our
-//   inline apiKey into an internal `apiKeyRef` pointer for its own
-//   bookkeeping, and (a) `apiKeyRef` isn't even a field runtimeModel.provider's
-//   schema accepts -- passing it verbatim is a validation error -- and
-//   (b) if you strip it without restoring a real `apiKey`, resume succeeds
-//   but the *next* send fails with "Model provider is missing an API key"
-//   -- a different, easy-to-mistake-for-progress failure mode.
-//
-// The apiKey is read at call time and only ever written to the child's
-// stdin (a pipe to a process that already reads the same config file
-// itself); never logged.
-const workspaceRuntimeModels = new Map(); // workspaceKey -> runtimeModel object, cached per process
-async function warmWorkspaceCatalog(workspaceKey, modelRef) {
-  const cached = workspaceRuntimeModels.get(workspaceKey);
-  if (cached) return cached;
-  const workspace = { workspacePath: cfg.workspaceDir, workspaceKey };
-  try {
-    const state = await zcode.call('workspace/readState', { workspace });
-    const models = state.modelCatalog?.providers?.find((p) => p.providerId === 'zai')?.models;
-    const zai = readZaiProvider(cfg.zaiConfigPath);
-    if (!models?.length) throw new Error('readState returned no zai models');
-    const provider = {
-      providerId: zai.providerId,
-      kind: zai.kind,
-      source: 'user',
-      label: zai.label,
-      baseURL: zai.baseURL,
-      apiKey: { source: 'inline', value: zai.apiKey },
-      models,
-    };
-    const res = await zcode.call('workspace/updateProviderRegistry', {
-      workspace,
-      registry: { revision: `bridge-warm-${Date.now()}`, generatedAt: Date.now(), providers: [provider] },
-    });
-    if (res.status !== 'applied' || res.providerCount < 1) throw new Error(`registry push not applied (status=${res.status}, providerCount=${res.providerCount})`);
-    console.log(`[bridge] warmed model catalog for workspace key ${workspaceKey} (${res.providerCount} provider)`);
-    const runtimeModel = {
-      revision: res.appliedProviderRevision,
-      generatedAt: Date.now(),
-      model: parseModelRef(modelRef),
-      provider, // ours, not res.workspaceState's echoed version -- see comment above
-    };
-    workspaceRuntimeModels.set(workspaceKey, runtimeModel);
-    return runtimeModel;
-  } catch (e) {
-    // Not fatal: sends on resumed sessions may still fail with
-    // ZCODE_RUNTIME_MODEL_UNAVAILABLE and fall back to a fresh session --
-    // the pre-fix behavior, degraded but working.
-    console.error(`[bridge] failed to warm model catalog for workspace key ${workspaceKey} (resumed sessions may still fail):`, e.message);
-    return null;
-  }
-}
-
-// --- get-or-create the zcode session for a Telegram topic ---
 // Returns { sessionId, resumed }. `resumed: true` means this call reloaded
 // a session that already existed before this process started (as opposed
-// to creating a brand new one) -- see the caller in handleMessage for why
-// that distinction matters despite session/resume itself having succeeded.
+// to creating a brand new one) -- see the caller in startTurn for why that
+// distinction matters despite resumeConversation itself having succeeded.
 async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
   let entry = forceFresh ? null : store.getTopic(threadId);
   let resumed = false;
 
-  if (entry && !subscribedSessions.has(entry.sessionId)) {
-    // Every bridge start spawns a brand-new `zcode app-server` child
-    // process (zcodeClient.js) -- there is no reconnection to a lingering
-    // daemon. That fresh process's live session registry is empty; a
-    // session persisted from a *previous* process is unknown to it until
-    // reloaded. session/resume is exactly the mechanism for that reload.
-    // Without calling it, session/subscribe (and session/send) reject
-    // every pre-existing topic's session with -32004 "Session is not
-    // active" -- forever, on every single restart, since store.js keeps
-    // returning the same now-permanently-dead sessionId on every future
-    // message. Confirmed by direct observation of a live app-server: session/subscribe
-    // and session/send both resolve the session via a bare Map lookup that
-    // throws if it isn't already resident; only session/resume's handler
-    // falls back to loading the persisted record from disk.
+  // Migration for a store entry written before this backend refactor: its
+  // sessionId is a bare zcode id with no "backend:" prefix. Treat it as
+  // zcode's (the only backend that ever existed before now) and persist the
+  // canonical prefixed form so this check is a one-time cost per topic.
+  if (entry?.sessionId && !backendNameOf(entry.sessionId)) {
+    entry = { ...entry, sessionId: makeSessionId('zcode', entry.sessionId), backend: entry.backend || 'zcode' };
+    store.setTopic(threadId, entry);
+  }
+
+  const backendName = entry?.backend || cfg.defaultBackend;
+  const backend = getBackend(backendName);
+  const workspaceKey = `tg-topic-${threadId}`;
+
+  if (entry?.sessionId && !subscribedSessions.has(entry.sessionId)) {
+    // Every bridge start spawns a brand-new backend subprocess -- there is
+    // no reconnection to a lingering daemon (true of zcode always, and of
+    // Codex too: each restart gets a fresh `codex app-server`). That fresh
+    // process's live session/thread registry is empty; a session persisted
+    // from a *previous* process is unknown to it until reloaded.
+    // resumeConversation is exactly the mechanism for that reload. Without
+    // it, zcode's session/subscribe and session/send reject a pre-existing
+    // topic's session with -32004 "Session is not active" -- forever, on
+    // every single restart, since store.js keeps returning the same
+    // now-permanently-dead sessionId on every future message.
     try {
-      const workspaceKey = `tg-topic-${threadId}`;
-      const runtimeModel = await warmWorkspaceCatalog(workspaceKey, entry.model);
-      await zcode.call('session/resume', {
-        sessionId: entry.sessionId,
-        // Both fields are required together for the fix to actually take:
-        // runtimeModel is what bypasses the broken deferred-adapter check,
-        // but the runtime still needs `workspace` on this same call to know
-        // which workspace's (just-warmed) catalog to resolve it against.
-        ...(runtimeModel ? { workspace: { workspacePath: cfg.workspaceDir, workspaceKey }, runtimeModel } : {}),
-      });
+      await backend.resumeConversation(entry.sessionId, { workspaceDir: cfg.workspaceDir, workspaceKey, model: entry.model });
       resumed = true;
     } catch (e) {
-      // Session is genuinely gone upstream (not just "not yet reloaded into
-      // this process") -- start fresh rather than have this topic loop on
+      // Session/thread is genuinely gone upstream (or this backend can't
+      // resume at all) -- start fresh rather than have this topic loop on
       // the same error on every future message forever. History is lost;
       // said so below.
-      console.error(`[bridge] topic ${threadId}: session/resume failed for ${entry.sessionId}, starting a fresh session (history lost):`, e.message);
+      console.error(`[bridge] topic ${threadId}: resume failed for ${entry.sessionId}, starting a fresh session (history lost):`, e.message);
       entry = null;
     }
+  } else if (entry && !entry.sessionId) {
+    // A topic-only stub (forum_topic_created, or MCP's session_create,
+    // seeds a store record -- chatId/name/backend/mode -- before any
+    // session exists yet) -- nothing to resume; fall through to creation.
+    entry = null;
   }
 
   if (!entry) {
-    const created = await zcode.call('session/create', {
-      workspace: { workspacePath: cfg.workspaceDir, workspaceKey: `tg-topic-${threadId}` },
-    });
-    const sessionId = created.session.sessionId;
-    // /model or /mode issued before the session existed is honored here.
+    // /model, /mode or /backend issued before the session existed is
+    // honored here (store.getTopic re-read: forum_topic_created seeds a
+    // topic-only record with no sessionId well before this ever runs).
     const stored = store.getTopic(threadId);
-    const model = stored?.model || cfg.defaultModel;
+    // NOT `... || cfg.defaultModel` on the end: that fallback is zcode's
+    // own default model string ('zai/glm-5.3-flash') and forcing it onto a
+    // Codex thread/start call is a real bug this refactor almost shipped
+    // (caught live: Codex's own API rejected it outright -- "not supported
+    // when using Codex with a ChatGPT account"). Absent a configured
+    // CODEX_DEFAULT_MODEL, `undefined` here means "let Codex pick its own
+    // default", which createConversation()/thread/start already handles.
+    const model = stored?.model || (backendName === 'codex' ? cfg.codexDefaultModel || undefined : cfg.defaultModel);
     const mode = stored?.mode || cfg.defaultSessionMode;
-    try {
-      await zcode.call('session/setModel', { sessionId, model: parseModelRef(model) });
-      await zcode.call('session/setMode', { sessionId, mode });
-    } catch (e) {
-      // Session exists server-side but we're about to throw before ever
-      // recording it anywhere (store, sessionToTopic, subscribedSessions) --
-      // best-effort close it rather than leak an abandoned, never-subscribed
-      // session on every retry of what might be a persistent misconfiguration
-      // (e.g. a typo'd model ref this account isn't entitled to).
-      await zcode.call('session/close', { sessionId }).catch(() => {});
-      throw e;
-    }
-    entry = { sessionId, model, mode };
+    const created = await backend.createConversation({ workspaceDir: cfg.workspaceDir, workspaceKey, model, mode });
+    entry = { sessionId: created.sessionId, model: created.model ?? model, mode: created.mode ?? mode, backend: backendName };
     store.setTopic(threadId, entry);
-    console.log(`[bridge] topic ${threadId}: created session ${sessionId} (${model}, mode=${mode})`);
+    console.log(`[bridge] topic ${threadId}: created ${backendName} session ${created.sessionId} (${entry.model}${entry.mode ? `, mode=${entry.mode}` : ''})`);
   }
 
   sessionToTopic.set(entry.sessionId, { threadId });
   if (!subscribedSessions.has(entry.sessionId)) {
-    await zcode.call('session/subscribe', { sessionId: entry.sessionId, deliveryKind: 'web-remote-replayable' });
+    await backend.subscribe(entry.sessionId);
     subscribedSessions.add(entry.sessionId);
   }
   return { sessionId: entry.sessionId, resumed };
-}
-
-function parseModelRef(ref) {
-  const [providerId, modelId] = ref.split('/');
-  return { providerId, modelId };
 }
 
 // --- per-topic pinned status message (agreed tier-2 item, reshaped
@@ -1366,46 +1373,49 @@ function restoreTopicStatuses() {
   }
 }
 
-// --- /model: list / switch the topic's model ---
-// Validated against workspace/readState's modelCatalog.available (verified
-// live: [{ref:{providerId,modelId}, label, contextWindow, ...}]).
+// --- /model: list / switch the topic's model, on whichever backend the
+// topic runs on ---
 async function handleModelCommand(threadId, arg) {
+  const entry = store.getTopic(threadId) || {};
+  const backendName = entry.backend || cfg.defaultBackend;
+  const backend = getBackend(backendName);
   const workspaceKey = `tg-topic-${threadId}`;
   let available;
   try {
-    const state = await zcode.call('workspace/readState', { workspace: { workspacePath: cfg.workspaceDir, workspaceKey } });
-    available = state.modelCatalog?.available ?? [];
+    available = await backend.listModels({ workspaceDir: cfg.workspaceDir, workspaceKey });
   } catch (e) {
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ /model failed: ${e.message}` });
     return;
   }
-  const refs = available.map((m) => `${m.ref.providerId}/${m.ref.modelId}`);
+  const refs = available.map((m) => m.ref);
 
   if (!arg) {
-    const current = store.getTopic(threadId)?.model || cfg.defaultModel;
+    const current = entry.model || (backendName === 'codex' ? cfg.codexDefaultModel : cfg.defaultModel) || '(backend default)';
     const rows = available.map((m) => {
-      const ref = `${m.ref.providerId}/${m.ref.modelId}`;
-      const ctx = m.contextWindow >= 1000000 ? `${m.contextWindow / 1000000}M` : `${Math.round(m.contextWindow / 1000)}k`;
-      return `${ref === current ? '▶' : '•'} ${ref} — ${m.label || m.ref.modelId} (${ctx} ctx)`;
+      const ctx = m.contextWindow ? (m.contextWindow >= 1000000 ? `${m.contextWindow / 1000000}M` : `${Math.round(m.contextWindow / 1000)}k`) : null;
+      return `${m.ref === current ? '▶' : '•'} ${m.ref} — ${m.label || m.ref}${ctx ? ` (${ctx} ctx)` : ''}`;
     });
-    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: ['Models available:', ...rows, '', 'Switch: /model <name>'].join('\n') });
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: [`Models available (${backendName}):`, ...rows, '', 'Switch: /model <name>'].join('\n') });
     return;
   }
 
-  // Accept both 'glm-5.3' (default provider) and 'zai/glm-5.3'.
-  const ref = arg.includes('/') ? arg : `zai/${arg}`;
+  // zcode's convention: a bare name defaults to the zai provider ('glm-5.3'
+  // -> 'zai/glm-5.3'). Other backends' model refs have no such prefix
+  // convention (Codex's are bare model ids already), so this only applies
+  // to zcode -- not a rule about model-ref shape in general.
+  const ref = backendName === 'zcode' && !arg.includes('/') ? `zai/${arg}` : arg;
   if (!refs.includes(ref)) {
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Unknown model "${arg}". /model with no argument lists what's available.` });
     return;
   }
-  const entry = store.getTopic(threadId) || {};
   store.setTopic(threadId, { ...entry, model: ref });
-  // The cached runtimeModel for this workspace was built for the OLD model;
-  // drop it so the next resume warms with the new one.
-  workspaceRuntimeModels.delete(workspaceKey);
+  // zcode caches a per-workspace runtimeModel built for the OLD model (see
+  // zcodeBackend.js); drop it so the next resume warms with the new one.
+  // Other backends don't implement this optional method.
+  backend.invalidateModelCache?.(workspaceKey);
   if (entry.sessionId && subscribedSessions.has(entry.sessionId)) {
     try {
-      await zcode.call('session/setModel', { sessionId: entry.sessionId, model: parseModelRef(ref) });
+      await backend.setModel(entry.sessionId, ref);
     } catch (e) {
       await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Stored for this topic, but the live session rejected the switch: ${e.message}` });
       return;
@@ -1415,34 +1425,34 @@ async function handleModelCommand(threadId, arg) {
   await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `✅ Model for this topic: ${ref}` });
 }
 
-// --- /mode: list / switch the topic's session mode ---
-// The runtime's mode enum (observed against a live app-server). Only a
-// sane subset is advertised in the listing, but any enum value is accepted
-// typed out.
-const MODES = ['default', 'plan', 'edit', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions', 'autoEdit', 'build', 'yolo'];
-const MODE_NOTES = {
-  default: 'confirm risky tool calls',
-  yolo: 'auto-approve everything (bridge default)',
-  plan: 'read-only planning',
-  edit: 'plan + apply edits',
-};
-
+// --- /mode: list / switch the topic's session mode -- a zcode-native
+// concept (its runtime mode enum: plan/edit/yolo/...); backends with no
+// equivalent (Codex) report an empty listModes() and /mode becomes a
+// documented no-op for that topic rather than a fake mapping onto whatever
+// Codex concept looks vaguely similar (see codexBackend.js's setMode). ---
 async function handleModeCommand(threadId, arg) {
   const entry = store.getTopic(threadId) || {};
+  const backendName = entry.backend || cfg.defaultBackend;
+  const backend = getBackend(backendName);
+  const modes = backend.listModes();
+  if (!modes.length) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `This topic runs on the '${backendName}' backend, which has no mode concept — /mode is a no-op here.` });
+    return;
+  }
   const current = entry.mode || cfg.defaultSessionMode;
   if (!arg) {
-    const rows = MODES.map((m) => `• ${m}${MODE_NOTES[m] ? ` — ${MODE_NOTES[m]}` : ''}`);
+    const rows = modes.map((m) => `• ${m.name}${m.note ? ` — ${m.note}` : ''}`);
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: [`Modes (current: ${current}):`, ...rows, '', 'Switch: /mode <name>'].join('\n') });
     return;
   }
-  if (!MODES.includes(arg)) {
+  if (!modes.some((m) => m.name === arg)) {
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Unknown mode "${arg}". /mode with no argument lists valid modes.` });
     return;
   }
   store.setTopic(threadId, { ...entry, mode: arg });
   if (entry.sessionId && subscribedSessions.has(entry.sessionId)) {
     try {
-      await zcode.call('session/setMode', { sessionId: entry.sessionId, mode: arg });
+      await backend.setMode(entry.sessionId, arg);
     } catch (e) {
       await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Stored for this topic, but the live session rejected the switch: ${e.message}` });
       return;
@@ -1450,6 +1460,58 @@ async function handleModeCommand(threadId, arg) {
   }
   await updateTopicStatus(threadId, busySessions.has(entry.sessionId) ? 'busy' : 'idle').catch(() => {});
   await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `✅ Mode for this topic: ${arg}` });
+}
+
+// --- /backend: list / switch which backend (zcode / codex) this topic runs
+// on. Switching starts a FRESH session on the new backend on the next
+// message -- a session id from one backend means nothing to the other, so
+// there is no way to carry conversation history across this switch (unlike
+// /model or /mode, which act on the SAME running session). ---
+const KNOWN_BACKENDS = ['zcode', 'codex'];
+async function handleBackendCommand(threadId, arg) {
+  const entry = store.getTopic(threadId) || {};
+  const current = entry.backend || cfg.defaultBackend;
+  if (!arg) {
+    const rows = KNOWN_BACKENDS.map((n) => `${n === current ? '▶' : '•'} ${n}`);
+    await tg.sendMessage({
+      chatId: chatOf(threadId),
+      messageThreadId: threadOf(threadId),
+      text: [`Backend (current: ${current}):`, ...rows, '', "Switch: /backend <name> — starts a FRESH session on the new backend; this topic's history does not carry over."].join('\n'),
+    });
+    return;
+  }
+  if (!KNOWN_BACKENDS.includes(arg)) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Unknown backend "${arg}". Known: ${KNOWN_BACKENDS.join(', ')}.` });
+    return;
+  }
+  if (arg === current) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `Already on '${arg}'.` });
+    return;
+  }
+  if (busySessions.has(entry.sessionId)) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '⚠️ A turn is running in this topic — /stop it first, then switch backends.' });
+    return;
+  }
+  try {
+    getBackend(arg); // throws e.g. if Codex isn't configured (CODEX_HOME unset) -- fail before touching any state
+  } catch (e) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Can't switch to '${arg}': ${e.message}` });
+    return;
+  }
+  if (entry.sessionId) {
+    // Best-effort close of the OLD session -- the new backend has no idea
+    // what the old session id even means, so this genuinely isn't "the same
+    // conversation continuing" the way /model and /mode are.
+    await backendForSession(entry.sessionId).closeConversation(entry.sessionId).catch(() => {});
+    subscribedSessions.delete(entry.sessionId);
+    sessionToTopic.delete(entry.sessionId);
+  }
+  store.setTopic(threadId, { ...entry, backend: arg, sessionId: undefined, model: undefined });
+  await tg.sendMessage({
+    chatId: chatOf(threadId),
+    messageThreadId: threadOf(threadId),
+    text: `✅ This topic now runs on '${arg}' — a fresh session starts on your next message (history does not carry over).`,
+  });
 }
 
 // --- /file: send a workspace file into the topic as a document ---
@@ -1543,24 +1605,24 @@ function sanitizeFileName(name, fallbackId) {
 
 
 // --- /stop is a HARD interrupt (owner ask 2026-09-06) ---
-// session/stop aborts the turn's AbortController, which interrupts the model
-// stream and FUTURE steps -- but a tool that is EXECUTING right now (a
-// blocking TaskOutput, a long bash) does not check that signal, so the turn
-// idles until the tool returns on its own. To actually stop "everything,
-// immediately, with interruption", the bridge additionally:
-//   1. kills the session's in-flight tool processes -- found via /proc by
-//      the session id embedded in every command the runtime launches (the
-//      shell-snapshot/bootstrap paths name sess_<id> on the bash command
-//      line) -- as a full process TREE (the bash's children, e.g. the sleep
-//      it wraps, would otherwise be orphaned and keep running), SIGTERM
-//      first and SIGKILL for stragglers;
-//   2. cancels the session's known background tasks via
-//      session/cancelBackgroundTask (taskIds tracked from the task
-//      lifecycle events the bridge already receives).
-// Scoped by the exact session id, which is unique; the bridge's own
-// processes and other sessions' tools never match.
-import { readdirSync, readFileSync } from 'node:fs';
-
+// cancel() (a backend's session/stop-equivalent) aborts the turn's
+// server-side control flow, which interrupts the model stream and FUTURE
+// steps -- but a tool that is EXECUTING right now (a blocking TaskOutput, a
+// long bash) does not check that signal, so the turn idles until the tool
+// returns on its own. To actually stop "everything, immediately, with
+// interruption", the bridge additionally:
+//   1. asks the session's own backend to kill its in-flight tool processes
+//      (killLocalToolProcesses -- an OPTIONAL, backend-specific capability:
+//      zcode's implementation (bridge/backends/zcodeBackend.js) finds them
+//      via /proc by the raw session id embedded in every command the
+//      runtime launches, as a full process TREE, SIGTERM then SIGKILL for
+//      stragglers; a backend with no way to make the same guarantee about
+//      its own subprocess naming leaves this a no-op rather than risk
+//      killing the wrong thing -- see codexBackend.js);
+//   2. cancels the session's known background tasks via the backend's
+//      cancelBackgroundTask (taskIds tracked from the task lifecycle events
+//      the bridge already receives -- a no-op for a backend with no
+//      background-task concept).
 const sessionBackgroundTasks = new Map(); // sessionId -> Set(taskId) currently running
 // sessionId -> timestamp of the last interrupt (hard /stop or breaker). A
 // terminal event arriving for a turn that never learned ITS OWN turnId,
@@ -1578,60 +1640,9 @@ function noteTaskLifecycle(sessionId, payload) {
   else sessionBackgroundTasks.delete(sessionId);
 }
 
-function processCmdline(pid) {
-  try {
-    return readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
-  } catch {
-    return '';
-  }
-}
-
-function collectTree(rootPid) {
-  // pid -> ppid for everything, then descendants of rootPid (inclusive).
-  const children = new Map();
-  for (const pid of readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
-    try {
-      const ppid = Number(readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]?.split(' ')[1]);
-      if (Number.isFinite(ppid)) {
-        if (!children.has(ppid)) children.set(ppid, []);
-        children.get(ppid).push(Number(pid));
-      }
-    } catch {}
-  }
-  const out = [];
-  const walk = (p) => {
-    out.push(p);
-    for (const c of children.get(p) ?? []) walk(c);
-  };
-  walk(rootPid);
-  return out;
-}
-
-function killSessionToolProcesses(sessionId) {
-  try {
-    for (const pid of readdirSync('/proc').filter((d) => /^\d+$/.test(d))) {
-      const p = Number(pid);
-      if (p === process.pid) continue;
-      if (!processCmdline(pid).includes(sessionId)) continue;
-      // A tool process for THIS session. TERM the whole tree now; KILL
-      // whatever is still alive shortly after.
-      const tree = collectTree(p);
-      for (const t of tree) { try { process.kill(t, 'SIGTERM'); } catch {} }
-      console.log(`[bridge] /stop: SIGTERM ${tree.length} process(es) of session ${sessionId} (root ${p})`);
-      setTimeout(() => {
-        for (const t of tree) {
-          try { process.kill(t, 0); process.kill(t, 'SIGKILL'); } catch {}
-        }
-      }, 400).unref();
-    }
-  } catch (e) {
-    console.error('[bridge] /stop: tool-process sweep failed:', e.message);
-  }
-}
-
 // Shared interrupt core. Used by /stop (EVERYTHING dies: processes killed,
 // background tasks cancelled) and by the TaskOutput circuit breaker below
-// (session/stop only: the TURN dies, while background tasks and their
+// (cancel() only: the TURN dies, while background tasks and their
 // processes keep running so completion notifications still arrive later --
 // the process sweep must NOT run there, because a background task's
 // command line carries the same session id as any foreground tool's, and
@@ -1640,11 +1651,12 @@ function killSessionToolProcesses(sessionId) {
 // test/e2e-breaker.mjs after exactly that bug fired live in its first run).
 async function interruptTurn(sessionId, { killEverything }) {
   lastInterruptedAt.set(sessionId, Date.now());
-  await zcode.call('session/stop', { sessionId }).catch((e) => console.error('[bridge] session/stop failed:', e.message));
+  const backend = backendForSession(sessionId);
+  await backend.cancel(sessionId).catch((e) => console.error('[bridge] cancel failed:', e.message));
   if (!killEverything) return;
-  killSessionToolProcesses(sessionId);
+  backend.killLocalToolProcesses(sessionId);
   for (const taskId of sessionBackgroundTasks.get(sessionId) ?? []) {
-    zcode.call('session/cancelBackgroundTask', { sessionId, taskId }).catch(() => {});
+    backend.cancelBackgroundTask(sessionId, taskId).catch(() => {});
   }
 }
 
@@ -1679,6 +1691,7 @@ function helpText() {
     '/clearqueue — drop queued messages',
     '/model [name] — list / switch this topic’s model',
     '/mode [name] — list / switch this topic’s mode',
+    '/backend [name] — list / switch this topic’s backend (zcode/codex)',
     '/file <path> — send a workspace file here',
     '',
     'Anything else is sent to the model. Replies stream into the ⌛ placeholder message. Messages sent while a turn is running are queued and run in order; reply to any message to quote it to the model. Send a file as a document and the agent reads it (saved to inbox/, your caption = instruction).',
@@ -1771,7 +1784,13 @@ async function handleMessage(message) {
     // preference 2026-09-01). A minimal store entry is seeded so the status
     // has somewhere to live; getOrCreateSession merges the session in later.
     if (!store.getTopic(topicKey)) {
-      store.setTopic(topicKey, { chatId, model: cfg.defaultModel, mode: cfg.defaultSessionMode });
+      // No `model` seeded here (unlike `mode`): its default depends on which
+      // backend this topic ends up on (see getOrCreateSession), which isn't
+      // decided yet -- a stub value here would win over that backend-aware
+      // default the moment a session is actually created (stored?.model
+      // there would already be non-empty). `backend` isn't seeded either,
+      // for the same reason: it defaults to cfg.defaultBackend later.
+      store.setTopic(topicKey, { chatId, mode: cfg.defaultSessionMode });
     }
     updateTopicStatus(topicKey, 'idle').catch(() => {});
     return;
@@ -1804,6 +1823,10 @@ async function handleMessage(message) {
   }
   if (command === 'mode') {
     await handleModeCommand(threadId, (message.text.split(/\s+/)[1] || '').trim());
+    return;
+  }
+  if (command === 'backend') {
+    await handleBackendCommand(threadId, (message.text.split(/\s+/)[1] || '').trim());
     return;
   }
   if (command === 'file') {
@@ -1963,9 +1986,10 @@ async function dispatchUserPrompt(threadId, promptText, command) {
   if (busySessions.has(sessionId)) {
     if (command === 'stop' || command === 'cancel') {
       // HARD stop: abort the turn AND kill what it is currently executing
-      // (see killSessionToolProcesses above for why session/stop alone is
-      // not "immediate" from the user's side). Background tasks are killed
-      // too -- a user-initiated stop means stop EVERYTHING.
+      // (see interruptTurn above, and killLocalToolProcesses in
+      // bridge/backend.js, for why cancel() alone is not "immediate" from
+      // the user's side). Background tasks are killed too -- a
+      // user-initiated stop means stop EVERYTHING.
       await interruptTurn(sessionId, { killEverything: true });
       const turn = activeTurns.get(sessionId);
       busySessions.delete(sessionId);
@@ -2039,19 +2063,19 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
   updateTopicStatus(threadId, 'busy').catch(() => {});
 
   try {
-    await zcode.call('session/send', { sessionId, content: text });
+    await backendForSession(sessionId).sendMessage(sessionId, text);
   } catch (e) {
-    // session/send itself rejecting outright (as opposed to the turn later
+    // sendMessage itself rejecting outright (as opposed to the turn later
     // completing with status "failed") is a different failure mode --
     // finalizeTurn() is never reached for it, so without this catch
     // busySessions/activeTurns for this session would stay set for the
     // rest of the process's life and the topic would be stuck on the
     // placeholder forever. (In practice this call site is effectively
-    // unreachable for -32010 "already running": the busySessions guard
-    // above and main()'s strictly-sequential per-update processing already
-    // prevent two concurrent session/send calls on the same session within
-    // one process. This catch remains as a backstop for whatever else could
-    // make session/send itself reject, e.g. the app-server process dying
+    // unreachable for zcode's -32010 "already running": the busySessions
+    // guard above and main()'s strictly-sequential per-update processing
+    // already prevent two concurrent sends on the same session within one
+    // process. This catch remains as a backstop for whatever else could
+    // make the send itself reject, e.g. the backend's subprocess dying
     // mid-call.)
     busySessions.delete(sessionId);
     activeTurns.delete(sessionId);
@@ -2060,15 +2084,16 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
     updateTopicStatus(threadId, 'idle').catch(() => {});
 
     if (session.resumed) {
-      // Confirmed by direct testing (see git history), not speculation: a
-      // cold-resumed session can report session/resume AND session/subscribe
-      // as successful, yet still reject session/send with "the historical
-      // task's model is no longer available" -- its model adapter stays
-      // permanently deferred/unmaterialized. Neither session/setModel,
-      // switching models away and back, nor supplying `workspace` on the
-      // resume call itself unstick it. Rather than leave the topic
-      // permanently broken, fall back once to a fresh session (conversation
-      // history is lost) and retry this same message before giving up.
+      // This retry is generic (any backend, any reason a resumed session's
+      // first send might reject) -- but the failure mode it was built for is
+      // zcode-specific and documented in bridge/backends/zcodeBackend.js:
+      // a cold-resumed session can report resume AND subscribe as
+      // successful, yet still reject the first send with "the historical
+      // task's model is no longer available", and nothing short of a fresh
+      // session unsticks it (confirmed by direct testing -- see git
+      // history). Rather than leave the topic permanently broken, fall back
+      // once to a fresh session (conversation history is lost) and retry
+      // this same message before giving up.
       console.error(`[bridge] topic ${threadId}: send failed on a resumed session, retrying once with a fresh session (history lost):`, e.message);
       let freshSessionId;
       try {
@@ -2083,14 +2108,17 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
         };
         attachTurnView(freshTurn, { placeholderMessageId, threadId });
         activeTurns.set(freshSessionId, freshTurn);
-        await zcode.call('session/send', { sessionId: freshSessionId, content: text });
+        await backendForSession(freshSessionId).sendMessage(freshSessionId, text);
         return; // retry accepted -- the normal event-driven flow takes it from here
       } catch (retryErr) {
         // Clears the FRESH session's routing state -- the original
         // sessionId was already cleared above. (The pre-queue version of
         // this path cleared the original id twice and never the fresh one,
         // leaving the fresh session in busySessions forever: a latent
-        // topic-wedging bug this restructure fixes.)
+        // topic-wedging bug this restructure fixes.) Stopping the fresh
+        // turn's streamer/progress here matters for the same reason: once
+        // it's out of activeTurns nothing else will ever stop it, and the
+        // heartbeat timer runs unconditionally from construction.
         if (freshSessionId) {
           busySessions.delete(freshSessionId);
           const freshTurn = activeTurns.get(freshSessionId);
@@ -2098,13 +2126,6 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
           freshTurn?.streamer?.stop();
           freshTurn?.progress?.stop();
         }
-        // Stop it explicitly -- it's no longer reachable through
-        // activeTurns for anything else to stop it, and since the
-        // heartbeat timer (added 2026-09-01) runs unconditionally from
-        // construction, an unstopped one would keep firing forever and
-        // periodically clobber the "Failed to send" notice below with a
-        // stale re-render of a turn that never actually started.
-        freshStreamer?.stop();
         console.error(`[bridge] topic ${threadId}: retry with a fresh session also failed:`, retryErr);
         e = retryErr;
       }
@@ -2235,17 +2256,22 @@ async function main() {
       log: (m) => console.log(`[bridge] ${m}`),
     });
     mcp.wire({
-      sessionCreate: async (name, chatIdNum) => {
+      sessionCreate: async (name, chatIdNum, backendName) => {
         const chatId = chatIdNum ?? cfg.chatId;
+        const backend = backendName || cfg.defaultBackend;
+        if (!KNOWN_BACKENDS.includes(backend)) throw new Error(`unknown backend: ${backend} (known: ${KNOWN_BACKENDS.join(', ')})`);
+        getBackend(backend); // fail early (e.g. Codex misconfigured) before creating a Telegram topic for it
         const created = await tg.createForumTopic({ chatId, name });
         const threadId = created.message_thread_id;
         const key = keyFor(chatId, threadId);
-        store.setTopic(key, { chatId, threadId, name, model: cfg.defaultModel, mode: cfg.defaultSessionMode });
+        store.setTopic(key, { chatId, threadId, name, backend, mode: cfg.defaultSessionMode });
         await getOrCreateSession(key);
-        // model is READ-ONLY information: MCP sessions always run this
-        // bridge's default model, and there is deliberately no way to
-        // switch it from here.
-        return { key, chat_id: chatId, thread_id: threadId, model: cfg.defaultModel };
+        // Model is otherwise READ-ONLY over MCP: a session always runs
+        // whatever the chosen backend's own default model is, and there is
+        // deliberately no way to switch it from here (model_get reports the
+        // real answer once the session actually exists).
+        const entry = store.getTopic(key);
+        return { key, chat_id: chatId, thread_id: threadId, model: entry.model, backend };
       },
       sessionClose: async (key) => {
         const t = store.getTopic(key) ?? {};
@@ -2279,7 +2305,20 @@ async function main() {
         return { reply: reply.text, at: reply.at };
       },
       repliesGet: (key, afterSeq) => ({ replies: mcp.repliesSince(key, afterSeq) }),
-      modelGet: () => ({ model: cfg.defaultModel, switchable: false }),
+      // Now backend-aware: a session can run zcode or Codex, and reporting
+      // just "the model" without which backend it's on is no longer the
+      // whole answer (the same model NAME could plausibly exist under two
+      // providers). `key` is optional for backward compatibility with a
+      // caller that predates backend choice -- omitted, this reports the
+      // bridge's own defaults, same as before this tool learned about a
+      // second backend.
+      modelGet: (key) => {
+        const entry = key ? store.getTopic(key) : null;
+        if (key && !entry) throw new Error(`unknown session: ${key}`);
+        const backend = entry?.backend || cfg.defaultBackend;
+        const model = entry?.model || (backend === 'codex' ? cfg.codexDefaultModel : cfg.defaultModel);
+        return { backend, model, switchable: false };
+      },
     });
   }
   restoreTopicStatuses();
