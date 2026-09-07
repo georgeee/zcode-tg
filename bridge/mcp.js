@@ -162,6 +162,11 @@ export function createMcpGateway({
             description:
               'Target chat id (a supergroup with Topics enabled). Omit to auto-pick: the most recently used forum-enabled group the bot is in, preferring ones where the bot is admin.',
           },
+          backend: {
+            type: 'string',
+            enum: ['zcode', 'codex'],
+            description: "Which backend runs this session. Defaults to the bridge's own default backend (normally 'zcode'). 'codex' requires the bridge to have CODEX_HOME configured.",
+          },
         },
         required: ['name'],
       },
@@ -204,8 +209,11 @@ export function createMcpGateway({
     {
       name: 'model_get',
       description:
-        'Return the model this bridge runs — READ-ONLY. Sessions created through this MCP server always use this model (the bridge default, zai/glm-5.3-flash); there is deliberately no way to switch models from here.',
-      inputSchema: { type: 'object', properties: {} },
+        'Return the backend and model a session runs — READ-ONLY (there is deliberately no way to switch either from here; use session_create\'s backend argument to choose at creation time). Omit `key` to get the bridge\'s own defaults instead of a specific session\'s.',
+      inputSchema: {
+        type: 'object',
+        properties: { key: { type: 'string', description: 'Conversation key from session_create. Omit for the bridge-wide default backend/model.' } },
+      },
     },
     {
       name: 'usage_get',
@@ -219,7 +227,7 @@ export function createMcpGateway({
     if (!handlers) throw new Error('mcp gateway not wired to the bridge');
     switch (name) {
       case 'session_create':
-        return handlers.sessionCreate(String(args.name), args.chat_id != null ? Number(args.chat_id) : undefined);
+        return handlers.sessionCreate(String(args.name), args.chat_id != null ? Number(args.chat_id) : undefined, args.backend ? String(args.backend) : undefined);
       case 'session_close':
         return handlers.sessionClose(String(args.key));
       case 'message_send':
@@ -227,7 +235,7 @@ export function createMcpGateway({
       case 'replies_get':
         return handlers.repliesGet(String(args.key), Number(args.after_seq) || 0);
       case 'model_get':
-        return handlers.modelGet();
+        return handlers.modelGet(args.key ? String(args.key) : undefined);
       case 'usage_get':
         return handlers.usageGet();
       default:
