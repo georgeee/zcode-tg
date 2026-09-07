@@ -47,7 +47,7 @@ test('tools/list advertises the six tools with schemas', async (t) => {
   t.after(() => h.close());
   const r = await rpc(h.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const names = r.body.result.tools.map((x) => x.name).sort();
-  assert.deepEqual(names, ['message_send', 'model_get', 'replies_get', 'session_close', 'session_create', 'usage_get']);
+  assert.deepEqual(names, ['message_send', 'model_get', 'model_set', 'replies_get', 'session_close', 'session_create', 'usage_get']);
   for (const tool of r.body.result.tools) assert.ok(tool.inputSchema, `${tool.name} carries a schema`);
 });
 
@@ -108,6 +108,37 @@ test('usage_get surfaces a fetch failure as a tool error, not a fabricated answe
   assert.equal(r.status, 200); // JSON-RPC succeeded; the TOOL reports the error
   assert.equal(r.body.result.isError, true);
   assert.match(r.body.result.content[0].text, /not been fetched yet/);
+});
+
+test('session_create forwards an optional model argument', async (t) => {
+  let seen;
+  const h = await startGateway(t, {
+    sessionCreate: async (name, chatId, backend, model) => {
+      seen = { name, chatId, backend, model };
+      return { key: 'k1', backend, model: model ?? 'gpt-5.6-terra' };
+    },
+  });
+  t.after(() => h.close());
+  const r = await rpc(h.url, {
+    jsonrpc: '2.0', id: 8, method: 'tools/call',
+    params: { name: 'session_create', arguments: { name: 'topic', backend: 'codex', model: 'gpt-5.6-luna' } },
+  });
+  assert.equal(r.body.result.isError, false);
+  assert.deepEqual(seen, { name: 'topic', chatId: undefined, backend: 'codex', model: 'gpt-5.6-luna' });
+});
+
+test('model_set routes key and model through to the handler', async (t) => {
+  let seen;
+  const h = await startGateway(t, { modelSet: async (key, model) => { seen = { key, model }; return { backend: 'codex', model, switchable: true }; } });
+  t.after(() => h.close());
+  const r = await rpc(h.url, {
+    jsonrpc: '2.0', id: 9, method: 'tools/call',
+    params: { name: 'model_set', arguments: { key: 'k1', model: 'gpt-5.6-sol' } },
+  });
+  assert.equal(r.body.result.isError, false);
+  assert.deepEqual(seen, { key: 'k1', model: 'gpt-5.6-sol' });
+  const payload = JSON.parse(r.body.result.content[0].text);
+  assert.equal(payload.model, 'gpt-5.6-sol');
 });
 
 test('unknown methods return a JSON-RPC error; notifications return no body', async (t) => {
