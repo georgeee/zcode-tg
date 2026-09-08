@@ -1332,7 +1332,36 @@ let usagePct = { at: 0, shortPct: null, weekPct: null, warned: false };
 function refreshUsagePercentages() {
   if (Date.now() - usagePct.at < 5 * 60_000) return;
   usagePct.at = Date.now(); // set eagerly: concurrent writers don't stampede
-  fetchUsage({ apiKey: readZaiApiKey(cfg.zaiConfigPath) })
+  // readZaiApiKey() reads ~/.zcode/cli/config.json SYNCHRONOUSLY and THROWS
+  // if it's missing or malformed (by design -- see usage.js and
+  // zcodeBackend.js's _warmWorkspaceCatalog, which already relies on that
+  // throw). A codex- or mock-DEFAULT deployment (this function runs
+  // unconditionally in main(), regardless of cfg.defaultBackend) has no
+  // reason to have this file at all -- "no zcode credential configured" is
+  // the whole point of such a deployment, not a misconfiguration. A bare
+  // `readZaiApiKey(...)` used to be evaluated as fetchUsage()'s ARGUMENT,
+  // so the throw happened before fetchUsage() (and its own .catch() below)
+  // ever got involved -- an uncaught synchronous exception straight out of
+  // main(), which main().catch() treats as fatal (process.exit(1)). Found
+  // live (test/e2e-codex-bug3-smoke.mjs): this crashed a codex-default
+  // bridge with an isolated $HOME on its very first call, DURING main(),
+  // before the "mcp gateway listening" log line ever printed -- a second,
+  // independent way "bug #3" could manifest as "the Codex MCP socket never
+  // binds", on top of the eager-start and spawn-'error' fixes elsewhere in
+  // this file/zcodeClient.js. No percentages is an ordinary, already-
+  // supported degradation (statusUsageText() already renders nothing when
+  // both are null) -- not a reason to take the whole bridge down.
+  let apiKey;
+  try {
+    apiKey = readZaiApiKey(cfg.zaiConfigPath);
+  } catch (e) {
+    if (!usagePct.warned) {
+      usagePct.warned = true;
+      console.error(`[bridge] status usage refresh skipped (no zcode credential configured -- expected on a non-zcode-default deployment): ${e.message}`);
+    }
+    return;
+  }
+  fetchUsage({ apiKey })
     .then((data) => {
       usagePct = { ...usagePct, ...usagePercentages(data), warned: false };
     })
