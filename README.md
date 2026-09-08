@@ -247,12 +247,12 @@ Six tools:
 
 | tool | what it does |
 |---|---|
-| `session_create` | Create a named session: a new forum topic + a fresh agent session; returns the conversation `key` and the `model` it runs. Takes an optional `backend` (`zcode` or `codex`) and, for `codex` only, an optional `model` — see below. |
+| `session_create` | Create a named session: a new forum topic + a fresh agent session; returns the conversation `key` and the `model` it runs. Takes an optional `backend` (`zcode`, `codex`, or `mock`) and, for `codex` only, an optional `model` — see below. |
 | `message_send` | Send a prompt to a session and (by default, `wait: true`) block until the final reply — a real turn, streamed into the topic meanwhile. `wait: false` queues and returns at once. |
 | `replies_get` | Catch-up read: replies already collected for a conversation since a sequence number (the in-memory log keeps the last 200 per conversation). |
 | `session_close` | Close the session and its Telegram topic; further `message_send` to the key names the error. |
-| `model_get` | The backend and model a session runs, and whether `model_set` can change it (`true` for `codex`, always `false` for `zcode`). |
-| `model_set` | Switch an existing session's model. `codex` only, among the same three tiers `session_create` offers — `zcode` sessions refuse with a clear error, not a silent no-op. |
+| `model_get` | The backend and model a session runs, and whether `model_set` can change it (`true` for `codex`, always `false` for `zcode` and `mock`). |
+| `model_set` | Switch an existing session's model. `codex` only, among the same three tiers `session_create` offers — `zcode` and `mock` sessions refuse with a clear error, not a silent no-op. |
 
 **Model policy differs by backend, on purpose.** zcode sessions always run
 the bridge default (`zai/glm-5.3-flash`) — there is deliberately no way to
@@ -267,7 +267,31 @@ is never offered here: neither `session_create`'s `model` argument nor
 pattern check, so a future Codex model name is refused by default rather
 than silently admitted for resembling one of these. Telegram's own
 `/model` command is unrestricted (a human may pick any model including
-Astra) unless the deployment sets `CODEX_DISALLOW_ASTRA`.
+Astra) unless the deployment sets `CODEX_DISALLOW_ASTRA`. `mock` sessions
+have exactly one model (`mock-1`) and, like zcode, refuse a `model`
+argument outright — see "The mock backend" below for why that's the right
+policy for a single-model backend, not just zcode's rule reused by default.
+
+### The mock backend: zero credentials, zero subprocesses, zero cost
+
+`backend: 'mock'` (Telegram: `/backend mock`) is a third backend that needs
+**no configuration at all** — no credential file, no CLI binary, no
+subprocess. It exists purely to exercise this MCP machinery (and the
+Telegram `/backend`/`/model` commands) for real, end to end, without
+spending anyone's z.ai or Codex quota — useful for CI, for a from-scratch
+smoke test of a fresh deployment, or as `DEFAULT_BACKEND=mock` for a
+deployment that wants zero external dependencies.
+
+A mock session's `sendMessage` resolves immediately (no I/O at all) and its
+reply is always a synthetic echo, obviously labeled so it's never mistaken
+for a real model's output: `[mock echo] <your prompt>`. `listModels()`
+reports exactly one model (`mock-1`); `model_get`/`model_set` report
+`switchable: false` — not because MCP can't support switching (Codex proves
+it can) but because a single-model backend has nothing to switch to or
+from, and a fake "switch" that reports success would be a worse contract
+than refusing outright. See `bridge/backends/mockBackend.js` for the
+implementation (modeled on `zcodeBackend.js`/`codexBackend.js`'s shape —
+the `Backend` contract in `bridge/backend.js` — but trivial in substance).
 
 Configuration (in the bridge's env, off by default):
 
@@ -312,6 +336,7 @@ through to the model as ordinary input):
 | `/clearqueue` | drop this topic's queued messages (their "Queued" notices are edited to "Dropped") |
 | `/model [name]` | list this topic's available models (current one marked `▶`) / switch (`session/setModel`, persisted per topic) |
 | `/mode [name]` | list session modes (current marked) / switch (`session/setMode`, persisted per topic) |
+| `/backend [name]` | list / switch this topic's backend (`zcode`/`codex`/`mock`) — starts a FRESH session on the new backend; history does not carry over |
 | `/file <path>` | send a file from the workspace into the topic as a document (realpath-restricted to the workspace subtree, `MAX_FILE_MB` cap) |
 | `/help` | the list above |
 
