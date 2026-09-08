@@ -95,7 +95,14 @@ the live bot token or while the account is near its rate limit.
 `test/e2e-backend-lifecycle.mjs` does the same against fake zcode/Codex CLI
 stand-ins (`test/fixtures/`) instead, specifically to cover eager-vs-lazy
 startup and misconfigured-backend failure modes without real credentials.
-The pure modules (`format.js`, `usage.js`, `streamer.js`, `mcp.js`,
+`test/e2e-codex-bug3-smoke.mjs` is the real-credential counterpart: a REAL
+`codex app-server` (real ChatGPT-Plus login), `DEFAULT_BACKEND=codex`, and
+an isolated `$HOME` (so no zcode credential can exist) — the exact
+deployment shape bug #3 was reported against — proving live that it boots,
+binds the MCP socket, and completes one real, cheap `gpt-5.6-luna` turn.
+This is the test that actually caught the `refreshUsagePercentages()` crash
+above; it's a real-spend script (one short Codex turn), not part of the
+fast suite. The pure modules (`format.js`, `usage.js`, `streamer.js`, `mcp.js`,
 `backends/mockBackend.js`) have fast unit tests: `node --test
 test/format.test.js test/usage.test.js test/streamer.test.js
 test/mcp.test.js test/mcp-unix.test.js test/mock-backend.test.js`.
