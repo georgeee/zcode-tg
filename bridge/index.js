@@ -60,6 +60,7 @@ import { loadEnv, resolveEnvPath } from './env.js';
 import { existsSync } from 'node:fs';
 import { ZcodeBackend } from './backends/zcodeBackend.js';
 import { CodexBackend } from './backends/codexBackend.js';
+import { MockBackend, MOCK_MODEL_REF } from './backends/mockBackend.js';
 import { makeSessionId, backendNameOf, rawSessionId } from './backend.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
@@ -198,7 +199,7 @@ const BOT_COMMANDS = [
   { command: 'clearqueue', description: 'Drop queued messages in this topic' },
   { command: 'model', description: 'List / switch this topic’s model' },
   { command: 'mode', description: 'List / switch this topic’s mode' },
-  { command: 'backend', description: 'List / switch this topic’s backend (zcode/codex)' },
+  { command: 'backend', description: 'List / switch this topic’s backend (zcode/codex/mock)' },
   { command: 'file', description: 'Send a workspace file into this topic' },
   { command: 'help', description: 'Bridge commands' },
 ];
@@ -234,12 +235,68 @@ const tg = new TelegramClient({ token: cfg.telegramToken });
 // --- backend registry ---
 // One long-lived instance per backend KIND (not per session/topic) --
 // exactly the "one process, many multiplexed sessions" shape zcode always
-// had. zcode starts eagerly, at the same point in startup it always did, so
-// a deployment that never touches Codex sees identical timing/behavior to
-// before this file knew about a second backend. Codex starts lazily, the
-// first time any topic actually asks for it (getBackend('codex') below) --
-// see wireBackend() for what "starts" wires up on every backend alike.
+// had.
+//
+// THE EAGER/LAZY SPLIT IS BY cfg.defaultBackend, NOT BY BACKEND NAME.
+// Originally (before a second backend existed) zcode was unconditionally
+// eager -- there was only one backend, so "eager" and "load-bearing" were
+// the same thing by construction. When Codex was added, that got hardcoded
+// forward as "zcode is eager and load-bearing, Codex is lazy and optional",
+// which is silently wrong the moment a deployment sets DEFAULT_BACKEND=codex:
+// it would still eagerly spawn a `zcode app-server` and treat ITS death as
+// fatal to the whole process, even though that deployment may have no real
+// z.ai credential configured at all and never intends to use zcode. Fixed
+// (2026-09-08, "bug #3"): whichever backend cfg.defaultBackend actually
+// names is the one started eagerly, here, at module load -- exactly the
+// point in startup zcode's own eager start always ran at, with identical
+// construction args and an identical synchronous start() call, so a
+// deployment with DEFAULT_BACKEND=zcode (the live one, and the default
+// absent that env var) is byte-for-byte unchanged by this refactor. ANY
+// OTHER known backend stays lazy, built and started the first time a topic
+// actually asks for it (getBackend() below) -- see wireBackend() for what
+// "starts" wires up on every backend alike, and its exit handler for how
+// "load-bearing" now means "is the default backend" instead of a bare name
+// check.
 const backends = {};
+
+// One factory per backend kind, used for BOTH the eager default-backend
+// construction below and getBackend()'s lazy path -- a backend the caller
+// never touches is never even constructed (never mind started), so a
+// deployment missing that backend's config (e.g. no CODEX_HOME on a
+// zcode-default deployment, or no z.ai credential on a codex-default one)
+// pays nothing for it. Codex's factory already threw on missing config
+// before this refactor (see the getBackend() 'codex' branch it replaces);
+// zcode's factory has no equivalent guard because it never needed one --
+// a missing/invalid z.ai credential doesn't stop the zcode app-server
+// process from *starting*, only from completing a real turn (see
+// zcodeClient.js's spawn-'error' handling and bridge/backends/zcodeBackend.js
+// for what DOES fail, and how).
+const BACKEND_FACTORIES = {
+  zcode: () => new ZcodeBackend({ nodeBin: cfg.nodeBin, zcodeBin: cfg.zcodeBin, cwd: cfg.workspaceDir, zaiConfigPath: cfg.zaiConfigPath }),
+  codex: () => {
+    if (!cfg.codexHome) throw new Error("the 'codex' backend needs CODEX_HOME set (see README)");
+    return new CodexBackend({ codexBin: cfg.codexBin, codexHome: cfg.codexHome, cwd: cfg.workspaceDir, autoApprovePermissions: cfg.autoApprovePermissions });
+  },
+  // No config to check -- that's the whole point (see mockBackend.js's
+  // module comment). Eligible as DEFAULT_BACKEND=mock too, for a deployment
+  // that wants zero external dependencies at all (e.g. this bridge's own
+  // future from-scratch tests).
+  mock: () => new MockBackend(),
+};
+
+// Per-backend default model, used wherever a topic/session needs one and
+// hasn't been told otherwise (a brand-new session, or /model's "current"
+// display with nothing stored yet). One place so the three-way branch this
+// replaced (zcode's cfg.defaultModel / Codex's cfg.codexDefaultModel / a
+// third backend's own default) can't drift across call sites -- it already
+// had before mock was added (see git history: getOrCreateSession's model
+// fallback and /model's "current" display used to hand-roll the same
+// zcode/codex two-way check independently).
+function defaultModelFor(backendName) {
+  if (backendName === 'codex') return cfg.codexDefaultModel || undefined;
+  if (backendName === 'mock') return MOCK_MODEL_REF;
+  return cfg.defaultModel;
+}
 
 function wireBackend(backend) {
   backend.on('event', onBackendEvent);
@@ -249,38 +306,41 @@ function wireBackend(backend) {
   backend.onPermissionRequest(onPermissionRequest);
   backend.onUserInputRequest(onUserInputRequest);
   backend.on('exit', ({ code, signal }) => {
-    if (backend.name === 'zcode') {
-      // zcode has always been load-bearing for the whole process: every
-      // topic depends on it, so its death takes the bridge down for the
-      // service manager to restart, unchanged from before this refactor.
-      console.error(`[bridge] zcode app-server exited unexpectedly (code=${code} signal=${signal}); exiting so the service manager restarts us`);
+    if (backend.name === cfg.defaultBackend) {
+      // The deployment's load-bearing backend: every topic that doesn't
+      // explicitly choose another one depends on it, so its death takes the
+      // bridge down for the service manager to restart -- unchanged
+      // behavior from before this refactor for a zcode-default deployment
+      // (the live one), now correctly generalized to whichever backend is
+      // actually load-bearing here instead of hardcoding zcode's name.
+      console.error(`[bridge] ${backend.name} app-server exited unexpectedly (code=${code} signal=${signal}); exiting so the service manager restarts us`);
       process.exit(1);
     }
-    // Codex is optional/secondary: its subprocess dying shouldn't take down
-    // topics running on zcode. Sessions currently on it will error on their
-    // next call (backends[name] still points at the dead instance) rather
-    // than silently hang; a fresh 'codex' getBackend() call after this is
+    // Optional/secondary backend: its subprocess dying shouldn't take down
+    // topics running on the default one. Sessions currently on it will error
+    // on their next call (backends[name] still points at the dead instance)
+    // rather than silently hang; a fresh getBackend(name) call after this is
     // NOT auto-respawned by this handler on purpose -- restarting the whole
-    // bridge is the same "known good" recovery zcode already relies on.
-    console.error(`[bridge] codex app-server exited unexpectedly (code=${code} signal=${signal}); Codex-backed topics are unavailable until the bridge restarts`);
+    // bridge is the same "known good" recovery the default backend already
+    // relies on.
+    console.error(`[bridge] ${backend.name} app-server exited unexpectedly (code=${code} signal=${signal}); ${backend.name}-backed topics are unavailable until the bridge restarts`);
   });
   return backend;
 }
 
-backends.zcode = wireBackend(
-  new ZcodeBackend({ nodeBin: cfg.nodeBin, zcodeBin: cfg.zcodeBin, cwd: cfg.workspaceDir, zaiConfigPath: cfg.zaiConfigPath }),
-);
-backends.zcode.start();
+if (!BACKEND_FACTORIES[cfg.defaultBackend]) {
+  throw new Error(`unknown DEFAULT_BACKEND: ${cfg.defaultBackend} (known: ${Object.keys(BACKEND_FACTORIES).join(', ')})`);
+}
+backends[cfg.defaultBackend] = wireBackend(BACKEND_FACTORIES[cfg.defaultBackend]());
+backends[cfg.defaultBackend].start();
 
 function getBackend(name) {
   if (backends[name]) return backends[name];
-  if (name === 'codex') {
-    if (!cfg.codexHome) throw new Error("the 'codex' backend needs CODEX_HOME set (see README)");
-    backends.codex = wireBackend(new CodexBackend({ codexBin: cfg.codexBin, codexHome: cfg.codexHome, cwd: cfg.workspaceDir, autoApprovePermissions: cfg.autoApprovePermissions }));
-    backends.codex.start();
-    return backends.codex;
-  }
-  throw new Error(`unknown backend: ${name}`);
+  const factory = BACKEND_FACTORIES[name];
+  if (!factory) throw new Error(`unknown backend: ${name}`);
+  backends[name] = wireBackend(factory());
+  backends[name].start();
+  return backends[name];
 }
 
 // Resolve the backend a given (prefixed) sessionId belongs to.
@@ -1226,17 +1286,13 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
     // honored here (store.getTopic re-read: forum_topic_created seeds a
     // topic-only record with no sessionId well before this ever runs).
     const stored = store.getTopic(threadId);
-    // NOT `... || cfg.defaultModel` on the end: that fallback is zcode's
-    // own default model string ('zai/glm-5.3-flash') and forcing it onto a
-    // Codex thread/start call is a real bug this refactor almost shipped
-    // (caught live: Codex's own API rejected it outright -- "not supported
-    // when using Codex with a ChatGPT account"). cfg.codexDefaultModel
-    // carries its own junior-model reasoning (see its definition above) --
-    // `|| undefined` here is just JS's empty-string-is-falsy guard in case
-    // an operator explicitly sets CODEX_DEFAULT_MODEL='', which should mean
-    // "let Codex pick its own default" (currently Astra) rather than send
-    // an empty string as a model ref.
-    const model = stored?.model || (backendName === 'codex' ? cfg.codexDefaultModel || undefined : cfg.defaultModel);
+    // NOT a bare `... || cfg.defaultModel` on the end: that fallback is
+    // zcode's own default model string ('zai/glm-5.3-flash') and forcing it
+    // onto a Codex thread/start call is a real bug this refactor almost
+    // shipped (caught live: Codex's own API rejected it outright -- "not
+    // supported when using Codex with a ChatGPT account"). defaultModelFor()
+    // picks the right per-backend default instead (see its definition above).
+    const model = stored?.model || defaultModelFor(backendName);
     const mode = stored?.mode || cfg.defaultSessionMode;
     const created = await backend.createConversation({ workspaceDir: cfg.workspaceDir, workspaceKey, model, mode });
     entry = { sessionId: created.sessionId, model: created.model ?? model, mode: created.mode ?? mode, backend: backendName };
@@ -1411,7 +1467,7 @@ async function handleModelCommand(threadId, arg) {
   const refs = available.map((m) => m.ref);
 
   if (!arg) {
-    const current = entry.model || (backendName === 'codex' ? cfg.codexDefaultModel : cfg.defaultModel) || '(backend default)';
+    const current = entry.model || defaultModelFor(backendName) || '(backend default)';
     const rows = available.map((m) => {
       const ctx = m.contextWindow ? (m.contextWindow >= 1000000 ? `${m.contextWindow / 1000000}M` : `${Math.round(m.contextWindow / 1000)}k`) : null;
       return `${m.ref === current ? '▶' : '•'} ${m.ref} — ${m.label || m.ref}${ctx ? ` (${ctx} ctx)` : ''}`;
@@ -1496,7 +1552,7 @@ async function handleModeCommand(threadId, arg) {
 // message -- a session id from one backend means nothing to the other, so
 // there is no way to carry conversation history across this switch (unlike
 // /model or /mode, which act on the SAME running session). ---
-const KNOWN_BACKENDS = ['zcode', 'codex'];
+const KNOWN_BACKENDS = Object.keys(BACKEND_FACTORIES);
 
 // THE MCP-REACHABLE CODEX TIERS, AND ONLY THESE THREE -- Sol (flagship,
 // ~Opus), Terra (balanced, ~Sonnet, the strong default), Luna (fastest/
@@ -1510,14 +1566,16 @@ const KNOWN_BACKENDS = ['zcode', 'codex'];
 const CODEX_MCP_MODELS = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'];
 
 // validateMcpModel enforces the MCP model policy for both session_create and
-// model_set, in one place, so the two can't drift: zcode refuses a model
-// argument outright (its own MCP contract has never offered one), Codex
-// accepts only CODEX_MCP_MODELS, omitted means "use the backend's own
-// default" (Terra, for Codex -- see cfg.codexDefaultModel).
+// model_set, in one place, so the two can't drift: zcode and mock both
+// refuse a model argument outright (zcode's own MCP contract has never
+// offered one; mock has exactly one model and nothing to switch to/from --
+// see mockBackend.js's "Model-switching policy" comment), Codex accepts
+// only CODEX_MCP_MODELS, omitted means "use the backend's own default"
+// (Terra, for Codex -- see cfg.codexDefaultModel).
 function validateMcpModel(backend, model) {
   if (model == null) return undefined;
   if (backend !== 'codex') {
-    throw new Error(`model may only be chosen for the codex backend over MCP (got backend=${backend}); zcode has no MCP-switchable model`);
+    throw new Error(`model may only be chosen for the codex backend over MCP (got backend=${backend}); ${backend} has no MCP-switchable model`);
   }
   if (!CODEX_MCP_MODELS.includes(model)) {
     throw new Error(`model "${model}" is not offered over MCP; choose one of ${CODEX_MCP_MODELS.join(', ')}`);
@@ -1747,7 +1805,7 @@ function helpText() {
     '/clearqueue — drop queued messages',
     '/model [name] — list / switch this topic’s model',
     '/mode [name] — list / switch this topic’s mode',
-    '/backend [name] — list / switch this topic’s backend (zcode/codex)',
+    '/backend [name] — list / switch this topic’s backend (zcode/codex/mock)',
     '/file <path> — send a workspace file here',
     '',
     'Anything else is sent to the model. Replies stream into the ⌛ placeholder message. Messages sent while a turn is running are queued and run in order; reply to any message to quote it to the model. Send a file as a document and the agent reads it (saved to inbox/, your caption = instruction).',
@@ -2379,7 +2437,7 @@ async function main() {
         const entry = key ? store.getTopic(key) : null;
         if (key && !entry) throw new Error(`unknown session: ${key}`);
         const backend = entry?.backend || cfg.defaultBackend;
-        const model = entry?.model || (backend === 'codex' ? cfg.codexDefaultModel : cfg.defaultModel);
+        const model = entry?.model || defaultModelFor(backend);
         return { backend, model, switchable: backend === 'codex' };
       },
       // Mirrors the Telegram /model command's own switch path (store the new
