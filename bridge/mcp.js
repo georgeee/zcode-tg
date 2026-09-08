@@ -102,8 +102,9 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
           chat_id: { type: 'number', description: 'Target chat id. Defaults to the bridge home chat.' },
           backend: {
             type: 'string',
-            enum: ['zcode', 'codex'],
-            description: "Which backend runs this session. Defaults to the bridge's own default backend (normally 'zcode'). 'codex' requires the bridge to have CODEX_HOME configured.",
+            enum: ['zcode', 'codex', 'mock'],
+            description:
+              "Which backend runs this session. Defaults to the bridge's own default backend (normally 'zcode'). 'codex' requires the bridge to have CODEX_HOME configured. 'mock' needs no configuration at all -- an in-process, zero-credential, zero-subprocess echo backend for exercising this MCP machinery without spending real API/credit usage; its reply is always a synthetic '[mock echo] <prompt>' echo, never a real model.",
           },
           model: {
             type: 'string',
@@ -153,7 +154,7 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
     {
       name: 'model_get',
       description:
-        "Return the backend and model a session runs, and whether model_set can change it (true for codex, always false for zcode). The backend itself is still only chosen at session_create time. Omit `key` to get the bridge's own defaults instead of a specific session's.",
+        "Return the backend and model a session runs, and whether model_set can change it (true for codex, always false for zcode and mock -- both are single-model/no-switching backends, for different reasons: zcode's own MCP contract never offered a switch, mock has only ever had the one synthetic model). The backend itself is still only chosen at session_create time. Omit `key` to get the bridge's own defaults instead of a specific session's.",
       inputSchema: {
         type: 'object',
         properties: { key: { type: 'string', description: 'Conversation key from session_create. Omit for the bridge-wide default backend/model.' } },
@@ -162,7 +163,7 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
     {
       name: 'model_set',
       description:
-        "Switch a session's model. Codex only, and only among the same three tiers session_create offers (gpt-5.6-luna/terra/sol) -- zcode sessions and gpt-6-astra both refuse with a clear error, not a silent no-op.",
+        "Switch a session's model. Codex only, and only among the same three tiers session_create offers (gpt-5.6-luna/terra/sol) -- zcode and mock sessions, and gpt-6-astra, all refuse with a clear error, not a silent no-op.",
       inputSchema: {
         type: 'object',
         properties: {
