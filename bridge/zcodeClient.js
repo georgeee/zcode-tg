@@ -38,6 +38,19 @@ export class ZcodeClient extends EventEmitter {
     this._decoder = new StringDecoder('utf8');
     this._serverRequestHandlers = new Map(); // method -> async (params, rawMsg) => resultObject
     this.proc = null;
+    // Set once the process is known gone (spawn failure OR a real exit) --
+    // see call()'s guard below. Without this, a FUTURE call() issued after
+    // the process has already died (e.g. bridge/index.js's createConversation
+    // calling session/create on a ZcodeBackend whose subprocess failed to
+    // spawn moments earlier) has nothing to reject it: the 'error'/'exit'
+    // handlers above only reject calls that were ALREADY pending at the
+    // instant they fired, and this process will never emit either event a
+    // second time. Left unguarded, that call would sit doing nothing at all
+    // until its own DEFAULT_TIMEOUT_MS (120s) elapses -- not a busy spin,
+    // but not the "clear, FAST failure" a misconfigured backend should give
+    // either (found and fixed via test/e2e-backend-lifecycle.mjs, which
+    // caught this exact 120s-shaped gap in the first version of this fix).
+    this._deadError = null;
   }
 
   start() {
@@ -55,13 +68,54 @@ export class ZcodeClient extends EventEmitter {
     this.proc.stderr.on('data', (chunk) => this.emit('stderr', chunk.toString('utf8')));
     this.proc.on('exit', (code, signal) => {
       this.emit('exit', { code, signal });
-      for (const [, p] of this._pending) {
-        clearTimeout(p.timer);
-        p.reject(new Error(`zcode app-server exited (code=${code} signal=${signal}) before responding`));
-      }
-      this._pending.clear();
+      const err = new Error(`zcode app-server exited (code=${code} signal=${signal}) before responding`);
+      this._deadError = err;
+      this._rejectAllPending(err);
+    });
+    // ROOT CAUSE of a real busy/hang-shaped failure (found investigating
+    // "bug #3" in the multi-backend refactor): child_process's 'error' event
+    // (spawn-time failures like ENOENT/EACCES -- e.g. a misconfigured
+    // ZCODE_NODE_BIN/ZCODE_BIN on a deployment that never touches zcode) is
+    // NOT followed by 'exit' -- the OS process never existed, so there's
+    // nothing to exit. Before this handler existed, nothing here ever
+    // listened for 'error', so Node's EventEmitter did what it always does
+    // for an unhandled 'error' event: threw synchronously, crashing the
+    // whole bridge process the instant it was thrown -- which, because this
+    // client is constructed and started at MODULE LOAD time (see
+    // bridge/index.js), happened before main() ever ran, before the Codex
+    // MCP socket had a chance to bind, and (under the live systemd unit's
+    // Restart=always/RestartSec=3) repeated forever: spawn, crash, restart,
+    // spawn, crash... every 3 seconds, indefinitely, with the MCP socket
+    // never once coming up. That is a crash-loop, not literally a CPU spin,
+    // but it matches the reported symptom exactly ("indefinite", "the MCP
+    // socket never binds") and is the only spawn-time failure mode this
+    // client could actually hit. Converting it into a normal 'exit'-shaped
+    // event lets it flow through the SAME bounded, already-safe handling
+    // wireBackend() (bridge/index.js) gives every other backend death:
+    // logged, and fatal only if this is the deployment's load-bearing
+    // backend -- never an uncaught crash, never a silent hang.
+    this.proc.on('error', (err) => {
+      this.emit('stderr', `spawn failed: ${err.message}\n`);
+      this.emit('exit', { code: null, signal: null, error: err });
+      // Also fail fast: a call already in flight (e.g. session/create issued
+      // right after start()) would otherwise sit until DEFAULT_TIMEOUT_MS
+      // (120s) elapses, since a process that never spawned never answers and
+      // never fires the ordinary 'exit' path above either. No pending call
+      // should ever have to wait out a timer for a failure that's already
+      // fully known.
+      const dead = new Error(`zcode app-server failed to start: ${err.message}`);
+      this._deadError = dead;
+      this._rejectAllPending(dead);
     });
     return this;
+  }
+
+  _rejectAllPending(err) {
+    for (const [, p] of this._pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this._pending.clear();
   }
 
   stop() {
@@ -80,6 +134,14 @@ export class ZcodeClient extends EventEmitter {
 
   // Fire off a client->server call, get the matching response back.
   call(method, params = {}, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+    // Fail immediately for a process already known dead (see _deadError's
+    // definition above) rather than register a pending call nothing will
+    // ever settle except its own DEFAULT_TIMEOUT_MS timer -- the specific
+    // gap a first version of this fix left open (a spawn failure was
+    // reported instantly, but any call issued AFTER it still took 120s to
+    // fail). A caller retrying against a permanently-broken backend gets the
+    // same clear, fast error on every attempt, not just the first.
+    if (this._deadError) return Promise.reject(this._deadError);
     const id = String(this._nextId++);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

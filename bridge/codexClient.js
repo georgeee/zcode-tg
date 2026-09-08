@@ -46,6 +46,9 @@ export class CodexClient extends EventEmitter {
     this._decoder = new StringDecoder('utf8');
     this._serverRequestHandlers = new Map();
     this.proc = null;
+    // Same "fail future calls fast, not just already-pending ones" guard as
+    // zcodeClient.js's identical field -- see its constructor comment.
+    this._deadError = null;
   }
 
   start() {
@@ -65,13 +68,35 @@ export class CodexClient extends EventEmitter {
     this.proc.stderr.on('data', (chunk) => this.emit('stderr', chunk.toString('utf8')));
     this.proc.on('exit', (code, signal) => {
       this.emit('exit', { code, signal });
-      for (const [, p] of this._pending) {
-        clearTimeout(p.timer);
-        p.reject(new Error(`codex app-server exited (code=${code} signal=${signal}) before responding`));
-      }
-      this._pending.clear();
+      const err = new Error(`codex app-server exited (code=${code} signal=${signal}) before responding`);
+      this._deadError = err;
+      this._rejectAllPending(err);
+    });
+    // Same fix, same reason as zcodeClient.js's identical handler -- see its
+    // comment for the full explanation (a spawn-time failure like ENOENT/
+    // EACCES on a misconfigured CODEX_BIN fires 'error', never 'exit', and
+    // with no listener Node throws it as an uncaught exception). Codex is
+    // already lazily started (getBackend('codex') in bridge/index.js), so
+    // this couldn't previously crash the WHOLE bridge at module-load time
+    // the way zcode's could -- but it could still crash it later, mid-flight,
+    // the first time any topic actually asked for Codex with a broken
+    // CODEX_BIN, which is just as much an uncaught-crash bug as zcode's.
+    this.proc.on('error', (err) => {
+      this.emit('stderr', `spawn failed: ${err.message}\n`);
+      this.emit('exit', { code: null, signal: null, error: err });
+      const dead = new Error(`codex app-server failed to start: ${err.message}`);
+      this._deadError = dead;
+      this._rejectAllPending(dead);
     });
     return this;
+  }
+
+  _rejectAllPending(err) {
+    for (const [, p] of this._pending) {
+      clearTimeout(p.timer);
+      p.reject(err);
+    }
+    this._pending.clear();
   }
 
   stop() {
@@ -102,6 +127,10 @@ export class CodexClient extends EventEmitter {
   }
 
   call(method, params = {}, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+    // See zcodeClient.js's identical guard for the full explanation: without
+    // this, a call issued AFTER the process is already known dead would
+    // still wait out the full timeoutMs instead of failing immediately.
+    if (this._deadError) return Promise.reject(this._deadError);
     const id = this._nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
