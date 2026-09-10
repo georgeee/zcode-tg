@@ -20,7 +20,11 @@
 let nodejs = nodejs_22; in
 stdenv.mkDerivation {
   pname = "zcode-tg";
-  version = "0.1.0";
+  # Derived from package.json, not hardcoded: the derivation name lands in
+  # the store path, and a stale hardcoded version made the unix-socket-fixed
+  # build INDISTINGUISHABLE by name from the broken one it replaced -- the
+  # pod diagnosis on 2026-09-10 had to grep file contents to tell them apart.
+  version = (builtins.fromJSON (builtins.readFile ../package.json)).version;
 
   inherit src;
 
