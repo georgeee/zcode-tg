@@ -2281,6 +2281,14 @@ async function main() {
       repliesGet: (key, afterSeq) => ({ replies: mcp.repliesSince(key, afterSeq) }),
       modelGet: () => ({ model: cfg.defaultModel, switchable: false }),
     });
+    // A failed listener (socket bind, chmod) must be LOUD: a silently dead
+    // MCP endpoint inside a healthy-looking bridge is exactly how this went
+    // unnoticed for days (2026-09-10 handout). Telegram keeps serving; the
+    // MCP gateway is dropped so noteReply/waitReply skip cleanly.
+    mcp.ready.catch((e) => {
+      console.error(`[bridge] MCP gateway failed to start: ${e.message} -- the junior-agent MCP is DEAD while Telegram continues`);
+      mcp = null;
+    });
   }
   restoreTopicStatuses();
   refreshUsagePercentages(); // warm the cache so the first status write has figures

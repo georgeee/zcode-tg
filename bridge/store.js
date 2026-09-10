@@ -26,6 +26,63 @@ function isProcessAlive(pid) {
   }
 }
 
+// --- namespace-safe lock identity (2026-09-10 handout, crash-loop bug) ---
+// A bare pid is not a safe identity for a lock file that survives restarts:
+// in containers the pid namespace does not, so the recorded pid may name a
+// LIVE-but-unrelated process in the new namespace, and the lock is never
+// reclaimed -- the bridge crash-loops forever (observed on a production
+// pod: 'pid 46' of a previous container vs whatever pid 46 is now). The
+// fix is identity, not liveness: boot id + the holder's /proc start time
+// alongside the pid. Same boot + same pid + same start time = same
+// process (genuinely held); anything else = stale, reclaim.
+export function lockIdentity(pid = process.pid) {
+  return { pid, bootId: readBootId(), startTime: readProcStartTime(pid) };
+}
+
+export function readBootId() {
+  try {
+    return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+  } catch {
+    return ''; // no /proc (exotic) -- fall back to pid-only matching
+  }
+}
+
+// Field 22 of /proc/<pid>/stat (starttime, clock ticks since boot). Uniquely
+// identifies a process within a boot; a recycled pid has a different one.
+export function readProcStartTime(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rest = stat.slice(stat.lastIndexOf(')') + 2); // fields from state (3) onward
+    return rest.split(' ')[19]; // field 22 overall
+  } catch {
+    return '';
+  }
+}
+
+export function parseLockFile(text) {
+  const trimmed = (text || '').trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const j = JSON.parse(trimmed);
+      if (Number.isInteger(j.pid)) return j;
+    } catch {}
+  }
+  const pid = Number(trimmed);
+  return Number.isInteger(pid) ? { pid } : { pid: NaN }; // legacy bare-pid lock
+}
+
+export function lockIsHeld(entry) {
+  if (!Number.isInteger(entry.pid) || entry.pid <= 0) return false;
+  if (!isProcessAlive(entry.pid)) return false;
+  // Legacy bare-pid lock: liveness is all we ever knew; keep the old
+  // conservative behaviour (this is also the cross-namespace ambiguity the
+  // new format exists to remove -- we cannot do better with what's on disk).
+  if (entry.bootId == null) return true;
+  const ident = lockIdentity(entry.pid);
+  if (ident.bootId === '' || ident.startTime === '') return true; // can't verify -- conservative
+  return ident.bootId === entry.bootId && ident.startTime === String(entry.startTime);
+}
+
 export class Store {
   constructor(path) {
     this.path = path;
@@ -37,12 +94,13 @@ export class Store {
     this.lockPath = `${this.path}.lock`;
     try {
       const fd = openSync(this.lockPath, 'wx'); // exclusive create, fails if it already exists
-      writeFileSync(fd, String(process.pid));
+      writeFileSync(fd, JSON.stringify(lockIdentity()));
       closeSync(fd);
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      const heldBy = Number(readFileSync(this.lockPath, 'utf8').trim());
-      if (isProcessAlive(heldBy)) {
+      const entry = parseLockFile(readFileSync(this.lockPath, 'utf8'));
+      if (lockIsHeld(entry)) {
+        const heldBy = entry.pid;
         throw new Error(
           `another instance already has ${this.path} open (pid ${heldBy}, lock at ${this.lockPath}). ` +
             `If that process is actually gone, delete the lock file and retry.`,

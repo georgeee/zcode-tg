@@ -19,6 +19,8 @@
 // reach dispatchUserPrompt.
 
 import fs from 'node:fs';
+import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
 
@@ -278,8 +280,9 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
     unixSrv = createNetServer((conn) => {
       unixConns.add(conn);
       let buf = '';
+      const decoder = new StringDecoder('utf8'); // chunk-safe: a multibyte char split across reads survives
       conn.on('data', (chunk) => {
-        buf += chunk;
+        buf += decoder.write(chunk);
         let nl;
         while ((nl = buf.indexOf('\n')) >= 0) {
           const line = buf.slice(0, nl).trim();
@@ -304,6 +307,9 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
       conn.on('error', () => {});
       conn.on('close', () => unixConns.delete(conn));
     });
+    // The parent directory is OURS to create (agent-cage creates nothing);
+    // a missing parent is the production case, not an edge.
+    fs.mkdirSync(path.dirname(unixSocket), { recursive: true });
     try {
       fs.rmSync(unixSocket, { force: true }); // a stale socket from a killed bridge would fail bind
     } catch {}
@@ -312,8 +318,21 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
       unixSrv.listen(unixSocket, () => {
         try {
           fs.chmodSync(unixSocket, 0o600); // owner read/write, nobody else
-        } catch {}
-        log(`mcp gateway listening on unix:${unixSocket}`);
+        } catch (e) {
+          // THE PERMISSIONS ARE THE AUTHENTICATION: a socket that came out
+          // group/world-reachable (umask 002 makes that the default) must
+          // not be served. Kill the listener and say why -- a dead endpoint
+          // that logs one line beats a silently world-open one.
+          const mode = (() => {
+            try { return (fs.statSync(unixSocket).mode & 0o777).toString(8); } catch { return '?'; }
+          })();
+          log(`mcp gateway: chmod 0600 on ${unixSocket} FAILED (${e.message}); mode is ${mode} -- refusing to serve, the socket permissions are the authentication`);
+          try { unixSrv.close(); } catch {}
+          try { fs.rmSync(unixSocket, { force: true }); } catch {}
+          reject(new Error(`chmod 0600 on unix socket failed: ${e.message}`));
+          return;
+        }
+        log(`mcp gateway listening on unix:${unixSocket} (mode 0600)`);
         resolve(unixSocket);
       });
     });

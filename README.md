@@ -255,6 +255,12 @@ Five tools:
 
 Configuration (in the bridge's env, off by default):
 
+  The bridge creates the socket's parent directory, unlinks a stale socket
+  before binding, and chmods the socket `0600` after binding — with the
+  permissions being the authentication, a chmod failure kills the listener
+  loudly rather than serving a group/world-reachable socket. Framing is one
+  JSON-RPC message per line (stdio-style, no HTTP), safe against multibyte
+  characters split across reads.
 - `MCP_UNIX_SOCKET` — the per-fleet unix socket to listen on. **Off unless
   set.** The socket file is created 0600 inside the bridge's own state
   directory, and those permissions ARE the authentication: only the account
