@@ -247,7 +247,7 @@ Five tools:
 
 | tool | what it does |
 |---|---|
-| `session_create` | Create a named session: a new forum topic + a fresh agent session; returns the conversation `key` and the `model` it runs. |
+| `session_create` | Create a named session: a new forum topic + a fresh agent session; returns the conversation `key` and the `model` it runs. Without `chat_id` the target is **auto-picked**: the forum-enabled groups the bot knows (Topics enabled, bot-admin preferred, most recently used first) — see below. |
 | `message_send` | Send a prompt to a session and (by default, `wait: true`) block until the final reply — a real turn, streamed into the topic meanwhile. `wait: false` queues and returns at once. |
 | `replies_get` | Catch-up read: replies already collected for a conversation since a sequence number (the in-memory log keeps the last 200 per conversation). |
 | `session_close` | Close the session and its Telegram topic; further `message_send` to the key names the error. |
@@ -286,6 +286,20 @@ session-creation failure surfaces to the MCP caller as the same failure
 notice the Telegram user would see. `message_send` rides the ordinary
 dispatch pipeline: queueing behind a running turn, deploy-drain semantics,
 and the reply footer are all shared with the Telegram path.
+
+**Auto-picked `session_create` targets.** The Bot API has no "list the chats
+this bot is in", so the bridge remembers every group it has served (owner
+message seen, topic created, bot added — persisted in the store, throttled to
+one touch per minute per chat) and, when `session_create` arrives with no
+`chat_id`, re-validates those candidates live: `getChat` must say Topics are
+enabled *right now*, `getChatMember` whether the bot is an administrator.
+Ranking: forums only, admin-run forums over member forums, then most
+recently served first. The configured `TELEGRAM_CHAT_ID` is just one more
+candidate — ranked by its own real activity, never privileged — so a stale
+value can no longer break the default (the 2026-09-10 cage-pod failure:
+`createForumTopic` against a non-forum home chat, Telegram's "the chat is
+not a forum"). With nothing eligible the tool fails with a line per rejected
+candidate saying why; an explicit `chat_id` always wins.
 
 ## Commands & turn lifecycle from Telegram
 

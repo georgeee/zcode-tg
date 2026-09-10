@@ -54,6 +54,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { createMcpGateway } from './mcp.js';
+import { pickForumChat } from './chatpick.js';
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { loadEnv, resolveEnvPath } from './env.js';
@@ -1731,12 +1732,75 @@ const chatOf = (key) => {
 };
 const threadOf = (key) => parseTopicKey(key).threadId;
 
+// The bot's own Telegram user id, fetched once -- getChatMember needs it to
+// ask about our own admin status when auto-picking a session target.
+let botUserId = null;
+async function ensureBotUserId() {
+  if (botUserId == null) botUserId = (await tg.getMe()).id;
+  return botUserId;
+}
+
+// A group the bot is IN and has SERVED (the owner spoke in it, created a
+// topic there, or added the bot): a candidate for the default MCP session
+// target. Positive ids (private chats) can never host topics, so they are
+// not worth remembering. lastSeenAt orders candidates at pick time; entries
+// are re-validated live there (pickDefaultForumChat), so staleness is
+// harmless -- but an hour of owner chatter shouldn't mean an hour of store
+// rewrites either, hence the throttle.
+const CHAT_RESEEN_MS = 60 * 1000;
+function noteKnownChat(chat) {
+  const chatId = Number(chat?.id);
+  if (!Number.isInteger(chatId) || chatId >= 0) return;
+  const known = store.getChats()[chatId] || {};
+  const fresh = {};
+  if (chat.title != null) fresh.title = chat.title;
+  if (chat.type != null) fresh.type = chat.type;
+  if (
+    (known.title ?? null) === (fresh.title ?? null) &&
+    (known.type ?? null) === (fresh.type ?? null) &&
+    Date.now() - (known.lastSeenAt ?? 0) < CHAT_RESEEN_MS
+  ) return; // nothing new worth a store write
+  store.noteChat(chatId, { ...fresh, lastSeenAt: Date.now() });
+}
+
+// Where a chat-less MCP session_create should land: the forum-enabled groups
+// the bot actually knows, admin-run ones first, most recently served first.
+// See bridge/chatpick.js for the ranking rationale.
+async function pickDefaultForumChat() {
+  const botId = await ensureBotUserId();
+  const byId = new Map(
+    Object.entries(store.getChats()).map(([id, info]) => [Number(id), { chatId: Number(id), lastSeenAt: info.lastSeenAt ?? 0 }]),
+  );
+  // The configured home chat stays a candidate (ranked by its own real
+  // activity, i.e. behind any chat the owner actually uses) so a CORRECT
+  // TELEGRAM_CHAT_ID keeps working even before the owner has ever spoken
+  // in it -- while a stale one can no longer break the default.
+  if (!byId.has(Number(cfg.chatId))) byId.set(Number(cfg.chatId), { chatId: Number(cfg.chatId), lastSeenAt: 0 });
+  const candidates = [...byId.values()].sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+  const winner = await pickForumChat({
+    getChat: (chatId) => tg.getChat({ chatId }),
+    getChatMember: (chatId) => tg.getChatMember({ chatId, userId: botId }),
+    botId,
+    candidates,
+  });
+  console.log(
+    `[bridge] mcp session_create: no chat_id given -- picked chat ${winner.chatId}${winner.title ? ` ("${winner.title}")` : ''}` +
+      `${winner.admin ? '' : ' (bot NOT admin there: topic creation may fail)'} from ${candidates.length} known chat(s)`,
+  );
+  return winner;
+}
+
 // ADDED SOMEWHERE BY A NON-OWNER: say why and leave, exactly as the cage's
 // own bot does. Exiting the process would only crash-loop under the service
 // supervisor (the bot is still a member of the foreign chat on every
 // restart); leaving is final and tells the truth once.
 function handleMyChatMember(m) {
   const status = m.new_chat_member?.status;
+  // Any status in these three means the bot is IN the chat right now --
+  // worth remembering as a default-target candidate (it gets re-validated
+  // live at pick time, so a chat we are subsequently kicked out of merely
+  // becomes unreachable there).
+  if (['member', 'restricted', 'administrator'].includes(status)) noteKnownChat(m.chat);
   if (!['member', 'restricted'].includes(status)) return;
   if (isOwner(m.from?.id)) return;
   const chatId = m.chat?.id;
@@ -1755,6 +1819,7 @@ async function handleMessage(message) {
     console.warn(`[bridge] ignoring message from unauthorized user ${message.from?.id} in chat ${message.chat?.id}`);
     return;
   }
+  noteKnownChat(message.chat); // a group the owner speaks in is a default-target candidate
   const chatId = message.chat.id;
   const messageThread = message.message_thread_id;
   // FROM HERE, `threadId` IS THE CONVERSATION KEY (chat+topic), not the raw
@@ -2236,8 +2301,20 @@ async function main() {
     });
     mcp.wire({
       sessionCreate: async (name, chatIdNum) => {
-        const chatId = chatIdNum ?? cfg.chatId;
+        // No chat_id: auto-pick. The old default was the configured home
+        // chat, unconditionally -- which turned a stale TELEGRAM_CHAT_ID
+        // into Telegram's "the chat is not a forum" (2026-09-10 cage-pod
+        // failure). Now the bridge picks the best forum it actually knows:
+        // Topics enabled, bot-admin preferred, most recently used first.
+        let chatId = chatIdNum;
+        let autoPicked = false;
+        if (chatId == null) {
+          const winner = await pickDefaultForumChat();
+          chatId = winner.chatId;
+          autoPicked = true;
+        }
         const created = await tg.createForumTopic({ chatId, name });
+        store.noteChat(chatId, { lastSeenAt: Date.now() }); // a successful create is the strongest "we serve this chat"
         const threadId = created.message_thread_id;
         const key = keyFor(chatId, threadId);
         store.setTopic(key, { chatId, threadId, name, model: cfg.defaultModel, mode: cfg.defaultSessionMode });
@@ -2245,7 +2322,7 @@ async function main() {
         // model is READ-ONLY information: MCP sessions always run this
         // bridge's default model, and there is deliberately no way to
         // switch it from here.
-        return { key, chat_id: chatId, thread_id: threadId, model: cfg.defaultModel };
+        return { key, chat_id: chatId, thread_id: threadId, model: cfg.defaultModel, auto_picked: autoPicked };
       },
       sessionClose: async (key) => {
         const t = store.getTopic(key) ?? {};

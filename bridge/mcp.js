@@ -101,7 +101,11 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Topic/session name (shown in Telegram).' },
-          chat_id: { type: 'number', description: 'Target chat id. Defaults to the bridge home chat.' },
+          chat_id: {
+            type: 'number',
+            description:
+              'Target chat id (a supergroup with Topics enabled). Omit to auto-pick: the most recently used forum-enabled group the bot is in, preferring ones where the bot is admin.',
+          },
         },
         required: ['name'],
       },

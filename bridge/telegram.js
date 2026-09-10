@@ -63,6 +63,23 @@ export class TelegramClient {
     });
   }
 
+  // Who we are on the Telegram side -- the id getChatMember needs to ask
+  // about the bot's own admin status. Fetched once and cached by the caller.
+  getMe() {
+    return this._call('getMe', {});
+  }
+
+  // Live chat facts: getChat's ChatFullInfo carries is_forum for
+  // supergroups, which is exactly what a default topic-creation target
+  // must be checked for (stale config or a toggled setting, not trusted).
+  getChat({ chatId }) {
+    return this._call('getChat', { chat_id: chatId });
+  }
+
+  getChatMember({ chatId, userId }) {
+    return this._call('getChatMember', { chat_id: chatId, user_id: userId });
+  }
+
   closeForumTopic({ chatId, messageThreadId }) {
     return this._call('closeForumTopic', { chat_id: chatId, message_thread_id: messageThreadId });
   }

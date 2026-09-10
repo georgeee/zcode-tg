@@ -52,6 +52,11 @@ const srv = createServer(async (req, res) => {
     calls.topicCreated.push(p);
     return ok({ message_thread_id: nextThreadId, chat_id: p.chat_id, name: p.name });
   }
+  // The default-target picker (chat-less session_create) asks these three;
+  // the fake vouches that the configured chat is a forum with the bot admin.
+  if (method === 'getMe') return ok({ id: 4242, is_bot: true });
+  if (method === 'getChat') return ok({ id: JSON.parse(body || '{}').chat_id, type: 'supergroup', title: 'E2E Home', is_forum: true });
+  if (method === 'getChatMember') return ok({ status: 'administrator' });
   if (method === 'closeForumTopic') {
     const p = JSON.parse(body);
     calls.topicClosed.push(p);

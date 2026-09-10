@@ -14,7 +14,7 @@
 
 import { readFileSync, writeFileSync, renameSync, existsSync, openSync, closeSync, unlinkSync } from 'node:fs';
 
-const EMPTY = { updateOffset: undefined, topics: {}, pendingPermissions: {}, queues: {} };
+const EMPTY = { updateOffset: undefined, topics: {}, pendingPermissions: {}, queues: {}, chats: {} };
 
 function isProcessAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -143,6 +143,21 @@ export class Store {
 
   setTopic(threadId, entry) {
     this.data.topics[threadId] = { ...this.data.topics[threadId], ...entry };
+    this._save();
+  }
+
+  // --- known group chats (default-target resolution for MCP session_create) ---
+  // The Bot API cannot enumerate a bot's chats, so the bridge remembers every
+  // group it has served (owner message seen, topic created, bot added).
+  // Purely advisory metadata: bridge/chatpick.js re-validates each candidate
+  // live via getChat before trusting it, so a stale entry is harmless.
+  getChats() {
+    return this.data.chats || {};
+  }
+
+  noteChat(chatId, info = {}) {
+    if (!this.data.chats) this.data.chats = {};
+    this.data.chats[chatId] = { ...this.data.chats[chatId], ...info };
     this._save();
   }
 
