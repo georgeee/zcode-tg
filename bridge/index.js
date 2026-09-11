@@ -274,14 +274,18 @@ async function shutdown(signal) {
   // regardless), and matters most for the foreground/dev-loop path
   // README.md documents, where nothing else guarantees the child doesn't
   // outlive us as an orphaned, still-authenticated zcode process.
-  const notifications = [...activeTurns.values()].map((turn) => {
+  // ENTRIES, NOT VALUES: activeTurns is keyed by sessionId, and the chat a
+  // turn belongs to is reachable only through that key (sessionToTopic). The
+  // value alone does not carry it, which is how `chatOf(threadId)` came to be
+  // written here against an identifier this scope does not define.
+  const notifications = [...activeTurns.entries()].map(([sessionId, turn]) => {
     turn.streamer?.stop();
     turn.progress?.stop();
     const liveId = turnLiveMessageId(turn);
     if (!liveId) return Promise.resolve();
     return tg
       .editMessageText({
-        chatId: chatOf(threadId),
+        chatId: chatOf(sessionToTopic.get(sessionId)?.threadId),
         messageId: liveId,
         text: "⚠️ Bridge is restarting (deploying an update) — this turn was interrupted. Send your message again once it's back (usually a few seconds).",
       })
@@ -357,7 +361,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
   const state = {
     resolve: null,
     timer: null,
-    chatId: chatOf(threadId),
+    chatId: chatOf(topic.threadId),
     threadId: topic.threadId,
     questions: [],
     answers: {},
@@ -382,8 +386,8 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
     let msg;
     try {
       msg = await tg.sendMessage({
-        chatId: chatOf(threadId),
-        messageThreadId: topic.threadId,
+        chatId: chatOf(topic.threadId),
+        messageThreadId: threadOf(topic.threadId),
         text: lines.join('\n'),
         replyMarkup: TG.inlineKeyboard(buttons),
       });
@@ -393,7 +397,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
       // and decline cleanly rather than leave half a prompt behind.
       console.error('[bridge] failed to post user-input prompt:', e.message);
       for (const posted of state.questions) {
-        await tg.editMessageText({ chatId: chatOf(threadId), messageId: posted.messageId, text: '⚠️ Not deliverable — question declined.', replyMarkup: { inline_keyboard: [] } }).catch(() => {});
+        await tg.editMessageText({ chatId: chatOf(topic.threadId), messageId: posted.messageId, text: '⚠️ Not deliverable — question declined.', replyMarkup: { inline_keyboard: [] } }).catch(() => {});
         store.removePendingPermission(userInputStoreKey(params.requestId, posted.index));
       }
       return { action: 'decline', reason: `bridge: failed to deliver the question to Telegram (${e.message})` };
@@ -401,7 +405,7 @@ zcode.onServerRequest('interaction/requestUserInput', async (params) => {
     state.questions.push({ index: qi, key: q.question, messageId: msg.message_id, header: q.header || '' });
     // Reused pendingPermissions storage (see its comment): entries orphaned by
     // a restart get their buttons swept and cleared at next startup.
-    store.addPendingPermission(userInputStoreKey(params.requestId, qi), { chatId: chatOf(threadId), messageId: msg.message_id, threadId: topic.threadId, kind: 'userInput' });
+    store.addPendingPermission(userInputStoreKey(params.requestId, qi), { chatId: chatOf(topic.threadId), messageId: msg.message_id, threadId: topic.threadId, kind: 'userInput' });
   }
 
   // The turn is now blocked on this answer -- say so on the ⌛ placeholder.
@@ -504,8 +508,8 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
   let msg;
   try {
     msg = await tg.sendMessage({
-      chatId: chatOf(threadId),
-      messageThreadId: topic.threadId,
+      chatId: chatOf(topic.threadId),
+      messageThreadId: threadOf(topic.threadId),
       text,
       replyMarkup: TG.inlineKeyboard(buttons),
     });
@@ -525,7 +529,7 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
   // Persisted so a request still awaiting a button press when the process
   // dies isn't left as an orphaned message with dead-but-still-clickable
   // buttons forever -- swept and cleaned up on the next startup, below.
-  store.addPendingPermission(params.requestId, { chatId: chatOf(threadId), messageId: msg.message_id, threadId: topic.threadId });
+  store.addPendingPermission(params.requestId, { chatId: chatOf(topic.threadId), messageId: msg.message_id, threadId: topic.threadId });
 
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -536,7 +540,7 @@ zcode.onServerRequest('interaction/requestPermission', async (params) => {
     pendingPermissions.set(params.requestId, {
       resolve,
       tokenMap,
-      chatId: chatOf(threadId),
+      chatId: chatOf(topic.threadId),
       messageId: msg.message_id,
       timer,
     });
@@ -787,7 +791,7 @@ async function adoptUnclaimedTurn(sessionId, params) {
   activeTurns.set(sessionId, entry);
   let msg;
   try {
-    msg = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: topic.threadId, text: '⌛ 🌀 …' });
+    msg = await tg.sendMessage({ chatId: chatOf(topic.threadId), messageThreadId: threadOf(topic.threadId), text: '⌛ 🌀 …' });
   } catch (e) {
     console.error(`[bridge] failed to post placeholder for auto-started turn ${params.turnId}; dropping it:`, e.message);
     activeTurns.delete(sessionId);
@@ -806,7 +810,7 @@ async function handleBackgroundTaskFinished(sessionId, payload) {
   const label = truncate(payload.description || payload.command || payload.taskId, 120);
   const icon = payload.status === 'completed' ? '✅' : '⚠️';
   await tg
-    .sendMessage({ chatId: chatOf(threadId), messageThreadId: topic.threadId, text: `🌀 Background task ${icon} ${label} — ${payload.status}` })
+    .sendMessage({ chatId: chatOf(topic.threadId), messageThreadId: threadOf(topic.threadId), text: `🌀 Background task ${icon} ${label} — ${payload.status}` })
     .catch((e) => console.error('[bridge] failed to post background-task notice:', e.message));
 }
 
@@ -842,7 +846,7 @@ async function finalizeTurn(sessionId, terminalParams) {
         const quietId = replaceId ?? turnLiveMessageId(turn);
         if (quietId) {
           await tg
-            .editMessageText({ chatId: chatOf(threadId), messageId: quietId, text: '🌀 Background task notification processed.' })
+            .editMessageText({ chatId: chatOf(topic?.threadId), messageId: quietId, text: '🌀 Background task notification processed.' })
             .catch(() => {});
         }
       } else {
@@ -1043,7 +1047,7 @@ setInterval(async () => {
     const topic = sessionToTopic.get(sessionId);
     tg
       .editMessageText({
-        chatId: chatOf(threadId),
+        chatId: chatOf(topic?.threadId),
         messageId: turn.placeholderMessageId,
         text: '⚠️ No response after a long time — the turn has been stopped. Send another message to try again (or /stop next time to cancel earlier).',
       })
@@ -2069,8 +2073,22 @@ async function dispatchUserPrompt(threadId, promptText, command) {
 // Attaches the turn's progress view, per cfg.streamProgress: the milestone
 // reporter (bridge/progress.js) or the classic streaming preview
 // (bridge/streamer.js). Exactly one of turn.progress / turn.streamer is set.
+// THE PARAMETER IS A CONVERSATION KEY; THE VIEWS WANT A TELEGRAM THREAD ID.
+// Those are not the same value and were being passed as if they were: chatOf()
+// parses the key correctly, and then the very same variable went on to
+// ProgressReporter as `threadId`, which sends it verbatim as message_thread_id.
+// A key reads "c-100…:t12" -- Telegram cannot parse that as an integer, drops
+// it, and the message lands in the group's General topic instead of the
+// session's own. Measured on a live fleet: progress and milestone posts from
+// subagent turns arriving in #General while ordinary replies (which go through
+// threadOf()) landed correctly.
+//
+// It is invisible on a fleet whose configured chat IS the forum group, because
+// keyFor() then returns a bare numeric string that happens to be a valid thread
+// id. Only a fleet whose TELEGRAM_CHAT_ID is something else -- a DM, a stale id
+// -- takes the "c<chat>:t<thread>" form and shows the bug.
 function attachTurnView(turn, { placeholderMessageId, threadId }) {
-  const common = { tg, chatId: chatOf(threadId), threadId, minEditIntervalMs: cfg.streamEditIntervalMs };
+  const common = { tg, chatId: chatOf(threadId), threadId: threadOf(threadId), minEditIntervalMs: cfg.streamEditIntervalMs };
   if (cfg.streamProgress === 'messages') {
     turn.progress = new ProgressReporter({ ...common, seedMessageId: placeholderMessageId, editIntervalMs: cfg.streamEditIntervalMs });
   } else if (cfg.streamProgress !== 'off') {
