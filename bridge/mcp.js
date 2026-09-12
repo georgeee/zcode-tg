@@ -151,6 +151,12 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
         'Return the model this bridge runs — READ-ONLY. Sessions created through this MCP server always use this model (the bridge default, zai/glm-5.3-flash); there is deliberately no way to switch models from here.',
       inputSchema: { type: 'object', properties: {} },
     },
+    {
+      name: 'usage_get',
+      description:
+        'Return this account\'s Z.ai coding-plan usage, per quota window (short-term and weekly): credits used, the cap, what remains, and when it resets — READ-ONLY. Lets a supervisor model track spend across the sessions it delegates without going through Telegram\'s /usage command. Figures may lag up to 5 minutes: the account\'s usage endpoint is rate-limit-sensitive, so this is served from the same cache the topic status line uses rather than fetched fresh on every call.',
+      inputSchema: { type: 'object', properties: {} },
+    },
   ];
 
   async function callTool(name, args) {
@@ -166,6 +172,8 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
         return handlers.repliesGet(String(args.key), Number(args.after_seq) || 0);
       case 'model_get':
         return handlers.modelGet();
+      case 'usage_get':
+        return handlers.usageGet();
       default:
         throw new Error(`unknown tool: ${name}`);
     }

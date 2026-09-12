@@ -40,12 +40,12 @@ test('initialize handshake returns the protocol version and capabilities', async
   assert.equal(r.body.result.serverInfo.name, 'cage-pod-zcode-mcp');
 });
 
-test('tools/list advertises the five tools with schemas', async (t) => {
+test('tools/list advertises the six tools with schemas', async (t) => {
   const h = await startGateway(t, {});
   t.after(() => h.close());
   const r = await rpc(h.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const names = r.body.result.tools.map((x) => x.name).sort();
-  assert.deepEqual(names, ['message_send', 'model_get', 'replies_get', 'session_close', 'session_create']);
+  assert.deepEqual(names, ['message_send', 'model_get', 'replies_get', 'session_close', 'session_create', 'usage_get']);
   for (const tool of r.body.result.tools) assert.ok(tool.inputSchema, `${tool.name} carries a schema`);
 });
 
@@ -61,6 +61,51 @@ test('model_get is read-only and names the default model', async (t) => {
   const payload = JSON.parse(r.body.result.content[0].text);
   assert.equal(payload.model, 'zai/glm-5.3-flash');
   assert.equal(payload.switchable, false);
+});
+
+test('usage_get is read-only and reports the account\'s quota windows', async (t) => {
+  const h = await startGateway(t, {
+    usageGet: () => ({
+      level: 'lite',
+      windows: [
+        { window: 'Short-term (~5h)', used: 127, cap: 2000, remaining: 1873, percentage: 6, resetsAt: '2026-09-01T03:26:57.027Z' },
+      ],
+      cachedAt: '2026-09-01T03:16:57.027Z',
+    }),
+  });
+  t.after(() => h.close());
+  const r = await rpc(h.url, {
+    jsonrpc: '2.0', id: 6, method: 'tools/call',
+    params: { name: 'usage_get', arguments: {} },
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.result.isError, false);
+  const payload = JSON.parse(r.body.result.content[0].text);
+  assert.equal(payload.level, 'lite');
+  assert.equal(payload.windows.length, 1);
+  // FIELD NAMES ARE THE INTERFACE: the API's own `usage`/`currentValue` are
+  // swapped from what they sound like, and this tool must never pass that
+  // confusion through -- `used` is what was used, `cap` is the ceiling.
+  assert.equal(payload.windows[0].used, 127);
+  assert.equal(payload.windows[0].cap, 2000);
+  assert.equal(payload.windows[0].remaining, 1873);
+  assert.ok(payload.cachedAt, 'reports how fresh the figures are');
+});
+
+test('usage_get surfaces a fetch failure as a tool error, not a fabricated answer', async (t) => {
+  const h = await startGateway(t, {
+    usageGet: () => {
+      throw new Error('usage has not been fetched yet; retry shortly');
+    },
+  });
+  t.after(() => h.close());
+  const r = await rpc(h.url, {
+    jsonrpc: '2.0', id: 7, method: 'tools/call',
+    params: { name: 'usage_get', arguments: {} },
+  });
+  assert.equal(r.status, 200); // JSON-RPC succeeded; the TOOL reports the error
+  assert.equal(r.body.result.isError, true);
+  assert.match(r.body.result.content[0].text, /not been fetched yet/);
 });
 
 test('unknown methods return a JSON-RPC error; notifications return no body', async (t) => {

@@ -131,7 +131,7 @@ try {
   check('initialize handshake', init.body?.result?.protocolVersion === '2024-11-05', JSON.stringify(init));
   await mcp(mcpPort, { jsonrpc: '2.0', method: 'notifications/initialized' });
   const list = await mcp(mcpPort, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
-  check('tools/list advertises the five tools', list.body?.result?.tools?.length === 5, JSON.stringify(list.body));
+  check('tools/list advertises the six tools', list.body?.result?.tools?.length === 6, JSON.stringify(list.body));
 
   // session_create: a named topic appears in the chat, a session is born.
   step('session_create');

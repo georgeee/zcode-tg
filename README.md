@@ -243,7 +243,7 @@ is mirrored into the topic **from the bot's identity**, and every reply is
 both delivered to the topic and returned to the MCP caller, so the Telegram
 chat stays the shared log no matter which frontend typed.
 
-Five tools:
+Six tools:
 
 | tool | what it does |
 |---|---|
@@ -252,6 +252,7 @@ Five tools:
 | `replies_get` | Catch-up read: replies already collected for a conversation since a sequence number (the in-memory log keeps the last 200 per conversation). |
 | `session_close` | Close the session and its Telegram topic; further `message_send` to the key names the error. |
 | `model_get` | Read-only: the model this bridge runs. **There is deliberately no way to switch models over MCP** — sessions always run the bridge default (`zai/glm-5.3-flash`). |
+| `usage_get` | Read-only: this account's Z.ai plan usage per quota window (used, cap, remaining, reset time) — the same data `/usage` renders as Telegram HTML, as plain fields. Lets a supervisor model track spend across the sessions it delegates. Cached up to 5 minutes, shared with the topic status line's own refresh, to protect the account's rate-limited monitoring endpoint. |
 
 Configuration (in the bridge's env, off by default):
 

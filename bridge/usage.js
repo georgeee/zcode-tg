@@ -48,7 +48,7 @@ export async function fetchUsage({ apiKey, url = USAGE_URL, fetchImpl = fetch })
 
 // unit 3 x number 5 -> "Short-term (~5h)"; unit 6 x 1 -> "Weekly". Any other
 // combination degrades to a literal label rather than a wrong friendly one.
-function windowLabel(l) {
+export function windowLabel(l) {
   if (l.unit === 3) return `Short-term (~${l.number}h)`;
   if (l.unit === 6 && l.number === 1) return 'Weekly';
   if (l.unit === 6) return `~${l.number}w`;
@@ -112,6 +112,50 @@ export function usagePercentages(data) {
   const week = limits.find((l) => l.unit === 6);
   const pct = (l) => (l && Number.isFinite(l.percentage) ? Math.round(l.percentage) : null);
   return { shortPct: pct(short), weekPct: pct(week) };
+}
+
+// usageSnapshot: the same figures renderUsage turns into Telegram HTML, as
+// plain data rather than markup -- for the MCP usage_get tool, where the
+// field names ARE the interface. The API's own names are misleading (`usage`
+// is the CAP, `currentValue` is what's USED, exactly backwards from what a
+// reader guesses), and that confusion must not leak through a tool a model
+// is meant to reason over: every field below is named for what it holds.
+export function usageSnapshot(data) {
+  const limits = Array.isArray(data?.limits) ? data.limits : [];
+  return {
+    level: data?.level ?? null,
+    windows: limits.map((l) => ({
+      window: windowLabel(l),
+      used: Number.isFinite(l.currentValue) ? l.currentValue : null,
+      cap: Number.isFinite(l.usage) ? l.usage : null,
+      // Prefer the API's own `remaining` (matches what a human sees in
+      // renderUsage); fall back to the arithmetic only when it is absent,
+      // rather than trusting a subtraction over a field the account itself
+      // computed and may round or floor differently.
+      remaining: Number.isFinite(l.remaining)
+        ? l.remaining
+        : Number.isFinite(l.usage) && Number.isFinite(l.currentValue)
+          ? l.usage - l.currentValue
+          : null,
+      percentage: Number.isFinite(l.percentage) ? Math.round(l.percentage) : null,
+      resetsAt: Number.isFinite(l.nextResetTime) ? new Date(l.nextResetTime).toISOString() : null,
+    })),
+  };
+}
+
+// usageSnapshotOrThrow is what the MCP usage_get tool actually calls:
+// usageSnapshot plus the one policy decision that belongs beside it rather
+// than in index.js's orchestration -- an EMPTY cache must be an ERROR, not a
+// degradation. The status line has a blank to fall back to; a tool call has
+// no such fallback, and answering `{windows: []}` to "how much usage is
+// left" reads as "unlimited" rather than as "not fetched yet". Pulled out
+// as its own pure function (data + a timestamp in, an object or a throw
+// out) so this policy is unit-testable the same way every other rule in
+// this file is, rather than living unreachably inside index.js, which
+// exports nothing.
+export function usageSnapshotOrThrow(data, cachedAt) {
+  if (!data) throw new Error('usage has not been fetched yet; retry shortly');
+  return { ...usageSnapshot(data), cachedAt: new Date(cachedAt).toISOString() };
 }
 
 function utc(epochMs) {

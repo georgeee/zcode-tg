@@ -6,7 +6,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { renderUsage, usagePercentages } from '../bridge/usage.js';
+import { renderUsage, usagePercentages, usageSnapshot, usageSnapshotOrThrow } from '../bridge/usage.js';
 
 const LIVE_PAYLOAD = {
   code: 200,
@@ -76,4 +76,54 @@ test('usagePercentages rounds, and tolerates missing windows / junk input', () =
   assert.deepEqual(usagePercentages({ limits: [{ unit: 6, percentage: 5 }] }), { shortPct: null, weekPct: 5 });
   assert.deepEqual(usagePercentages({}), { shortPct: null, weekPct: null });
   assert.deepEqual(usagePercentages(null), { shortPct: null, weekPct: null });
+});
+
+// --- usageSnapshot: the same data as plain fields, for the MCP usage_get
+// tool, where the API's misleading names (`usage` is the cap, `currentValue`
+// is what's used) must not leak through ---
+
+test('usageSnapshot renames the confusing fields and keeps the level', () => {
+  const out = usageSnapshot(LIVE_PAYLOAD.data);
+  assert.equal(out.level, 'lite');
+  assert.equal(out.windows.length, 2);
+  const shortTerm = out.windows[0];
+  assert.equal(shortTerm.window, 'Short-term (~5h)');
+  assert.equal(shortTerm.used, 127); // was currentValue
+  assert.equal(shortTerm.cap, 2000); // was usage
+  assert.equal(shortTerm.remaining, 1872);
+  assert.equal(shortTerm.percentage, 6);
+  assert.equal(shortTerm.resetsAt, new Date(1788233217027).toISOString());
+});
+
+test('usageSnapshot falls back to cap-minus-used when remaining is absent', () => {
+  const out = usageSnapshot({ limits: [{ unit: 3, number: 5, usage: 100, currentValue: 40, percentage: 40, nextResetTime: 0 }] });
+  assert.equal(out.windows[0].remaining, 60);
+});
+
+test('usageSnapshot tolerates missing/junk input without throwing', () => {
+  assert.deepEqual(usageSnapshot(null), { level: null, windows: [] });
+  assert.deepEqual(usageSnapshot({}), { level: null, windows: [] });
+  const out = usageSnapshot({ limits: [{ unit: 3 }] });
+  assert.deepEqual(out.windows[0], {
+    window: 'Short-term (~undefinedh)', // windowLabel's own degradation for a missing `number`, not usageSnapshot's concern
+    used: null,
+    cap: null,
+    remaining: null,
+    percentage: null,
+    resetsAt: null,
+  });
+});
+
+// --- usageSnapshotOrThrow: usage_get's own policy, an empty cache is an
+// error rather than a silent "no usage" answer ---
+
+test('usageSnapshotOrThrow returns the reshaped data plus when it was fetched', () => {
+  const out = usageSnapshotOrThrow(LIVE_PAYLOAD.data, 1788233217027 - 10 * 60 * 1000);
+  assert.equal(out.level, 'lite');
+  assert.equal(out.windows.length, 2);
+  assert.equal(out.cachedAt, new Date(1788233217027 - 10 * 60 * 1000).toISOString());
+});
+
+test('usageSnapshotOrThrow refuses to answer before anything has been fetched', () => {
+  assert.throws(() => usageSnapshotOrThrow(null, 0), /has not been fetched yet/);
 });

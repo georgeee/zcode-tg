@@ -65,7 +65,7 @@ import { Store } from './store.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
 import { ProgressReporter } from './progress.js';
-import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages } from './usage.js';
+import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages, usageSnapshotOrThrow } from './usage.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
 // a session running in this same directory could read that file as part of
@@ -1243,36 +1243,64 @@ function parseModelRef(ref) {
 //     deleted, new posted + pinned + id re-stored) so exactly one exists.
 const topicStatus = new Map(); // threadId -> { messageId, pinned, gone }
 
-// Usage percentages for the status line, from the same quota endpoint
-// /usage reads. Cached with a TTL: status writes fire on every turn
-// start/end across every topic, and that endpoint is the account's
-// rate-limit-sensitive monitor -- one call per 5 minutes regardless of
-// traffic. The refresh is fire-and-forget, so a given write renders the
-// PREVIOUS cache; figures lag by at most one refresh cycle.
-let usagePct = { at: 0, shortPct: null, weekPct: null, warned: false };
-function refreshUsagePercentages() {
-  if (Date.now() - usagePct.at < 5 * 60_000) return;
-  usagePct.at = Date.now(); // set eagerly: concurrent writers don't stampede
+// The quota endpoint's last-known response, shared by the status line's
+// percentages AND the MCP usage_get tool a supervisor model may poll before
+// delegating each task. ONE cache rather than one per consumer: this
+// endpoint is the account's rate-limit-sensitive monitor (observed to 429
+// under load), and a second independent fetch path would double the
+// outbound rate exactly when the account is busiest, which is exactly when
+// that matters most. Cached with a TTL: status writes fire on every turn
+// start/end across every topic, and this is one call per 5 minutes
+// regardless of how much of that traffic there is.
+let usageCache = { at: 0, data: null, warned: false };
+
+// getUsageData refreshes the cache in the background if it is stale and
+// returns whatever is cached RIGHT NOW, stale or not.
+//
+// THE STALE VALUE, IMMEDIATELY, NEVER AWAITED: the status line already
+// relied on this shape (a write renders the PREVIOUS cache; figures lag by
+// at most one refresh cycle) before usage_get existed, and usage_get
+// inherits the identical contract for the identical reason -- a supervisor
+// asking "how much is left" gets an answer in milliseconds, at most 5
+// minutes stale, rather than blocking on a call to an endpoint that can
+// itself hang or 429.
+function getUsageData() {
+  if (Date.now() - usageCache.at < 5 * 60_000) return usageCache.data;
+  usageCache.at = Date.now(); // set eagerly: concurrent callers don't stampede
   fetchUsage({ apiKey: readZaiApiKey(cfg.zaiConfigPath) })
     .then((data) => {
-      usagePct = { ...usagePct, ...usagePercentages(data), warned: false };
+      usageCache = { at: Date.now(), data, warned: false };
     })
     .catch((e) => {
-      // Log once per failure streak, not per turn: this endpoint 429s when
-      // the account runs hot (observed live), and stale percentages are a
+      // Log once per failure streak, not per call: this endpoint 429s when
+      // the account runs hot (observed live), and a stale answer is a
       // degradation, not an emergency.
-      if (!usagePct.warned) {
-        usagePct.warned = true;
-        console.error(`[bridge] status usage refresh failed (percentages will lag or be omitted): ${e.message}`);
+      if (!usageCache.warned) {
+        usageCache.warned = true;
+        console.error(`[bridge] usage refresh failed (figures will lag or be omitted): ${e.message}`);
       }
     });
+  return usageCache.data; // the previous successful fetch, or null before the first one lands
+}
+
+function refreshUsagePercentages() {
+  getUsageData(); // fire-and-forget: this call alone is what keeps the cache warm
 }
 
 function statusUsageText() {
+  const { shortPct, weekPct } = usagePercentages(usageCache.data);
   const seg = [];
-  if (usagePct.shortPct != null) seg.push(`${usagePct.shortPct}% session`);
-  if (usagePct.weekPct != null) seg.push(`${usagePct.weekPct}% week`);
+  if (shortPct != null) seg.push(`${shortPct}% session`);
+  if (weekPct != null) seg.push(`${weekPct}% week`);
   return seg.length ? seg.join(' / ') : null;
+}
+
+// usageGetForMcp is the usage_get tool's handler: the cached data (see
+// getUsageData above), reshaped and policy-checked by usage.js's
+// usageSnapshotOrThrow -- an empty cache throws, which callTool turns into
+// isError: true with the reason, rather than a fabricated "no usage" answer.
+function usageGetForMcp() {
+  return usageSnapshotOrThrow(getUsageData(), usageCache.at);
 }
 
 // Owner-specified format (2026-09-01): one compact line -- one-word state,
@@ -2375,6 +2403,7 @@ async function main() {
       },
       repliesGet: (key, afterSeq) => ({ replies: mcp.repliesSince(key, afterSeq) }),
       modelGet: () => ({ model: cfg.defaultModel, switchable: false }),
+      usageGet: () => usageGetForMcp(),
     });
     // A failed listener (socket bind, chmod) must be LOUD: a silently dead
     // MCP endpoint inside a healthy-looking bridge is exactly how this went
