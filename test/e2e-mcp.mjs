@@ -133,6 +133,17 @@ try {
   const list = await mcp(mcpPort, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   check('tools/list advertises the six tools', list.body?.result?.tools?.length === 6, JSON.stringify(list.body));
 
+  // usage_get, on a bridge that has NEVER fetched usage before (this is its
+  // first call since boot) -- the exact cold-start case that used to answer
+  // with an error rather than awaiting one real fetch.
+  step('usage_get on a cold cache');
+  const usage = await tool(mcpPort, 'usage_get', {}, 9);
+  const usagePayload = JSON.parse(usage.body.result.content[0].text);
+  check('usage_get answers real data on the very first call, not an error',
+    usage.body.result.isError === false && Array.isArray(usagePayload.windows) && usagePayload.windows.length > 0,
+    JSON.stringify(usage.body));
+  check('usage_get reports when it fetched', typeof usagePayload.cachedAt === 'string', JSON.stringify(usagePayload));
+
   // session_create: a named topic appears in the chat, a session is born.
   step('session_create');
   const created = await tool(mcpPort, 'session_create', { name: 'mcp-e2e' }, 3);

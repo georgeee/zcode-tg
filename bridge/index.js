@@ -1252,26 +1252,28 @@ const topicStatus = new Map(); // threadId -> { messageId, pinned, gone }
 // that matters most. Cached with a TTL: status writes fire on every turn
 // start/end across every topic, and this is one call per 5 minutes
 // regardless of how much of that traffic there is.
-let usageCache = { at: 0, data: null, warned: false };
+let usageCache = { at: 0, data: null, pending: null, warned: false };
 
-// getUsageData refreshes the cache in the background if it is stale and
-// returns whatever is cached RIGHT NOW, stale or not.
+// ensureUsageFetch starts a fetch if the cache is stale and none is already
+// in flight, and returns whatever fetch IS in flight (possibly one a
+// concurrent caller already started), or null when the cache is fresh and
+// nothing needs to happen.
 //
-// THE STALE VALUE, IMMEDIATELY, NEVER AWAITED: the status line already
-// relied on this shape (a write renders the PREVIOUS cache; figures lag by
-// at most one refresh cycle) before usage_get existed, and usage_get
-// inherits the identical contract for the identical reason -- a supervisor
-// asking "how much is left" gets an answer in milliseconds, at most 5
-// minutes stale, rather than blocking on a call to an endpoint that can
-// itself hang or 429.
-function getUsageData() {
-  if (Date.now() - usageCache.at < 5 * 60_000) return usageCache.data;
+// SHARED, NOT RESTARTED: the status line and usage_get can both be asking
+// at once, and the second one to ask must join the first one's fetch rather
+// than opening a second connection to an endpoint that already 429s under
+// load.
+function ensureUsageFetch() {
+  if (Date.now() - usageCache.at < 5 * 60_000) return usageCache.pending;
+  if (usageCache.pending) return usageCache.pending;
   usageCache.at = Date.now(); // set eagerly: concurrent callers don't stampede
-  fetchUsage({ apiKey: readZaiApiKey(cfg.zaiConfigPath) })
+  const p = fetchUsage({ apiKey: readZaiApiKey(cfg.zaiConfigPath) })
     .then((data) => {
-      usageCache = { at: Date.now(), data, warned: false };
+      usageCache = { at: Date.now(), data, pending: null, warned: false };
+      return data;
     })
     .catch((e) => {
+      usageCache.pending = null;
       // Log once per failure streak, not per call: this endpoint 429s when
       // the account runs hot (observed live), and a stale answer is a
       // degradation, not an emergency.
@@ -1279,8 +1281,23 @@ function getUsageData() {
         usageCache.warned = true;
         console.error(`[bridge] usage refresh failed (figures will lag or be omitted): ${e.message}`);
       }
+      throw e;
     });
-  return usageCache.data; // the previous successful fetch, or null before the first one lands
+  usageCache.pending = p;
+  return p;
+}
+
+// getUsageData returns whatever is cached RIGHT NOW, stale or not, and
+// refreshes the cache in the background if it is due.
+//
+// THE STALE VALUE, IMMEDIATELY, NEVER AWAITED: a status write fires on
+// every turn start/end across every topic, and must never stall one on a
+// call to an endpoint that can itself hang or 429 -- so this renders the
+// PREVIOUS cache and figures lag by at most one refresh cycle, same as
+// before ensureUsageFetch existed.
+function getUsageData() {
+  ensureUsageFetch()?.catch(() => {}); // fire-and-forget: rejection is logged inside ensureUsageFetch already
+  return usageCache.data; // the previous successful fetch, or null before the first one ever lands
 }
 
 function refreshUsagePercentages() {
@@ -1295,12 +1312,29 @@ function statusUsageText() {
   return seg.length ? seg.join(' / ') : null;
 }
 
-// usageGetForMcp is the usage_get tool's handler: the cached data (see
-// getUsageData above), reshaped and policy-checked by usage.js's
-// usageSnapshotOrThrow -- an empty cache throws, which callTool turns into
-// isError: true with the reason, rather than a fabricated "no usage" answer.
-function usageGetForMcp() {
-  return usageSnapshotOrThrow(getUsageData(), usageCache.at);
+// usageGetForMcp is the usage_get tool's handler.
+//
+// A COLD CACHE AWAITS ONE FETCH RATHER THAN ERRORING. The status line has
+// nowhere to put a wait -- it fires inline with every turn -- but an MCP
+// tool call is exactly the place a real answer belongs: the gateway already
+// lets message_send block for up to ten minutes waiting on a model turn, so
+// blocking for the ~10s fetchUsage's own timeout allows, on the FIRST call
+// this bridge has ever made, is a real answer rather than a degradation. A
+// warm cache is still returned immediately, unawaited, exactly as before --
+// this only changes the one case that used to be an error a model had no
+// way to act on.
+async function usageGetForMcp() {
+  let data = usageCache.data;
+  if (!data) {
+    try {
+      data = await ensureUsageFetch();
+    } catch (e) {
+      throw new Error(`usage could not be fetched: ${e.message}`);
+    }
+  } else {
+    ensureUsageFetch()?.catch(() => {}); // still keep the cache warm in the background
+  }
+  return usageSnapshotOrThrow(data, usageCache.at);
 }
 
 // Owner-specified format (2026-09-01): one compact line -- one-word state,
