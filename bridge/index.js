@@ -66,6 +66,7 @@ import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
 import { ProgressReporter } from './progress.js';
 import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages, usageSnapshotOrThrow } from './usage.js';
+import { runtimePreferences } from './runtimePrefs.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
 // a session running in this same directory could read that file as part of
@@ -350,6 +351,13 @@ const pendingPrompts = new Map(); // threadId -> { parts: [promptText...], first
 // decline (same as the old auto-decline behavior, just later). One tap per
 // question; multiSelect questions are answered single-pick (documented
 // limitation -- Telegram buttons don't toggle).
+// ANSWERED, RATHER THAN LEFT TO THE "unregistered method" DEFAULT, because
+// that default is not neutral here: it is -32601, which the app-server reads
+// as "client too old" and answers by enabling its own bash prelude. See
+// runtimePrefs.js for the whole chain and why NATIVE_SEARCH_ENHANCEMENTS
+// exists.
+zcode.onServerRequest('session/requestRuntimePreferences', async () => runtimePreferences());
+
 zcode.onServerRequest('interaction/requestUserInput', async (params) => {
   const topic = sessionToTopic.get(params.sessionId);
   const questions = Array.isArray(params.questions) ? params.questions : [];

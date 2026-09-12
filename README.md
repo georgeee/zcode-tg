@@ -214,6 +214,35 @@ interactive Approve/Deny inline-keyboard prompts instead (this path is
 implemented and was verified working before the auto-approve default was
 added — see git history).
 
+### `NATIVE_SEARCH_ENHANCEMENTS` — for split-privilege deployments
+
+The zcode runtime asks the bridge, over `session/requestRuntimePreferences`,
+whether to enable its "native search enhancements". When enabled — which is
+what the runtime falls back to if nobody answers — it writes a per-session
+bash prelude (`bash-startup/<session>/embedded-search-startup-<hash>.sh`,
+shadowing `find`/`grep` with `bfs`/`ugrep`) at mode `0600`, and `source`s it
+at the head of every bash tool call.
+
+That is fine when the agent and its shell are the same OS account. It is not
+fine when they are deliberately different — as in a privilege-split
+deployment where the model's commands run as an unprivileged executor: the
+prelude belongs to the agent, `source` needs read permission, and every
+single command prints
+
+```
+/bin/bash: line 1: .../embedded-search-startup-<hash>.sh: Permission denied
+```
+
+before its real output. The file's mode cannot be widened from outside (the
+runtime passes `0600` to `writeFileSync` *and* re-asserts it with
+`chmodSync`; a POSIX ACL does not survive that chmod, because chmod rewrites
+the ACL mask from the group bits and `0600`'s are zero).
+
+Set `NATIVE_SEARCH_ENHANCEMENTS=false` on such a deployment. The prelude is
+then never generated, the noise disappears, and nothing is lost — the
+shadowing was never in effect there anyway, since the `source` always failed.
+Default is on, for the single-account case that genuinely benefits from it.
+
 **This means messages in an allowed topic can run arbitrary tool calls
 (shell commands, file edits) with no human approval step**, on a host with
 no sandbox. The only gate is the `chat_id` + `user_id` allowlist in
