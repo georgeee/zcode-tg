@@ -2080,6 +2080,20 @@ function firePendingPrompt(threadId) {
 // Queue an incoming prompt, merging into the newest entry when it landed
 // within the input-merge window -- the queue-side half of the Telegram
 // split-message defense (see the merge window in handleMessage).
+// stranded tells an MCP caller parked on this conversation that the turn it
+// asked for will never answer.
+//
+// EVERY CALL SITE IS ONE THAT ALREADY POSTS A NOTICE TO THE TOPIC. Those
+// notices resolve the story for a Telegram user and used to resolve nothing
+// at all for an MCP caller, which sat out the full ten-minute wait and was
+// then told the turn might still be running -- about a turn that was never
+// started, or a message that was dropped outright. A no-op when nobody is
+// parked, which is every Telegram-driven prompt.
+function stranded(key, reason) {
+  const n = mcp?.failWaitersFor(key, reason) ?? 0;
+  if (n) console.error(`[bridge] told ${n} parked MCP caller(s) on ${key}: ${reason}`);
+}
+
 async function enqueuePrompt(threadId, promptText, noticeText) {
   const queue = store.getQueue(threadId);
   if (queue.length >= cfg.maxQueuePerTopic) {
@@ -2088,6 +2102,7 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
       messageThreadId: threadOf(threadId),
       text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. /stop to cancel the running turn.`,
     });
+    stranded(threadId, `this conversation's queue is full (${cfg.maxQueuePerTopic}), so the message was DROPPED, not queued. Nothing will answer it. Wait for the running turn to finish, or stop it.`);
     return;
   }
   const last = queue[queue.length - 1];
@@ -2122,6 +2137,7 @@ async function dispatchUserPrompt(threadId, promptText, command) {
         messageThreadId: threadOf(threadId),
         text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. Try again once the bridge is back.`,
       });
+      stranded(threadId, `this conversation's queue is full (${cfg.maxQueuePerTopic}) and the bridge is restarting, so the message was DROPPED, not queued. Nothing will answer it. Send it again once the bridge is back.`);
       return;
     }
     await enqueuePrompt(threadId, promptText, `📥 Queued (position ${queue.length + 1}) — the bridge is deploying an update and will run this once it's back (usually a few seconds).`);
@@ -2140,6 +2156,7 @@ async function dispatchUserPrompt(threadId, promptText, command) {
     await tg
       .sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Couldn't start a session: ${e.message}` })
       .catch((sendErr) => console.error('[bridge] failed to post session-creation failure notice:', sendErr.message));
+    stranded(threadId, `the agent session could not be started, so this message was never delivered to a model: ${e.message}`);
     return;
   }
   let sessionId = session.sessionId;
@@ -2308,6 +2325,10 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
       }
     }
 
+    // BEFORE THE TELEGRAM EDIT, NOT AFTER. That edit is a network round trip,
+    // and on the path this most often fires for -- the runtime dying -- the
+    // process is already counting down to exit behind it.
+    stranded(threadId, `the prompt could not be handed to the model, so this turn never ran and nothing will answer it: ${e.message}`);
     await tg
       .editMessageText({ chatId: chatOf(threadId), messageId: placeholderMessageId, text: `⚠️ Failed to send: ${e.message}` })
       .catch((editErr) => console.error('[bridge] failed to edit failure notice:', editErr.message));
@@ -2342,6 +2363,7 @@ async function drainQueue(threadId) {
     await tg
       .editMessageText({ chatId: chatOf(threadId), messageId: next.placeholderMessageId, text: `⚠️ Couldn't start a session: ${e.message}` })
       .catch(() => {});
+    stranded(threadId, `this message reached the front of the queue and the agent session could not be started, so nothing will answer it: ${e.message}`);
     await drainQueue(threadId); // give the one behind it the same chance
     return;
   }

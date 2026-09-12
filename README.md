@@ -339,6 +339,20 @@ junior agent is broken and I do not know why" is a different decision from
 redeploy gets the corresponding sentence, matching the notice the Telegram
 side has always had in its topic.
 
+**The same applies to a turn that dies without the bridge dying.** Three
+paths post an apology to the topic and then return normally — the session
+could not be created, `session/send` was rejected or timed out, the queue was
+full and the message was dropped. For a Telegram user those notices are the
+whole story; an MCP caller used to get nothing from them and sat out the full
+ten minutes. Each now fails the parked caller for THAT conversation only,
+with the same information at the same moment, and leaves every other topic
+waiting.
+
+What is still a genuine wait: a runtime that HANGS rather than dies. Nothing
+resolves, nothing rejects, and the ten-minute timeout is the honest answer —
+"no reply within 600s, the turn may still be running; use `replies_get`" is
+true in that case, which is the one case it was ever meant for.
+
 **Auto-picked `session_create` targets.** The Bot API has no "list the chats
 this bot is in", so the bridge remembers every group it has served (owner
 message seen, topic created, bot added — persisted in the store, throttled to

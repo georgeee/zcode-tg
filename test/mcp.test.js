@@ -18,6 +18,7 @@ async function startGateway(t, impl) {
     noteReply: (k, text) => gw.noteReply(k, text),
     waitReply: (k) => gw.waitReply(k),
     failAll: (why) => gw.failWaiters(why),
+    failOne: (key, why) => gw.failWaitersFor(key, why),
     replies: (k) => gw.repliesSince(k),
   };
 }
@@ -288,4 +289,45 @@ test('a dispatch that throws still throws, and does not wait for a reply', async
   const { raceReply } = await import('../bridge/mcp.js');
   const pending = new Promise(() => {}); // never settles
   await assert.rejects(raceReply(pending, Promise.reject(new Error('session is closed'))), /session is closed/);
+});
+
+// ONE CONVERSATION'S TURN CAN DIE WITHOUT THE BRIDGE DYING. Session creation
+// failing, session/send being rejected, a full queue dropping the message:
+// each already posts a notice to the Telegram topic and then returns
+// normally, so for an MCP caller they were ten minutes of silence about a
+// turn that was never started. Every other topic must be untouched.
+test('failing one conversation leaves the others parked', async (t) => {
+  const h = await startGateway(t, {});
+  t.after(() => h.close());
+
+  const mine = h.waitReply('-100:7');
+  const theirs = h.waitReply('-100:8');
+  mine.catch(() => {});
+
+  assert.equal(h.failOne('-100:7', 'the queue is full, so this was dropped'), 1);
+  await assert.rejects(mine, /dropped/);
+
+  // The other conversation is still waiting, and still answerable.
+  h.noteReply('-100:8', 'their answer');
+  assert.equal((await theirs).text, 'their answer');
+});
+
+test('failing a conversation nobody is waiting on is a no-op', async (t) => {
+  const h = await startGateway(t, {});
+  t.after(() => h.close());
+  assert.equal(h.failOne('-100:9', 'nothing to say'), 0);
+});
+
+// failWaiters is failWaitersFor over every key, so a bridge-wide failure must
+// still reach conversations it has never heard a reply from.
+test('the bridge-wide failure still reaches every conversation', async (t) => {
+  const h = await startGateway(t, {});
+  t.after(() => h.close());
+  const a = h.waitReply('-100:1');
+  const b = h.waitReply('-100:2');
+  a.catch(() => {});
+  b.catch(() => {});
+  assert.equal(h.failAll('the runtime died'), 2);
+  await assert.rejects(a, /the runtime died/);
+  await assert.rejects(b, /the runtime died/);
 });

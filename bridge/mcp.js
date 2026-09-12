@@ -104,14 +104,27 @@ export function createMcpGateway({
   // plainly instead of dressing up as a timeout.
   function failWaiters(reason) {
     let n = 0;
-    for (const list of waiters.values()) {
-      for (const w of list) {
-        w.reject(new Error(reason));
-        n++;
-      }
-    }
-    waiters.clear();
+    for (const key of [...waiters.keys()]) n += failWaitersFor(key, reason);
     return n;
+  }
+
+  // failWaitersFor is the same thing for ONE conversation: this turn will
+  // never produce a reply, but the bridge is fine and every other topic is
+  // unaffected.
+  //
+  // THE PATHS THAT NEED IT ARE THE ONES THAT ALREADY APOLOGISE IN TELEGRAM.
+  // Three of them -- session creation failing, session/send being rejected or
+  // timing out, and a full queue dropping the message -- post a visible
+  // notice to the topic and then RETURN NORMALLY. For a Telegram user that is
+  // the whole story. For an MCP caller it was a ten-minute silence ending in
+  // "the turn may still be running", about a turn that was never started.
+  // Whoever asked deserves the same sentence at the same moment, whichever
+  // frontend they typed into.
+  function failWaitersFor(key, reason) {
+    const list = waiters.get(key) ?? [];
+    for (const w of list) w.reject(new Error(reason));
+    waiters.delete(key);
+    return list.length;
   }
 
   function repliesSince(key, afterSeq = 0) {
@@ -418,6 +431,7 @@ export function createMcpGateway({
     noteReply,
     waitReply,
     failWaiters,
+    failWaitersFor,
     repliesSince,
     wire,
     address: () => server.address(),
