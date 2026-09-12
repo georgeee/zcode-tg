@@ -317,6 +317,28 @@ notice the Telegram user would see. `message_send` rides the ordinary
 dispatch pipeline: queueing behind a running turn, deploy-drain semantics,
 and the reply footer are all shared with the Telegram path.
 
+**When the reply cannot come, the caller is told, and told what is not
+known.** Two events make a reply impossible: the zcode runtime exiting
+underneath the turn, and the bridge itself restarting. Both used to leave the
+caller parked for the full ten minutes and then hand it "the turn may still be
+running", which by then was false — and usually not even that, because the
+process exited first and the caller simply saw its connection drop, which
+reads exactly like a network hiccup. Every parked `message_send` is now failed
+first, with a sentence that states the cause is NOT established:
+
+> the zcode runtime exited while this turn was running (code=null
+> signal=SIGKILL). The bridge does not know why: a process killed by a signal
+> cannot report anything on its way out. SIGKILL here is most often the kernel
+> out-of-memory killer — this host, or this pod, ran out of memory. The turn is
+> lost and no partial answer was delivered. The bridge restarts automatically;
+> retry in a few seconds […]
+
+The point of the wording is that a supervising model can act on it: "the
+junior agent is broken and I do not know why" is a different decision from
+"the junior agent is thinking", and the two used to be indistinguishable. A
+redeploy gets the corresponding sentence, matching the notice the Telegram
+side has always had in its topic.
+
 **Auto-picked `session_create` targets.** The Bot API has no "list the chats
 this bot is in", so the bridge remembers every group it has served (owner
 message seen, topic created, bot added — persisted in the store, throttled to

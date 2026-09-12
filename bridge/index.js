@@ -207,7 +207,37 @@ const zcode = new ZcodeClient({
 
 zcode.on('exit', ({ code, signal }) => {
   console.error(`[bridge] zcode app-server exited unexpectedly (code=${code} signal=${signal}); exiting so the service manager restarts us`);
-  process.exit(1);
+
+  // TELL THE MCP CALLER BEFORE THE SOCKET GOES. A supervising model parked in
+  // message_send has no other way to learn this: exiting first drops its
+  // connection mid-request, which arrives as a transport error indistinguishable
+  // from a network hiccup, and if it somehow survives that it waits out the full
+  // ten-minute timeout and is then told "the turn may still be running" -- which
+  // by then is a lie.
+  //
+  // THE MESSAGE ADMITS IGNORANCE ON PURPOSE. A process killed by a signal
+  // reports nothing on its way out, so this bridge genuinely does not know
+  // whether the runtime crashed, was OOM-killed, or was stopped by a person.
+  // Naming SIGKILL and the most likely cause, while saying plainly that the
+  // cause is not established, is more useful to a model deciding what to do
+  // next than either a confident guess or silence.
+  const killed = signal === 'SIGKILL' || code === 137;
+  const why =
+    `the zcode runtime exited while this turn was running (code=${code} signal=${signal}). ` +
+    'The bridge does not know why: a process killed by a signal cannot report anything on its way out. ' +
+    (killed
+      ? 'SIGKILL here is most often the kernel out-of-memory killer -- this host, or this pod, ran out of memory. '
+      : '') +
+    'The turn is lost and no partial answer was delivered. The bridge restarts automatically; retry in a few seconds, ' +
+    'and if it happens again the fleet is probably short of memory rather than the request being at fault.';
+  const stranded = mcp ? mcp.failWaiters(why) : 0;
+  if (stranded) console.error(`[bridge] failed ${stranded} parked MCP caller(s) with the reason above`);
+
+  // A BEAT FOR THOSE REPLIES TO REACH THE WIRE. The rejections above turn into
+  // JSON-RPC error responses written to a socket; process.exit() on the same
+  // tick discards them and the caller is back to a dropped connection.
+  if (stranded) setTimeout(() => process.exit(1), 250);
+  else process.exit(1);
 });
 zcode.on('stderr', (text) => process.stderr.write(`[zcode stderr] ${text}`));
 zcode.on('parseError', ({ line, error }) => console.error('[bridge] unparseable line from zcode:', error.message, line.slice(0, 200)));
@@ -293,6 +323,17 @@ async function shutdown(signal) {
       .catch((e) => console.error('[bridge] failed to notify an in-flight turn of shutdown:', e.message));
   });
   await Promise.race([Promise.allSettled(notifications), sleep(8000)]);
+
+  // THE SAME COURTESY THE TELEGRAM SIDE ALREADY GETS. The loop above edits
+  // every interrupted turn's placeholder to say the bridge is restarting; an
+  // MCP caller parked in message_send got nothing at all and sat out its full
+  // ten-minute timeout, on every ordinary redeploy.
+  mcp?.failWaiters(
+    'the bridge restarted (a deploy or a supervisor restart) while this turn was running, so the turn was ' +
+      'interrupted. Nothing partial was delivered. Send the message again once the bridge is back, usually a few seconds.',
+  );
+  await sleep(100); // let those rejections reach the socket before it closes
+
   zcode.stop();
   process.exit(0);
 }

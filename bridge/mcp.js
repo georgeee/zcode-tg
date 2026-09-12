@@ -29,7 +29,18 @@ const MAX_BODY = 1 << 20; // 1 MiB of JSON-RPC is far beyond any tool call
 const WAIT_TIMEOUT_MS = 10 * 60 * 1000; // a real model turn can take minutes
 const REPLY_LOG_LIMIT = 200; // per conversation, in memory
 
-export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = () => {} }) {
+export function createMcpGateway({
+  port,
+  unixSocket,
+  host = '127.0.0.1',
+  log = () => {},
+  // A SEAM FOR THE TESTS AND NOTHING ELSE. Ten minutes is the production
+  // value and the only one the bridge ever passes; a test that had to wait it
+  // out could not check the timeout path at all, and a test that had to wait
+  // it out ACCIDENTALLY -- because a waiter was left armed -- would hang the
+  // suite instead of failing it.
+  waitTimeoutMs = WAIT_TIMEOUT_MS,
+}) {
   // Two listeners, one JSON-RPC core:
   // - unixSocket: a per-fleet unix domain socket speaking LINE-delimited
   //   JSON-RPC (the stdio-MCP wire format, one request per line, one response
@@ -63,12 +74,44 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
       const timer = setTimeout(() => {
         const i = (waiters.get(key) ?? []).indexOf(entry);
         if (i >= 0) (waiters.get(key) ?? []).splice(i, 1);
-        reject(new Error(`no reply within ${WAIT_TIMEOUT_MS / 1000}s -- the turn may still be running; use replies_get`));
-      }, WAIT_TIMEOUT_MS);
-      const entry = { resolve: (v) => { clearTimeout(timer); resolve(v); }, timer };
+        reject(new Error(`no reply within ${waitTimeoutMs / 1000}s -- the turn may still be running; use replies_get`));
+      }, waitTimeoutMs);
+      const entry = {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+        timer,
+      };
       list.push(entry);
       waiters.set(key, list);
     });
+  }
+
+  // failWaiters ends every parked message_send with a stated reason.
+  //
+  // WHY THIS EXISTS. A waiter's only other exit is the ten-minute timeout,
+  // and the two events that most often make a reply impossible -- the zcode
+  // runtime being killed, and the bridge itself restarting -- both used to
+  // leave the caller sitting through all ten of those minutes and then
+  // reading "the turn may still be running", which was false. Worse, the
+  // process usually exited first, so the caller got a dropped socket instead
+  // of any sentence at all: a supervising model saw a transport error and had
+  // no way to tell "the junior agent is broken" from "the junior agent is
+  // thinking".
+  //
+  // The reason is passed in rather than composed here because only the caller
+  // knows it, and because the honest version of it is usually "something
+  // failed and this process cannot tell you why" -- which is worth saying
+  // plainly instead of dressing up as a timeout.
+  function failWaiters(reason) {
+    let n = 0;
+    for (const list of waiters.values()) {
+      for (const w of list) {
+        w.reject(new Error(reason));
+        n++;
+      }
+    }
+    waiters.clear();
+    return n;
   }
 
   function repliesSince(key, afterSeq = 0) {
@@ -374,6 +417,7 @@ export function createMcpGateway({ port, unixSocket, host = '127.0.0.1', log = (
     ready,
     noteReply,
     waitReply,
+    failWaiters,
     repliesSince,
     wire,
     address: () => server.address(),

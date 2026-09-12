@@ -17,6 +17,7 @@ async function startGateway(t, impl) {
     close: () => gw.close(),
     noteReply: (k, text) => gw.noteReply(k, text),
     waitReply: (k) => gw.waitReply(k),
+    failAll: (why) => gw.failWaiters(why),
     replies: (k) => gw.repliesSince(k),
   };
 }
@@ -165,4 +166,92 @@ test('unknown tool names an error', async (t) => {
   const r = await rpc(h.url, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'nope', arguments: {} } });
   assert.equal(r.body.result.isError, true);
   assert.match(r.body.result.content[0].text, /unknown tool/);
+});
+
+// A PARKED CALLER MUST BE TOLD, NOT LEFT TO TIME OUT.
+//
+// message_send blocks for up to ten minutes waiting for the agent's reply.
+// When the runtime dies under it -- OOM kill, crash, a redeploy -- there will
+// never be a reply, and the two things that used to happen instead were both
+// worse than useless: the bridge exited and the caller saw a dropped socket,
+// or (if it survived) the caller waited out all ten minutes and was told "the
+// turn may still be running", which by then is false.
+//
+// Driven through the real JSON-RPC surface rather than by calling the waiter
+// directly, because what is being tested is what a SUPERVISING MODEL reads.
+test('a parked message_send is failed with a stated reason when the runtime dies', async (t) => {
+  let released;
+  const h = await startGateway(t, {
+    // Never resolves on its own: this is the turn that will never come back.
+    messageSend: async (key, text, wait) => {
+      if (!wait) return { queued: true, key };
+      const reply = await h.waitReply(key);
+      return { reply: reply.text, at: reply.at };
+    },
+  });
+  t.after(() => h.close());
+
+  const call = rpc(h.url, {
+    jsonrpc: '2.0', id: 40, method: 'tools/call',
+    params: { name: 'message_send', arguments: { key: '-100:7', text: 'status?', wait: true } },
+  });
+  // Let the request reach the handler and park before failing it.
+  await new Promise((r) => setTimeout(r, 50));
+  released = h.failAll('the zcode runtime exited while this turn was running (code=null signal=SIGKILL). ' +
+    'The bridge does not know why.');
+  assert.equal(released, 1, 'the parked caller was not found');
+
+  const r = await call;
+  const text = JSON.stringify(r.body);
+  assert.match(text, /SIGKILL/, 'the reason never reached the caller');
+  assert.match(text, /does not know why/, 'the caller is not told the cause is unknown');
+});
+
+// AND NOTHING IS FAILED THAT IS NOT WAITING. failWaiters runs on every
+// runtime exit, including the ordinary ones with no MCP traffic at all.
+test('failing the waiters when nobody is waiting is a no-op', async (t) => {
+  const h = await startGateway(t, {});
+  t.after(() => h.close());
+  assert.equal(h.failAll('anything'), 0);
+});
+
+// A FAILED WAITER MUST NOT BE FIRED TWICE. A second failure, or a reply that
+// lands after one, would settle an already-settled promise -- harmless in
+// JavaScript, but it also means the waiter was left in the map, which leaks
+// one entry per dead turn for the life of the process.
+test('a failed waiter is forgotten, not left in the map', async (t) => {
+  const h = await startGateway(t, {});
+  t.after(() => h.close());
+  const pending = h.waitReply('-100:9');
+  pending.catch(() => {});
+  assert.equal(h.failAll('gone'), 1);
+  assert.equal(h.failAll('gone again'), 0, 'the waiter survived being failed');
+  // A reply arriving late must not throw on a cleared waiter list.
+  h.noteReply('-100:9', 'a late reply');
+  assert.equal(h.replies('-100:9').length, 1);
+});
+
+// THE TIMEOUT PATH, AT A SPEED A TEST CAN OBSERVE. Two things are pinned:
+// that an unanswered wait ends in a stated error rather than hanging forever,
+// and that a waiter failed for another reason stays settled afterwards even
+// once its original deadline passes. (The clearTimeout that makes the second
+// one tidy is not itself observable -- a late timer merely rejects an
+// already-settled promise -- so this covers the behaviour, not that line.)
+test('an unanswered wait ends in a stated timeout, and a failed one stays failed', async () => {
+  const { createMcpGateway } = await import('../bridge/mcp.js');
+  const gw = createMcpGateway({ port: 0, log: () => {}, waitTimeoutMs: 60 });
+  gw.wire({});
+  await gw.ready;
+  try {
+    await assert.rejects(gw.waitReply('-100:1'), /no reply within 0.06s/);
+
+    const failed = gw.waitReply('-100:2');
+    failed.catch(() => {});
+    assert.equal(gw.failWaiters('the runtime died'), 1);
+    await assert.rejects(failed, /the runtime died/);
+    // Past the timeout: if the timer were still armed it would fire here.
+    await new Promise((r) => setTimeout(r, 120));
+  } finally {
+    await gw.close();
+  }
 });
