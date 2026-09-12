@@ -53,7 +53,7 @@
 // unit); it does not daemonize itself.
 
 import { randomBytes } from 'node:crypto';
-import { createMcpGateway } from './mcp.js';
+import { createMcpGateway, raceReply } from './mcp.js';
 import { pickForumChat } from './chatpick.js';
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -236,6 +236,10 @@ zcode.on('exit', ({ code, signal }) => {
   // A BEAT FOR THOSE REPLIES TO REACH THE WIRE. The rejections above turn into
   // JSON-RPC error responses written to a socket; process.exit() on the same
   // tick discards them and the caller is back to a dropped connection.
+  //
+  // 250ms IS ONLY ENOUGH BECAUSE message_send RACES (see raceReply). Awaiting
+  // the dispatch first would put a Telegram round trip between the rejection
+  // and the response, and this timer would routinely lose to it.
   if (stranded) setTimeout(() => process.exit(1), 250);
   else process.exit(1);
 });
@@ -2476,13 +2480,18 @@ async function main() {
         // registered only after dispatch resolves.
         const pending = mcp.waitReply(key);
         try {
-          await dispatchUserPrompt(key, text);
+          // RACED, NOT SEQUENCED -- see raceReply. Awaiting the dispatch first
+          // and the waiter second means a waiter FAILED by failWaiters (the
+          // runtime died, the bridge is restarting) cannot be reported until
+          // the dispatch has finished unwinding, which on that exact path
+          // includes a Telegram round trip while the process is already
+          // counting down to exit.
+          const reply = await raceReply(pending, dispatchUserPrompt(key, text));
+          return { reply: reply.text, at: reply.at };
         } catch (e) {
-          pending.catch(() => {}); // abandoned waiter times out quietly
+          pending.catch(() => {}); // an abandoned waiter must not go unhandled
           throw e;
         }
-        const reply = await pending;
-        return { reply: reply.text, at: reply.at };
       },
       repliesGet: (key, afterSeq) => ({ replies: mcp.repliesSince(key, afterSeq) }),
       modelGet: () => ({ model: cfg.defaultModel, switchable: false }),

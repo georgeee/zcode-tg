@@ -255,3 +255,37 @@ test('an unanswered wait ends in a stated timeout, and a failed one stays failed
     await gw.close();
   }
 });
+
+// THE ORDERING BUG failWaiters ALONE DID NOT FIX.
+//
+// message_send's obvious shape is "await the dispatch, then await the reply".
+// That defeats failWaiters completely: the waiter's failure is only OBSERVED
+// at the second await, and the first one does not fail when the runtime dies
+// -- startTurn catches the rejected session/send, edits the Telegram
+// placeholder, and resolves. So the caller learns nothing until a network
+// round trip finishes, on the one path where the process is counting down to
+// exit. These pin the race that fixes it.
+test('a waiter failed mid-turn is reported without waiting for the dispatch', async () => {
+  const { raceReply } = await import('../bridge/mcp.js');
+  let finishDispatch;
+  const dispatched = new Promise((r) => { finishDispatch = r; }); // never resolves here
+  const pending = Promise.reject(new Error('the runtime died'));
+
+  await assert.rejects(raceReply(pending, dispatched), /the runtime died/);
+  finishDispatch(); // the dispatch limping to a finish afterwards changes nothing
+});
+
+test('the ordinary case is unchanged: the dispatch resolves, then the reply lands', async () => {
+  const { raceReply } = await import('../bridge/mcp.js');
+  let land;
+  const pending = new Promise((r) => { land = r; });
+  const dispatched = Promise.resolve();
+  setTimeout(() => land({ text: 'the answer', at: 'now' }), 20);
+  assert.deepEqual(await raceReply(pending, dispatched), { text: 'the answer', at: 'now' });
+});
+
+test('a dispatch that throws still throws, and does not wait for a reply', async () => {
+  const { raceReply } = await import('../bridge/mcp.js');
+  const pending = new Promise(() => {}); // never settles
+  await assert.rejects(raceReply(pending, Promise.reject(new Error('session is closed'))), /session is closed/);
+});

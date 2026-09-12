@@ -424,3 +424,30 @@ export function createMcpGateway({
     unixSocket,
   };
 }
+
+
+// raceReply is message_send's ordering rule, and it exists because the
+// obvious sequential version defeats failWaiters entirely.
+//
+// THE SHAPE THAT DOES NOT WORK:
+//
+//	await dispatch(...);        // "send the prompt"
+//	const reply = await pending; // "now wait for the answer"
+//
+// The waiter's failure is only OBSERVED at the second line, so it cannot be
+// reported until the first one finishes. And the first one does not fail when
+// the runtime dies: the bridge's own startTurn catches a rejected
+// session/send, edits the Telegram placeholder to say so, and RESOLVES -- a
+// network round trip to Telegram, on a path where the process is already
+// counting down to exit. Measured against that: failWaiters rejects the
+// waiter instantly and the caller still learns nothing, because the socket
+// closes before the sequential await gets there.
+//
+// So the two are raced. A waiter failure surfaces on the microtask after
+// failWaiters runs, with no dependency on how long the dispatch takes to
+// unwind or whether it reports anything at all. The `.then(() => pending)`
+// arm preserves the normal case exactly: a dispatch that succeeds still hands
+// over to the same waiter, and a dispatch that throws still throws.
+export function raceReply(pending, dispatched) {
+  return Promise.race([pending, dispatched.then(() => pending)]);
+}
