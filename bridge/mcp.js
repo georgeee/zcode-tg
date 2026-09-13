@@ -227,6 +227,8 @@ export function createMcpGateway({
       description:
         'Return this account\'s Z.ai coding-plan usage, per quota window (short-term and weekly): credits used, the cap, what remains, and when it resets — READ-ONLY. Lets a supervisor model track spend across the sessions it delegates without going through Telegram\'s /usage command. Figures may lag up to 5 minutes: the account\'s usage endpoint is rate-limit-sensitive, so this is served from the same cache the topic status line uses rather than fetched fresh on every call.',
       inputSchema: { type: 'object', properties: {} },
+    },
+    {
       name: 'model_set',
       description:
         "Switch a session's model. Codex only, and only among the same three tiers session_create offers (gpt-5.6-luna/terra/sol) -- zcode and mock sessions, and gpt-6-astra, all refuse with a clear error, not a silent no-op.",
