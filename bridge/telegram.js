@@ -9,6 +9,10 @@
 
 const API_ROOT = process.env.TELEGRAM_API_ROOT || 'https://api.telegram.org';
 
+// sendMessage's 429 budget: total attempts (the initial try plus retries)
+// before the 429 goes back to the caller.
+const RATE_LIMIT_ATTEMPTS = 3;
+
 export class TelegramClient {
   constructor({ token }) {
     if (!token) throw new Error('TelegramClient: token required');
@@ -24,7 +28,16 @@ export class TelegramClient {
     });
     const json = await res.json();
     if (!json.ok) {
-      throw new Error(`telegram ${method} failed: ${json.description || res.status}`);
+      const err = new Error(`telegram ${method} failed: ${json.description || res.status}`);
+      // 429 carries the wait Telegram demands, structured in parameters (and
+      // echoed in the description text). Attached to the error so sendMessage
+      // can honor it with a bounded retry; every other caller sees a plain
+      // error, as before.
+      if (json.error_code === 429) {
+        const parsed = json.parameters?.retry_after ?? (json.description || '').match(/retry after (\d+)/i)?.[1];
+        err.retryAfterS = Number(parsed ?? 1);
+      }
+      throw err;
     }
     return json.result;
   }
@@ -43,15 +56,29 @@ export class TelegramClient {
     return this._call('leaveChat', { chat_id: chatId });
   }
 
-  sendMessage({ chatId, messageThreadId, text, replyMarkup, replyToMessageId, parseMode }) {
-    return this._call('sendMessage', {
+  // The one call the bridge floods hardest (prompt mirrors, placeholders,
+  // notices, reply chunks) is also the one Telegram rate-limits hardest, and
+  // an unanswered 429 used to fail the caller outright. Honor retry_after:
+  // wait what the API demanded (bounded), retry, and only surface the 429
+  // after RATE_LIMIT_ATTEMPTS total attempts. Non-429 failures are not
+  // retried -- a 400 will fail identically forever.
+  async sendMessage({ chatId, messageThreadId, text, replyMarkup, replyToMessageId, parseMode }) {
+    const body = {
       chat_id: chatId,
       message_thread_id: messageThreadId,
       text,
       reply_markup: replyMarkup,
       reply_to_message_id: replyToMessageId,
       parse_mode: parseMode,
-    });
+    };
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this._call('sendMessage', body);
+      } catch (e) {
+        if (e.retryAfterS == null || attempt >= RATE_LIMIT_ATTEMPTS) throw e;
+        await sleep(Math.min(e.retryAfterS, 30) * 1000);
+      }
+    }
   }
 
   createForumTopic({ chatId, name, iconColor, iconCustomEmojiId }) {
@@ -160,4 +187,8 @@ export class TelegramClient {
     // prompts read better stacked than crammed side by side on mobile).
     return { inline_keyboard: buttons.map((b) => [{ text: b.text, callback_data: b.data }]) };
   }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }

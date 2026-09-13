@@ -22,6 +22,9 @@ mkdirSync(WS, { recursive: true });
 
 const calls = { send: [], edit: [], topicCreated: [], topicClosed: [] };
 let nextMsgId = 100, updateId = 1, nextThreadId = 55;
+// How many times the MCP prompt's Telegram mirror has been attempted; the
+// first two get Telegram's real 429 shape (see the sendMessage branch).
+let mirror429s = 0;
 
 const srv = createServer(async (req, res) => {
   let body = '';
@@ -39,6 +42,20 @@ const srv = createServer(async (req, res) => {
   }
   if (method === 'sendMessage') {
     const p = JSON.parse(body);
+    // THE HOTFIX SCENARIO (2026-09-12): a burst of message_sends trips
+    // Telegram's per-minute group cap, and the prompt MIRROR is what eats
+    // the 429s. Answer with the API's real 429 shape for the first two
+    // attempts; the bridge must honor retry_after, retry the mirror, and
+    // still deliver the prompt to the agent -- asserted below by the tool
+    // call returning the agent's reply and exactly three attempts seen.
+    if ((p.text ?? '').startsWith('Reply with exactly MCP-E2E-OK')) {
+      mirror429s++;
+      if (mirror429s <= 2) {
+        res.statusCode = 429;
+        res.setHeader('content-type', 'application/json');
+        return void res.end(JSON.stringify({ ok: false, error_code: 429, description: 'Too Many Requests: retry after 1', parameters: { retry_after: 1 } }));
+      }
+    }
     calls.send.push({ chat: p.chat_id, thread: p.message_thread_id, text: p.text });
     return ok({ message_id: nextMsgId++ });
   }
@@ -80,6 +97,10 @@ const bridge = spawn(NODE, [path.join(REPO, 'bridge/index.js')], {
     ZCODE_DEFAULT_MODEL: 'zai/glm-5.3-flash',
     ZCODE_DEFAULT_MODE: 'yolo',
     STORE_PATH: STORE,
+    // The honesty scenario below needs a fullable queue (cap 1) and no
+    // input-merge window (two rapid wait:false prompts must stay two entries).
+    MAX_QUEUE_PER_TOPIC: '1',
+    INPUT_MERGE_MS: '0',
     MCP_HTTP_PORT: '0', // ephemeral; the e2e reads the bound port from the boot log
     HOME: process.env.HOME, // the real z.ai credential, same as e2e-file
   },
@@ -175,6 +196,27 @@ try {
   const got = await tool(mcpPort, 'replies_get', { key: c1.key }, 5);
   const log = JSON.parse(got.body.result.content[0].text);
   check('replies_get returns the collected replies', (log.replies ?? []).some((x) => /MCP-E2E-OK/.test(x.text)), JSON.stringify(log).slice(0, 300));
+
+  // The 429 storm above actually happened to the mirror, and the bridge
+  // retried it within the retry_after budget instead of failing or eating
+  // the prompt: two refusals + one accepted send, and the checks above
+  // (reply returned, prompt mirrored) passed through it.
+  check('the rate-limited mirror was retried to success (2x 429 + 1 send)', mirror429s === 3, `mirror attempts: ${mirror429s}`);
+
+  // queued:true MUST MEAN THE AGENT HAS THE PROMPT. With the queue capped at
+  // one, a prompt sent while a turn runs queues honestly; the one after it
+  // is dropped -- and must reach the caller as a stated ERROR, not a lying
+  // {queued:true} that leaves it waiting on a reply that will never come
+  // (the four-silent-sessions failure measured live on 2026-09-12).
+  step('wait:false while busy: honest acks');
+  await tool(mcpPort, 'message_send', { key: c1.key, text: 'Reply with exactly MCP-E2E-BUSY and nothing else.', wait: false }, 11);
+  const busyAck = await tool(mcpPort, 'message_send', { key: c1.key, text: 'queued while the turn runs', wait: false }, 12);
+  const busyPayload = busyAck.body?.result?.isError ? null : JSON.parse(busyAck.body.result.content[0].text);
+  check('a prompt sent while busy acks queued:true', busyPayload?.queued === true, JSON.stringify(busyAck.body).slice(0, 300));
+  const dropAck = await tool(mcpPort, 'message_send', { key: c1.key, text: 'this one hits the full queue', wait: false }, 13);
+  check('a dropped prompt is a stated error, not a lying ack',
+    dropAck.body?.result?.isError === true && /DROPPED|full/i.test(dropAck.body.result.content[0].text),
+    JSON.stringify(dropAck.body).slice(0, 300));
 
   // session_close: the topic closes, the key is marked closed.
   const closed = await tool(mcpPort, 'session_close', { key: c1.key }, 6);

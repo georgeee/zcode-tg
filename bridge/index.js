@@ -2083,6 +2083,10 @@ function firePendingPrompt(threadId) {
 // stranded tells an MCP caller parked on this conversation that the turn it
 // asked for will never answer.
 //
+// Same reason-or-null contract as dispatchUserPrompt: null once the prompt
+// is durably queued, the reason when the queue is full and the message was
+// dropped.
+//
 // EVERY CALL SITE IS ONE THAT ALREADY POSTS A NOTICE TO THE TOPIC. Those
 // notices resolve the story for a Telegram user and used to resolve nothing
 // at all for an MCP caller, which sat out the full ten-minute wait and was
@@ -2102,8 +2106,9 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
       messageThreadId: threadOf(threadId),
       text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. /stop to cancel the running turn.`,
     });
-    stranded(threadId, `this conversation's queue is full (${cfg.maxQueuePerTopic}), so the message was DROPPED, not queued. Nothing will answer it. Wait for the running turn to finish, or stop it.`);
-    return;
+    const why = `this conversation's queue is full (${cfg.maxQueuePerTopic}), so the message was DROPPED, not queued. Nothing will answer it. Wait for the running turn to finish, or stop it`;
+    stranded(threadId, why);
+    return why;
   }
   const last = queue[queue.length - 1];
   if (last && Date.now() - (last.at ?? 0) < cfg.inputMergeMs) {
@@ -2111,11 +2116,12 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
     last.at = Date.now();
     store.setQueue(threadId, queue);
     refreshTopicStatusForQueue(threadId);
-    return;
+    return null;
   }
   const notice = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: noticeText });
   store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id, at: Date.now() }]);
   refreshTopicStatusForQueue(threadId);
+  return null;
 }
 
 // Everything that happens AFTER a prompt is composed (merge window closed):
@@ -2123,6 +2129,13 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
 // turn start. Split out of handleMessage so the merge window can hand it
 // one combined prompt -- and so live-typed messages and debounced bursts
 // flow through the exact same code path.
+//
+// Returns null when the prompt is in the agent's hands (a turn started, or
+// the message durably queued behind one), or a human-readable reason when it
+// is not -- the same sentence stranded() gives a parked waiter, returned so
+// message_send can fail its caller instead of acking a prompt it dropped.
+// Callers that don't care (handleMessage, the merge window, and drainQueue
+// via startTurn) ignore the value.
 async function dispatchUserPrompt(threadId, promptText, command) {
   // A redeploy is draining: don't start anything new (getOrCreateSession
   // below can itself call session/create, work an about-to-restart process
@@ -2137,11 +2150,11 @@ async function dispatchUserPrompt(threadId, promptText, command) {
         messageThreadId: threadOf(threadId),
         text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. Try again once the bridge is back.`,
       });
-      stranded(threadId, `this conversation's queue is full (${cfg.maxQueuePerTopic}) and the bridge is restarting, so the message was DROPPED, not queued. Nothing will answer it. Send it again once the bridge is back.`);
-      return;
+      const why = `this conversation's queue is full (${cfg.maxQueuePerTopic}) and the bridge is restarting, so the message was DROPPED, not queued. Nothing will answer it. Send it again once the bridge is back`;
+      stranded(threadId, why);
+      return why;
     }
-    await enqueuePrompt(threadId, promptText, `📥 Queued (position ${queue.length + 1}) — the bridge is deploying an update and will run this once it's back (usually a few seconds).`);
-    return;
+    return enqueuePrompt(threadId, promptText, `📥 Queued (position ${queue.length + 1}) — the bridge is deploying an update and will run this once it's back (usually a few seconds).`);
   }
 
   let session;
@@ -2156,8 +2169,9 @@ async function dispatchUserPrompt(threadId, promptText, command) {
     await tg
       .sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Couldn't start a session: ${e.message}` })
       .catch((sendErr) => console.error('[bridge] failed to post session-creation failure notice:', sendErr.message));
-    stranded(threadId, `the agent session could not be started, so this message was never delivered to a model: ${e.message}`);
-    return;
+    const why = `the agent session could not be started, so this message was never delivered to a model: ${e.message}`;
+    stranded(threadId, why);
+    return why;
   }
   let sessionId = session.sessionId;
 
@@ -2188,9 +2202,9 @@ async function dispatchUserPrompt(threadId, promptText, command) {
     // Busy + ordinary message: queue it. The notice we post becomes the
     // turn's placeholder when the message is dequeued, so the reply lands on
     // the message the user already saw accepted. Rapid consecutive parts
-    // merge into the newest entry (Telegram split-message defense).
-    await enqueuePrompt(threadId, promptText, `📥 Queued (position ${store.getQueue(threadId).length + 1}) — runs when the current message finishes. /clearqueue to drop.`);
-    return;
+    // merge into the newest entry (Telegram split-message defense). The
+    // reason-or-null contract carries a full-queue drop back to the caller.
+    return enqueuePrompt(threadId, promptText, `📥 Queued (position ${store.getQueue(threadId).length + 1}) — runs when the current message finishes. /clearqueue to drop.`);
   }
 
   if (command === 'stop' || command === 'cancel') {
@@ -2199,7 +2213,7 @@ async function dispatchUserPrompt(threadId, promptText, command) {
   }
 
   const placeholder = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '⌛ …' });
-  await startTurn(threadId, session, promptText, placeholder.message_id);
+  return startTurn(threadId, session, promptText, placeholder.message_id);
 }
 
 // Attaches the turn's progress view, per cfg.streamProgress: the milestone
@@ -2240,6 +2254,10 @@ function turnLiveMessageId(turn) {
 // "resumed session rejects sends" quirk (see getOrCreateSession). Split out
 // of handleMessage so the queue drain starts turns through the exact same
 // code path a live-typed message takes.
+//
+// Same reason-or-null contract as dispatchUserPrompt: null once session/send
+// has accepted the prompt (the turn owns delivery from here), the reason
+// when the prompt was never handed to the model.
 async function startTurn(threadId, session, text, placeholderMessageId) {
   const sessionId = session.sessionId;
   busySessions.add(sessionId);
@@ -2255,6 +2273,7 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
 
   try {
     await zcode.call('session/send', { sessionId, content: text });
+    return null; // accepted -- the normal event-driven flow takes it from here
   } catch (e) {
     // session/send itself rejecting outright (as opposed to the turn later
     // completing with status "failed") is a different failure mode --
@@ -2299,7 +2318,7 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
         attachTurnView(freshTurn, { placeholderMessageId, threadId });
         activeTurns.set(freshSessionId, freshTurn);
         await zcode.call('session/send', { sessionId: freshSessionId, content: text });
-        return; // retry accepted -- the normal event-driven flow takes it from here
+        return null; // retry accepted -- the normal event-driven flow takes it from here
       } catch (retryErr) {
         // Clears the FRESH session's routing state -- the original
         // sessionId was already cleared above. (The pre-queue version of
@@ -2310,16 +2329,16 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
           busySessions.delete(freshSessionId);
           const freshTurn = activeTurns.get(freshSessionId);
           activeTurns.delete(freshSessionId);
+          // Stop the fresh turn's views explicitly -- they're no longer
+          // reachable through activeTurns for anything else to stop, and
+          // since the heartbeat timer (added 2026-09-01) runs
+          // unconditionally from construction, an unstopped one would keep
+          // firing forever and periodically clobber the "Failed to send"
+          // notice below with a stale re-render of a turn that never
+          // actually started.
           freshTurn?.streamer?.stop();
           freshTurn?.progress?.stop();
         }
-        // Stop it explicitly -- it's no longer reachable through
-        // activeTurns for anything else to stop it, and since the
-        // heartbeat timer (added 2026-09-01) runs unconditionally from
-        // construction, an unstopped one would keep firing forever and
-        // periodically clobber the "Failed to send" notice below with a
-        // stale re-render of a turn that never actually started.
-        freshStreamer?.stop();
         console.error(`[bridge] topic ${threadId}: retry with a fresh session also failed:`, retryErr);
         e = retryErr;
       }
@@ -2328,13 +2347,15 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
     // BEFORE THE TELEGRAM EDIT, NOT AFTER. That edit is a network round trip,
     // and on the path this most often fires for -- the runtime dying -- the
     // process is already counting down to exit behind it.
-    stranded(threadId, `the prompt could not be handed to the model, so this turn never ran and nothing will answer it: ${e.message}`);
+    const why = `the prompt could not be handed to the model, so this turn never ran and nothing will answer it: ${e.message}`;
+    stranded(threadId, why);
     await tg
       .editMessageText({ chatId: chatOf(threadId), messageId: placeholderMessageId, text: `⚠️ Failed to send: ${e.message}` })
       .catch((editErr) => console.error('[bridge] failed to edit failure notice:', editErr.message));
     // The message behind this failed one doesn't deserve to wait forever
     // just because its predecessor's send was rejected.
     void drainQueue(threadId);
+    return why;
   }
 }
 
@@ -2486,15 +2507,33 @@ async function main() {
         return { ok: true };
       },
       messageSend: async (key, text, wait) => {
-        // MIRROR THE PROMPT INTO THE TOPIC FIRST (the bot's identity, per
-        // the MCP contract), then dispatch through the SAME pipeline a
-        // Telegram message uses: queue/deploy-drain semantics, session
-        // creation, the turn, and the reply delivered back to the topic by
-        // the ordinary reply flow.
+        // Mirror the prompt into the topic (the bot's identity, per the MCP
+        // contract), then dispatch through the SAME pipeline a Telegram
+        // message uses: queue/deploy-drain semantics, session creation, the
+        // turn, and the reply delivered back to the topic by the ordinary
+        // reply flow.
+        //
+        // THE MIRROR IS A SIDE EFFECT; THE AGENT TURN IS THE POINT. Measured
+        // live (2026-09-12): a burst of message_sends 429'd the mirror
+        // sendMessage, and since it was awaited before anything else, the
+        // whole tool call failed -- the prompt never reached any agent. So
+        // the mirror is best-effort now: sendMessage already retries within
+        // its 429 budget, and past that a dropped mirror costs one log line,
+        // never the prompt.
         if (store.getTopic(key)?.closed) throw new Error(`session ${key} is closed`);
-        await tg.sendMessage({ chatId: chatOf(key), messageThreadId: threadOf(key), text });
+        try {
+          await tg.sendMessage({ chatId: chatOf(key), messageThreadId: threadOf(key), text });
+        } catch (e) {
+          console.error(`[bridge] message_send: prompt mirror into ${key} dropped (delivering to the agent anyway): ${e.message}`);
+        }
         if (!wait) {
-          await dispatchUserPrompt(key, text);
+          // queued:true is a promise that the agent has the prompt. The
+          // dispatch returns WHY NOT when the message was dropped or its
+          // turn could not be started -- surface that as the tool error
+          // instead of a lying ack that leaves the caller waiting on a
+          // reply that will never come.
+          const notDelivered = await dispatchUserPrompt(key, text);
+          if (notDelivered) throw new Error(notDelivered);
           return { queued: true, key };
         }
         // Register the waiter BEFORE dispatching: finalizeTurn's noteReply
