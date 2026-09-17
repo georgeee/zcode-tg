@@ -302,6 +302,23 @@ have exactly one model (`mock-1`) and, like zcode, refuse a `model`
 argument outright — see "The mock backend" below for why that's the right
 policy for a single-model backend, not just zcode's rule reused by default.
 
+The three-tier allowlist is a default, not a constant: `CODEX_MCP_MODELS`
+(env, comma list) replaces it wholesale — name one model and the bridge's
+MCP surface is pinned to exactly that one (refusals name the configured
+set), so a deployment that must spend only Terra sets
+`CODEX_MCP_MODELS=gpt-5.6-terra` alongside `CODEX_DEFAULT_MODEL`.
+Unset/empty restores the three tiers. Telegram's `/model` is not narrowed
+by this knob.
+
+Backends start EAGERLY or lazily by configuration: whichever backend
+`DEFAULT_BACKEND` names is constructed and started at boot and is
+load-bearing (its death takes the bridge down for the service manager to
+restart); every other backend starts lazily, the first time a topic or MCP
+call asks for it. A deployment that wants additional backends constructed
+at boot names them in `EAGER_BACKENDS` (comma list) — unknown names refuse
+to boot, and unset keeps the default-backend-only behavior, so a
+codex-default bridge never spawns `zcode app-server` unless asked.
+
 ### The mock backend: zero credentials, zero subprocesses, zero cost
 
 `backend: 'mock'` (Telegram: `/backend mock`) is a third backend that needs

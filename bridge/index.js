@@ -117,6 +117,17 @@ const cfg = {
   // 'backend' argument). Left at 'zcode' so the live deployment's behavior
   // is unchanged unless this is deliberately switched.
   defaultBackend: process.env.DEFAULT_BACKEND || 'zcode',
+  // Which backends are constructed AND started eagerly at boot: a comma
+  // list, defaulting to the default backend alone -- the bug-#3 property (a
+  // codex-default bridge never spawns `zcode app-server` at boot) is the
+  // DEFAULT, not a side effect, and an operator opts in per deployment
+  // (e.g. EAGER_BACKENDS=codex,zcode on a bridge whose chat must list both
+  // backends' models without a lazy first touch). Unknown names fail the
+  // boot loudly, exactly like an unknown DEFAULT_BACKEND.
+  eagerBackends: (process.env.EAGER_BACKENDS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
   storePath: process.env.STORE_PATH || new URL('../data/sessions.json', import.meta.url).pathname,
   permissionTimeoutMs: Number(process.env.PERMISSION_TIMEOUT_MS || 10 * 60 * 1000), // 10 min
   // Empty string is "off"; a bare 0 means an ephemeral listen (what the e2e uses).
@@ -274,7 +285,30 @@ const backends = {};
 // zcodeClient.js's spawn-'error' handling and bridge/backends/zcodeBackend.js
 // for what DOES fail, and how).
 const BACKEND_FACTORIES = {
-  zcode: () => new ZcodeBackend({ nodeBin: cfg.nodeBin, zcodeBin: cfg.zcodeBin, cwd: cfg.workspaceDir, zaiConfigPath: cfg.zaiConfigPath }),
+  zcode: () => {
+    const backend = new ZcodeBackend({ nodeBin: cfg.nodeBin, zcodeBin: cfg.zcodeBin, cwd: cfg.workspaceDir, zaiConfigPath: cfg.zaiConfigPath });
+    // THE RUNTIME-PREFERENCES HANDLER, REGISTERED AT THE ONE PLACE A ZCODE
+    // BACKEND IS EVER CREATED. This factory serves BOTH start paths -- the
+    // eager default-backend boot and getBackend()'s lazy construct-on-first-
+    // use -- so every zcode instance answers
+    // session/requestRuntimePreferences, whichever way it came to exist. It
+    // used to be registered once at module scope against `backends.zcode`,
+    // which crashed every bridge whose default backend wasn't zcode
+    // (backends.zcode didn't exist yet) and, had that been patched with an
+    // optional chain, would have silently dropped the handler from every
+    // zcode constructed LAZILY -- the /backend-zcode-on-a-codex-bridge case.
+    //
+    // ZCODE-ONLY, AND KEPT IN THE ZCODE BRANCH FOR THAT REASON:
+    // session/requestRuntimePreferences is a zcode app-server method with no
+    // Codex analog (codexBackend.js registers nothing like it), so this is
+    // not a backend-generic wireBackend() concern. And answering it is not
+    // optional: the blanket "unregistered method" reply is -32601, which the
+    // app-server reads as "client too old" and answers by enabling its own
+    // bash prelude -- see runtimePrefs.js for the whole chain and why
+    // NATIVE_SEARCH_ENHANCEMENTS exists.
+    backend.onServerRequest('session/requestRuntimePreferences', async () => runtimePreferences());
+    return backend;
+  },
   codex: () => {
     if (!cfg.codexHome) throw new Error("the 'codex' backend needs CODEX_HOME set (see README)");
     return new CodexBackend({ codexBin: cfg.codexBin, codexHome: cfg.codexHome, cwd: cfg.workspaceDir, autoApprovePermissions: cfg.autoApprovePermissions });
@@ -366,8 +400,18 @@ function wireBackend(backend) {
 if (!BACKEND_FACTORIES[cfg.defaultBackend]) {
   throw new Error(`unknown DEFAULT_BACKEND: ${cfg.defaultBackend} (known: ${Object.keys(BACKEND_FACTORIES).join(', ')})`);
 }
-backends[cfg.defaultBackend] = wireBackend(BACKEND_FACTORIES[cfg.defaultBackend]());
-backends[cfg.defaultBackend].start();
+// THE EAGER SET: cfg.eagerBackends when the operator named one, else the
+// default backend alone -- which makes the unset behavior the identical two
+// statements this loop replaced (construct the default, start it, nothing
+// else).
+const eagerBackends = cfg.eagerBackends.length ? [...new Set(cfg.eagerBackends)] : [cfg.defaultBackend];
+for (const name of eagerBackends) {
+  if (!BACKEND_FACTORIES[name]) {
+    throw new Error(`unknown backend in EAGER_BACKENDS: ${name} (known: ${Object.keys(BACKEND_FACTORIES).join(', ')})`);
+  }
+  backends[name] = wireBackend(BACKEND_FACTORIES[name]());
+  backends[name].start();
+}
 
 function getBackend(name) {
   if (backends[name]) return backends[name];
@@ -538,12 +582,6 @@ const pendingPrompts = new Map(); // threadId -> { parts: [promptText...], first
 // decline (same as the old auto-decline behavior, just later). One tap per
 // question; multiSelect questions are answered single-pick (documented
 // limitation -- Telegram buttons don't toggle).
-// ANSWERED, RATHER THAN LEFT TO THE "unregistered method" DEFAULT, because
-// that default is not neutral here: it is -32601, which the app-server reads
-// as "client too old" and answers by enabling its own bash prelude. See
-// runtimePrefs.js for the whole chain and why NATIVE_SEARCH_ENHANCEMENTS
-// exists.
-backends.zcode.onServerRequest('session/requestRuntimePreferences', async () => runtimePreferences());
 
 // Registered on every backend that supports it (see wireBackend()) --
 // currently zcode only; Codex's nearest analog is experimental and unwired,
@@ -1712,7 +1750,19 @@ const KNOWN_BACKENDS = Object.keys(BACKEND_FACTORIES);
 // allowlist rather than a pattern/prefix check on purpose -- a future model
 // name is refused by default until someone deliberately adds it here, not
 // silently admitted because it happens to start with "gpt-5.6-".
-const CODEX_MCP_MODELS = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'];
+//
+// CONFIGURABLE FROM ENV, never from code at a deployment: CODEX_MCP_MODELS
+// is a comma list replacing this default wholesale (not extending it --
+// an operator who names one model gets exactly one, which is how a bridge
+// pinned to Terra alone is done: CODEX_MCP_MODELS=gpt-5.6-terra). Unset or
+// empty means the three tiers below. Paired with CODEX_DEFAULT_MODEL, which
+// should name one of the listed models -- a default outside the allowlist
+// is unreachable over MCP.
+const codexMcpModelsFromEnv = (process.env.CODEX_MCP_MODELS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const CODEX_MCP_MODELS = codexMcpModelsFromEnv.length ? codexMcpModelsFromEnv : ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'];
 
 // validateMcpModel enforces the MCP model policy for both session_create and
 // model_set, in one place, so the two can't drift: zcode and mock both
