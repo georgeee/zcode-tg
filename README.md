@@ -310,6 +310,31 @@ set), so a deployment that must spend only Terra sets
 Unset/empty restores the three tiers. Telegram's `/model` is not narrowed
 by this knob.
 
+**Telegram's `/model` spans every backend.** With no argument it lists the
+models of every configured backend, grouped by backend and marking the
+topic's current backend+model; a backend that cannot be constructed (no
+`CODEX_HOME`, say) or cannot answer is a one-line note — the rest still
+lists. Picking a model resolves it against ALL the backends' lists, and the
+resolution always carries the backend it was found in: same backend as the
+topic, the ordinary in-session switch; a model only another backend offers,
+a fresh session on THAT backend opened with the picked model (history does
+not carry over — the reply says so). A name two backends both offer is
+refused with both named; the qualified form `/model backend:name` (e.g.
+`/model codex:gpt-5.6-terra`) always resolves exactly. zcode's bare-name
+shorthand (`glm-5.3` → `zai/glm-5.3`) still works, and only when the bare
+name resolves nowhere on its own.
+
+The span is configurable: `MODEL_BACKENDS` (env, comma list) names exactly
+the backends `/model` lists and resolves against. Unset, it is every
+backend **except mock** — the zero-credential test double must not appear
+in a production bridge's `/model`, be constructed by it, or answer a
+`mock:` qualified ref (the refusal is "unknown backend", and the backend is
+never touched). A bridge whose `DEFAULT_BACKEND` is mock — or which eagerly
+starts mock via `EAGER_BACKENDS` — is itself a test bridge and sees mock
+unless the operator names a list without it. Unknown `MODEL_BACKENDS` names
+refuse to boot; `/backend` is unaffected and can still switch a topic to
+mock by hand.
+
 Backends start EAGERLY or lazily by configuration: whichever backend
 `DEFAULT_BACKEND` names is constructed and started at boot and is
 load-bearing (its death takes the bridge down for the service manager to
@@ -437,7 +462,7 @@ through to the model as ordinary input):
 | `/stop`, `/cancel` | cancel the topic's running turn (`session/stop`) |
 | `/queue` | list this topic's queued messages |
 | `/clearqueue` | drop this topic's queued messages (their "Queued" notices are edited to "Dropped") |
-| `/model [name]` | list this topic's available models (current one marked `▶`) / switch (`session/setModel`, persisted per topic) |
+| `/model [name]` | list the models of EVERY configured backend (grouped by backend, current one marked `▶`; a backend that cannot be constructed or answer is a one-line note, the rest still lists) / switch. Same backend as the topic: in-session switch, history kept. A model only ANOTHER backend offers: a FRESH session on that backend, opened with the picked model — history does not carry over. A model name two backends both offer is refused until qualified: `/model backend:name` (e.g. `/model codex:gpt-5.6-terra`) always works |
 | `/mode [name]` | list session modes (current marked) / switch (`session/setMode`, persisted per topic) |
 | `/backend [name]` | list / switch this topic's backend (`zcode`/`codex`/`mock`) — starts a FRESH session on the new backend; history does not carry over |
 | `/file <path>` | send a file from the workspace into the topic as a document (realpath-restricted to the workspace subtree, `MAX_FILE_MB` cap) |

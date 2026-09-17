@@ -40,6 +40,13 @@ export function createMcpGateway({
   // it out ACCIDENTALLY -- because a waiter was left armed -- would hang the
   // suite instead of failing it.
   waitTimeoutMs = WAIT_TIMEOUT_MS,
+  // The codex models this bridge actually offers over MCP (the bridge passes
+  // its configured CODEX_MCP_MODELS). A tool schema is an OUTPUT too: the
+  // model/model_set inputSchema enums advertise exactly this list, so a
+  // bridge pinned to Terra alone claims Terra alone. The bridge's own
+  // validateMcpModel enforces the same list -- schema and enforcement are
+  // fed from one source so they cannot drift.
+  codexMcpModels = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'],
 }) {
   // Two listeners, one JSON-RPC core:
   // - unixSocket: a per-fleet unix domain socket speaking LINE-delimited
@@ -170,9 +177,9 @@ export function createMcpGateway({
           },
           model: {
             type: 'string',
-            enum: ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'],
+            enum: codexMcpModels,
             description:
-              "Codex only (ignored/rejected for zcode, which has no MCP-switchable model at all). Picks which of Codex's three everyday tiers this session runs -- Luna (fastest/cheapest), Terra (balanced, the strong default if omitted), or Sol (Codex's flagship). gpt-6-astra (Codex's newest, most expensive model) is deliberately NOT offered here: MCP is not a channel for reaching it.",
+              "Codex only (ignored/rejected for zcode, which has no MCP-switchable model at all). Picks which of this bridge's configured Codex MCP models the session runs -- exactly the enum advertised here; anything else is refused. The default when omitted is the bridge's CODEX_DEFAULT_MODEL. Codex's own server-side default (gpt-6-astra, its newest and most expensive model) is deliberately NOT offered: MCP is not a channel for reaching it.",
           },
         },
         required: ['name'],
@@ -231,12 +238,12 @@ export function createMcpGateway({
     {
       name: 'model_set',
       description:
-        "Switch a session's model. Codex only, and only among the same three tiers session_create offers (gpt-5.6-luna/terra/sol) -- zcode and mock sessions, and gpt-6-astra, all refuse with a clear error, not a silent no-op.",
+        "Switch a session's model. Codex only, and only among this bridge's configured Codex MCP models -- the same list session_create's model argument offers (exactly the enum advertised here). zcode and mock sessions, and anything outside the list, all refuse with a clear error, not a silent no-op.",
       inputSchema: {
         type: 'object',
         properties: {
           key: { type: 'string', description: 'Conversation key from session_create.' },
-          model: { type: 'string', enum: ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'] },
+          model: { type: 'string', enum: codexMcpModels },
         },
         required: ['key', 'model'],
       },

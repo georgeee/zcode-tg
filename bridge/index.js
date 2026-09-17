@@ -70,6 +70,7 @@ import { ReplyStreamer } from './streamer.js';
 import { ProgressReporter } from './progress.js';
 import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages, usageSnapshotOrThrow } from './usage.js';
 import { runtimePreferences } from './runtimePrefs.js';
+import { mergeModelLists, resolveModelRef } from './modelref.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
 // a session running in this same directory could read that file as part of
@@ -125,6 +126,15 @@ const cfg = {
   // backends' models without a lazy first touch). Unknown names fail the
   // boot loudly, exactly like an unknown DEFAULT_BACKEND.
   eagerBackends: (process.env.EAGER_BACKENDS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+  // Which backends /model spans: a comma list. RAW parse here; the default
+  // (every known backend except mock) is filled in after BACKEND_FACTORIES
+  // below, because it reads the two knobs this list sits between --
+  // defaultBackend and eagerBackends. Unknown names refuse to boot, same as
+  // EAGER_BACKENDS.
+  modelBackendsEnv: (process.env.MODEL_BACKENDS ?? '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
@@ -319,6 +329,24 @@ const BACKEND_FACTORIES = {
   // future from-scratch tests).
   mock: () => new MockBackend(),
 };
+
+// THE /model SPAN, and its safe default. A production bridge must not have
+// its /model construct the mock backend and offer the owner fake models
+// (mock is the zero-credential test double -- see README's "The mock
+// backend"), so the default is every known backend EXCEPT mock. A bridge
+// whose DEFAULT_BACKEND is mock, or which eagerly starts mock via
+// EAGER_BACKENDS, is itself a test bridge and sees mock unless the operator
+// names a list without it. This set is what gatherModelsAcrossBackends
+// iterates AND what resolution sees: a `mock:` qualified ref on a bridge
+// that excludes mock is refused as unknown, never constructed.
+const modelBackends = cfg.modelBackendsEnv.length
+  ? cfg.modelBackendsEnv
+  : Object.keys(BACKEND_FACTORIES).filter((name) => name !== 'mock' || cfg.defaultBackend === 'mock' || cfg.eagerBackends.includes('mock'));
+for (const name of modelBackends) {
+  if (!BACKEND_FACTORIES[name]) {
+    throw new Error(`unknown backend in MODEL_BACKENDS: ${name} (known: ${Object.keys(BACKEND_FACTORIES).join(', ')})`);
+  }
+}
 
 // Per-backend default model, used wherever a topic/session needs one and
 // hasn't been told otherwise (a brand-new session, or /model's "current"
@@ -1637,64 +1665,155 @@ function restoreTopicStatuses() {
   }
 }
 
-// --- /model: list / switch the topic's model, on whichever backend the
-// topic runs on ---
+// --- /model: list / switch the topic's model, across the /model span (the
+// MODEL_BACKENDS set -- every backend except mock by default; the listing
+// constructs lazily where needed; a ref the topic's own backend offers
+// switches in-session exactly as before; a ref only ANOTHER backend offers
+// performs the /backend-style fresh-session switch with that model stored
+// for the new session; a ref two backends both offer is refused until
+// qualified as backend:model) -- the merge and resolve rules themselves are
+// pure functions in bridge/modelref.js ---
+
+// One gather, shared by the listing and the resolution: every backend in the
+// /model span (modelBackends -- mock excluded by default, see its
+// definition). getBackend() constructs each exactly as a topic asking for it
+// would (so a bridge that never touches codex pays nothing until this runs),
+// and a backend that cannot be constructed or cannot answer becomes a
+// one-line note instead of failing the whole command.
+async function gatherModelsAcrossBackends(threadId) {
+  const workspaceKey = `tg-topic-${threadId}`;
+  const lists = {};
+  const unavailable = [];
+  for (const name of modelBackends) {
+    try {
+      const models = await getBackend(name).listModels({ workspaceDir: cfg.workspaceDir, workspaceKey });
+      if (models.length) lists[name] = models;
+      else unavailable.push(`${name}: no models advertised`);
+    } catch (e) {
+      unavailable.push(`${name}: unavailable — ${e.message}`);
+    }
+  }
+  return { lists, unavailable };
+}
+
 async function handleModelCommand(threadId, arg) {
   const entry = store.getTopic(threadId) || {};
-  const backendName = entry.backend || cfg.defaultBackend;
-  const backend = getBackend(backendName);
+  const currentBackend = entry.backend || cfg.defaultBackend;
+  const currentModel = entry.model || defaultModelFor(currentBackend);
   const workspaceKey = `tg-topic-${threadId}`;
-  let available;
-  try {
-    available = await backend.listModels({ workspaceDir: cfg.workspaceDir, workspaceKey });
-  } catch (e) {
-    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ /model failed: ${e.message}` });
-    return;
-  }
-  const refs = available.map((m) => m.ref);
+  const { lists, unavailable } = await gatherModelsAcrossBackends(threadId);
 
   if (!arg) {
-    const current = entry.model || defaultModelFor(backendName) || '(backend default)';
-    const rows = available.map((m) => {
+    const rows = [];
+    let lastBackend = null;
+    for (const m of mergeModelLists(lists, modelBackends)) {
+      if (m.backend !== lastBackend) {
+        rows.push(`${m.backend}:`);
+        lastBackend = m.backend;
+      }
       const ctx = m.contextWindow ? (m.contextWindow >= 1000000 ? `${m.contextWindow / 1000000}M` : `${Math.round(m.contextWindow / 1000)}k`) : null;
-      return `${m.ref === current ? '▶' : '•'} ${m.ref} — ${m.label || m.ref}${ctx ? ` (${ctx} ctx)` : ''}`;
-    });
-    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: [`Models available (${backendName}):`, ...rows, '', 'Switch: /model <name>'].join('\n') });
+      // The topic's current model is marked only within its own backend's
+      // group -- the header already names the current backend.
+      const mark = m.backend === currentBackend && m.ref === currentModel ? '▶' : '•';
+      rows.push(`${mark} ${m.ref} — ${m.label || m.ref}${ctx ? ` (${ctx} ctx)` : ''}`);
+    }
+    const text = [
+      `Models across backends (current: ${currentBackend} · ${currentModel || '(backend default)'}):`,
+      ...rows,
+      ...unavailable,
+      '',
+      "Switch: /model <name> — if the model lives on another backend, this topic starts a FRESH session there (backends don't share history).",
+      'If a name exists on more than one backend, qualify it: /model backend:name.',
+    ].join('\n');
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text });
     return;
   }
 
-  // zcode's convention: a bare name defaults to the zai provider ('glm-5.3'
-  // -> 'zai/glm-5.3'). Other backends' model refs have no such prefix
-  // convention (Codex's are bare model ids already), so this only applies
-  // to zcode -- not a rule about model-ref shape in general.
-  const ref = backendName === 'zcode' && !arg.includes('/') ? `zai/${arg}` : arg;
-  if (!refs.includes(ref)) {
-    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Unknown model "${arg}". /model with no argument lists what's available.` });
+  // Resolve the typed ref against every backend's list. The resolver's
+  // answer carries the backend it was found in, and the switch below applies
+  // THAT pair -- a resolved model is never applied to the topic's current
+  // backend by default (that guess is the recorded live bug this replaces).
+  let resolution = null;
+  let resolveError = null;
+  try {
+    resolution = resolveModelRef(arg, lists);
+  } catch (e) {
+    resolveError = e;
+  }
+  if (!resolution && !arg.includes(':') && !arg.includes('/')) {
+    // zcode's bare-name convention, unchanged: a bare name defaults to the
+    // zai provider ('glm-5.3' -> 'zai/glm-5.3') -- tried only when the bare
+    // ref resolved nowhere on its own, so a name another backend genuinely
+    // offers is not shadowed by it.
+    try {
+      resolution = resolveModelRef(`zai/${arg}`, lists);
+      resolveError = null;
+    } catch {
+      /* the original error is the honest one; report that */
+    }
+  }
+  if (!resolution) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ /model failed: ${resolveError.message}` });
     return;
   }
-  // CODEX_DISALLOW_ASTRA is a deployment-level dial (see cfg.codexDisallowAstra's
-  // definition), not a permanent restriction on Telegram switching in general --
-  // a normal deployment reaches this ref === 'gpt-6-astra' check and simply
-  // never trips it.
-  if (backendName === 'codex' && ref === 'gpt-6-astra' && cfg.codexDisallowAstra) {
+  const { backend: resolvedBackend, ref } = resolution;
+
+  // CODEX_DISALLOW_ASTRA (and any future per-backend dial) operates on the
+  // backend the ref was FOUND in, not the topic's current one.
+  if (resolvedBackend === 'codex' && ref === 'gpt-6-astra' && cfg.codexDisallowAstra) {
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ This deployment has CODEX_DISALLOW_ASTRA set; /model gpt-6-astra is refused here.` });
     return;
   }
-  store.setTopic(threadId, { ...entry, model: ref });
-  // zcode caches a per-workspace runtimeModel built for the OLD model (see
-  // zcodeBackend.js); drop it so the next resume warms with the new one.
-  // Other backends don't implement this optional method.
-  backend.invalidateModelCache?.(workspaceKey);
-  if (entry.sessionId && subscribedSessions.has(entry.sessionId)) {
-    try {
-      await backend.setModel(entry.sessionId, ref);
-    } catch (e) {
-      await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Stored for this topic, but the live session rejected the switch: ${e.message}` });
-      return;
+
+  if (resolvedBackend === currentBackend) {
+    // The topic's own backend: the in-session switch, unchanged.
+    store.setTopic(threadId, { ...entry, model: ref });
+    getBackend(resolvedBackend).invalidateModelCache?.(workspaceKey);
+    if (entry.sessionId && subscribedSessions.has(entry.sessionId)) {
+      try {
+        await getBackend(resolvedBackend).setModel(entry.sessionId, ref);
+      } catch (e) {
+        await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Stored for this topic, but the live session rejected the switch: ${e.message}` });
+        return;
+      }
     }
+    await updateTopicStatus(threadId, busySessions.has(entry.sessionId) ? 'busy' : 'idle').catch(() => {});
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `✅ Model for this topic: ${ref}` });
+    return;
   }
-  await updateTopicStatus(threadId, busySessions.has(entry.sessionId) ? 'busy' : 'idle').catch(() => {});
-  await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `✅ Model for this topic: ${ref}` });
+
+  // A different backend: the /backend-style fresh-session switch, with the
+  // model the ref resolved to stored so the new session opens on it. A
+  // running turn is refused, exactly as /backend refuses one.
+  if (busySessions.has(entry.sessionId)) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '⚠️ A turn is running in this topic — /stop it first, then switch models.' });
+    return;
+  }
+  if (entry.sessionId) {
+    // Best-effort close of the OLD session -- the new backend has no idea
+    // what the old session id even means, so this genuinely isn't "the same
+    // conversation continuing" the way a same-backend /model switch is.
+    await backendForSession(entry.sessionId).closeConversation(entry.sessionId).catch(() => {});
+    subscribedSessions.delete(entry.sessionId);
+    sessionToTopic.delete(entry.sessionId);
+    // The old backend's per-workspace model cache (zcode's runtimeModel) was
+    // built for the old model -- drop it so this topic returning there later
+    // warms with whatever the model is then.
+    try {
+      backendForSession(entry.sessionId).invalidateModelCache?.(workspaceKey);
+    } catch {}
+  }
+  // THE PAIR, APPLIED TOGETHER: the resolved model is stored WITH the backend
+  // it was found in, and the old session id is dropped -- a resolved model is
+  // never applied to the topic's current backend by default (that guess is
+  // the recorded live bug this command's resolver exists to make impossible).
+  store.setTopic(threadId, { ...entry, backend: resolvedBackend, sessionId: undefined, model: ref });
+  await updateTopicStatus(threadId, 'idle').catch(() => {});
+  await tg.sendMessage({
+    chatId: chatOf(threadId),
+    messageThreadId: threadOf(threadId),
+    text: `✅ This topic now runs ${ref} on '${resolvedBackend}' — a fresh session starts on your next message (history does not carry over: backends don't share sessions).`,
+  });
 }
 
 // --- /mode: list / switch the topic's session mode -- a zcode-native
@@ -2695,6 +2814,7 @@ async function main() {
       port: cfg.mcpHttpPort ?? null,
       unixSocket: cfg.mcpUnixSocket,
       host: process.env.MCP_BIND || '127.0.0.1',
+      codexMcpModels: CODEX_MCP_MODELS, // the schemas advertise exactly what validateMcpModel enforces
       log: (m) => console.log(`[bridge] ${m}`),
     });
     mcp.wire({

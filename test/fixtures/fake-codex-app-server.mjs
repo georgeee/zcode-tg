@@ -10,12 +10,22 @@
 // harness's set_exec repair, not by this script.
 //
 // Answers exactly enough of the protocol to let CodexBackend.start() and
-// bridge/index.js's eager boot succeed (the 'initialize' handshake) and to
-// let an MCP session_create on this backend complete end to end: thread/start
-// gets a thread id (a fresh one per call, the way the real server behaves)
-// and a model. Everything else (the 'initialized' notification; turn/start
-// and the rest, which these tests never send) is silently ignored.
-import { writeFileSync } from 'node:fs';
+// bridge/index.js's eager boot succeed (the 'initialize' handshake), to let
+// an MCP session_create on this backend complete end to end (thread/start
+// gets a thread id and a model), and to let the cross-backend /model listing
+// work (model/list returns the fixture's advertised models). Everything else
+// (the 'initialized' notification; turn/start and the rest, which these
+// tests never send) is silently ignored.
+//
+// FIXTURE_CODEX_MODELS   optional comma list of "model:Label" entries
+//                        model/list advertises (default the three everyday
+//                        tiers). Drives what /model lists for this backend.
+// FIXTURE_CODEX_LOG      if set, every client->server REQUEST is appended
+//                        here as one JSON line {at, method, params} -- the
+//                        record the cross-backend switch test asserts on
+//                        (thread/start's params.model names the model the
+//                        new codex session actually opened with).
+import { writeFileSync, appendFileSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 
 if (process.env.FIXTURE_CODEX_MARKER) {
@@ -25,6 +35,7 @@ if (process.env.FIXTURE_CODEX_MARKER) {
 let nextThreadId = 1;
 const decoder = new StringDecoder('utf8');
 let buf = '';
+const reply = (msg, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\n');
 process.stdin.on('data', (chunk) => {
   buf += decoder.write(chunk);
   let idx;
@@ -38,19 +49,33 @@ process.stdin.on('data', (chunk) => {
     } catch {
       continue;
     }
-    if (msg.id !== undefined && msg.method === 'initialize') {
-      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\n');
+    if (msg.id === undefined || msg.method === undefined) continue; // notification, or a reply to our own (none) requests
+    if (process.env.FIXTURE_CODEX_LOG) {
+      appendFileSync(process.env.FIXTURE_CODEX_LOG, JSON.stringify({ at: Date.now(), method: msg.method, params: msg.params ?? {} }) + '\n');
     }
-    if (msg.id !== undefined && msg.method === 'thread/start') {
+    if (msg.method === 'initialize') {
+      reply(msg, {});
+    } else if (msg.method === 'thread/start') {
       // CodexBackend.createConversation reads res.thread.id and res.model
       // (see bridge/backends/codexBackend.js) -- exactly what a real
-      // thread/start reply carries.
-      process.stdout.write(
-        JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: `fake-thread-${nextThreadId++}` }, model: 'gpt-5.6-terra' } }) + '\n',
-      );
+      // thread/start reply carries. res.model echoes the REQUESTED model
+      // (params.model) when given, the way a real server reports the
+      // thread's effective model; the bridge stores what the backend says
+      // it runs, so a fixture that ignored the request would misreport it.
+      reply(msg, { thread: { id: `fake-thread-${nextThreadId++}` }, model: msg.params?.model ?? 'gpt-5.6-terra' });
+    } else if (msg.method === 'model/list') {
+      // CodexBackend.listModels maps data[].model / data[].displayName.
+      const models = (process.env.FIXTURE_CODEX_MODELS || 'gpt-5.6-luna:Luna,gpt-5.6-terra:Terra,gpt-5.6-sol:Sol')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((entry) => {
+          const [model, label] = entry.split(':');
+          return { model, displayName: label || model };
+        });
+      reply(msg, { data: models });
     }
-    // Everything else (the 'initialized' notification, and anything these
-    // tests never send -- turn/start, model/list) is silently ignored.
+    // Everything else is silently ignored.
   }
 });
 process.stdin.resume();

@@ -36,22 +36,53 @@
 //                                 the observable for "the runtime-preferences
 //                                 handler is registered on EVERY zcode
 //                                 instance, eager or lazy".
-//                                 While this is set it also answers the four
-//                                 calls createConversation()+subscribe() issue
-//                                 (session/create, session/setModel,
-//                                 session/setMode, session/subscribe) so an
-//                                 MCP session_create on this backend
-//                                 completes end to end.
-// Absent all three, or once the crash timer isn't set, it just idles
-// forever -- good enough for tests that only care whether it was STARTED,
-// not whether a session/turn actually completes on it.
-import { writeFileSync } from 'node:fs';
+//   FIXTURE_ZCODE_LOG             if set, EVERY client->server REQUEST is
+//                                 appended to this file as one JSON line
+//                                 {at, method, params} -- the record tests
+//                                 assert on: which session was created when,
+//                                 and (the cross-backend /model case) which
+//                                 model a session/setModel actually carried.
+//   FIXTURE_ZCODE_MODELS          if set, a comma list "provider/model:Label"
+//                                 entries this fixture's workspace/readState
+//                                 advertises (default two GLM models). Drives
+//                                 listModels() -- and so what /model shows.
+// With any of LOG/RP_REPLY set it answers the calls the bridge actually
+// issues (session/create, session/setModel, session/setMode, session/subscribe,
+// session/close, session/stop, session/send, workspace/readState) so a topic
+// can really be created on it, listed, and switched away from.
+import { writeFileSync, appendFileSync } from 'node:fs';
 
 if (process.env.FIXTURE_ZCODE_MARKER) {
   writeFileSync(process.env.FIXTURE_ZCODE_MARKER, JSON.stringify({ pid: process.pid, at: Date.now(), argv: process.argv.slice(2) }));
 }
 
 const reply = (id, result) => process.stdout.write(JSON.stringify({ id, result }) + '\n');
+let nextSessionId = 1;
+
+// The model catalog listModels() reads (zcodeBackend.js maps
+// modelCatalog.available's {ref:{providerId, modelId}, label, contextWindow});
+// providers[].models is included so the resume-path catalog warm-up would
+// also find zai models if a test resumes a session.
+const FIXTURE_MODELS = (process.env.FIXTURE_ZCODE_MODELS || 'zai/glm-5.3-flash:GLM-5.3 Flash:204800,zai/glm-4.6-air:GLM-4.6 Air:131072')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .map((entry) => {
+    const [ref, label, ctx] = entry.split(':');
+    const [providerId, modelId] = ref.split('/');
+    return { providerId, modelId, label: label || modelId, contextWindow: ctx ? Number(ctx) : undefined };
+  });
+const readState = {
+  modelCatalog: {
+    available: FIXTURE_MODELS.map(({ providerId, modelId, label, contextWindow }) => ({ ref: { providerId, modelId }, label, contextWindow })),
+    providers: [{ providerId: 'zai', models: FIXTURE_MODELS.map(({ modelId, contextWindow }) => ({ modelId, contextWindow })) }],
+  },
+};
+
+const logRequest = (msg) => {
+  if (!process.env.FIXTURE_ZCODE_LOG) return;
+  appendFileSync(process.env.FIXTURE_ZCODE_LOG, JSON.stringify({ at: Date.now(), method: msg.method, params: msg.params ?? {} }) + '\n');
+};
 
 if (process.env.FIXTURE_ZCODE_RP_REPLY) {
   // A server-initiated request, sent before anything else -- if the bridge
@@ -60,40 +91,40 @@ if (process.env.FIXTURE_ZCODE_RP_REPLY) {
   process.stdout.write(JSON.stringify({ id: 'fixture-rp-1', method: 'session/requestRuntimePreferences', params: {} }) + '\n');
 }
 
-if (process.env.FIXTURE_ZCODE_RP_REPLY) {
-  const { StringDecoder } = await import('node:string_decoder');
-  const decoder = new StringDecoder('utf8');
-  let buf = '';
-  process.stdin.on('data', (chunk) => {
-    buf += decoder.write(chunk);
-    let idx;
-    while ((idx = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, idx);
-      buf = buf.slice(idx + 1);
-      if (!line.trim()) continue;
-      let msg;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      // The bridge's reply to OUR server-initiated request: an id, no method.
-      if (msg.id === 'fixture-rp-1' && msg.method === undefined) {
-        writeFileSync(process.env.FIXTURE_ZCODE_RP_REPLY, JSON.stringify(msg));
-        continue;
-      }
-      // Replies to the bridge's own calls carry the call's method.
-      if (msg.method === 'session/create') reply(msg.id, { session: { sessionId: 'fake-z-1' } });
-      else if (msg.method === 'session/setModel' || msg.method === 'session/setMode' || msg.method === 'session/subscribe') reply(msg.id, {});
+const { StringDecoder } = await import('node:string_decoder');
+const decoder = new StringDecoder('utf8');
+let buf = '';
+process.stdin.on('data', (chunk) => {
+  buf += decoder.write(chunk);
+  let idx;
+  while ((idx = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, idx);
+    buf = buf.slice(idx + 1);
+    if (!line.trim()) continue;
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      continue;
     }
-  });
-}
+    // The bridge's reply to OUR server-initiated request: an id, no method.
+    if (msg.id === 'fixture-rp-1' && msg.method === undefined) {
+      if (process.env.FIXTURE_ZCODE_RP_REPLY) writeFileSync(process.env.FIXTURE_ZCODE_RP_REPLY, JSON.stringify(msg));
+      continue;
+    }
+    if (msg.method === undefined || msg.id === undefined) continue; // not a request
+    logRequest(msg);
+    // This protocol carries no "jsonrpc" key in either direction (the client
+    // rejects one) -- reply mirrors the request's {id, result} shape.
+    if (msg.method === 'session/create') reply(msg.id, { session: { sessionId: `fake-z-${nextSessionId++}` } });
+    else if (msg.method === 'workspace/readState') reply(msg.id, readState);
+    else reply(msg.id, {}); // setModel, setMode, subscribe, close, stop, send: acknowledged, nothing to say
+  }
+});
 
 if (process.env.FIXTURE_ZCODE_CRASH_AFTER_MS) {
   setTimeout(() => process.exit(1), Number(process.env.FIXTURE_ZCODE_CRASH_AFTER_MS));
 }
 
-// Keep stdin open (don't let EOF end the process) without doing anything
-// else useful with it -- matches "spawned, alive, never touched further" for
-// tests that don't need a real protocol round trip.
+// Keep stdin open (don't let EOF end the process).
 process.stdin.resume();

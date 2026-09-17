@@ -28,6 +28,17 @@
 //     unknown name refuses to boot loudly.
 //  7. CODEX_MCP_MODELS narrows the MCP codex model allowlist from env;
 //     unset keeps today's three tiers.
+//  8. Cross-backend /model in Telegram (D3): the listing spans every
+//     backend (constructed lazily), a ref from another backend switches the
+//     topic to a FRESH session on that backend with the picked model
+//     (asserted on the fixtures' recorded requests), and an unconfigured
+//     backend degrades to a note.
+//  9. tools/list advertises the CONFIGURED model list in the
+//     model/model_set schemas, not a static enum.
+// 10. The /model span (MODEL_BACKENDS): mock excluded by default on a real
+//     bridge (never listed, constructed, or resolved to), mock-default
+//     bridges see themselves, a named list is honored wholesale, unknown
+//     names refuse to boot.
 //
 // Drive: node test/e2e-backend-lifecycle.mjs
 import { createServer } from 'node:http';
@@ -53,21 +64,35 @@ const check = (name, cond, extra = '') => {
 };
 
 // --- a fresh fake Telegram + bridge subprocess per scenario ---
-function startFakeTelegram() {
+// `updates` pre-queues Telegram updates the fake serves on the FIRST
+// getUpdates poll; the returned pushUpdate() queues more mid-run, served on
+// the next poll (the bridge long-polls with a 1s idle answer, so a pushed
+// update is picked up within ~1s). This is how the Telegram-command paths
+// (e.g. /model) are driven end to end.
+function startFakeTelegram(updates = []) {
   const calls = { send: [], edit: [], topicCreated: [] };
+  const pending = [...updates];
   let nextMsgId = 100, nextThreadId = 900;
   const srv = createServer(async (req, res) => {
     let body = '';
     for await (const c of req) body += c;
     const method = req.url.split('/').pop();
     const ok = (result = {}) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ ok: true, result })); };
-    if (method === 'getUpdates') { const t = setTimeout(() => ok([]), 1000); t.unref?.(); return; }
+    if (method === 'getUpdates') {
+      if (pending.length) {
+        const batch = pending.splice(0, pending.length);
+        return ok(batch);
+      }
+      const t = setTimeout(() => ok([]), 1000);
+      t.unref?.();
+      return;
+    }
     if (method === 'sendMessage') { const p = JSON.parse(body); calls.send.push(p); return ok({ message_id: nextMsgId++ }); }
     if (method === 'editMessageText') { const p = JSON.parse(body); calls.edit.push(p); return ok({ message_id: p.message_id }); }
-    if (method === 'createForumTopic') { const p = JSON.parse(body); calls.topicCreated.push(p); return ok({ message_thread_id: nextThreadId, chat_id: p.chat_id, name: p.name }); }
+    if (method === 'createForumTopic') { const p = JSON.parse(body); calls.topicCreated.push(p); return ok({ message_thread_id: nextThreadId++, chat_id: p.chat_id, name: p.name }); }
     return ok();
   });
-  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () => resolve({ srv, port: srv.address().port, calls })));
+  return new Promise((resolve) => srv.listen(0, '127.0.0.1', () => resolve({ srv, port: srv.address().port, calls, pushUpdate: (u) => pending.push(u) })));
 }
 
 function startBridge(env, label) {
@@ -142,6 +167,31 @@ function httpMcpCaller(log) {
     });
     return JSON.parse(await res.text());
   };
+}
+
+// A Telegram message update as the real API would deliver one, for
+// pushUpdate()-ing into the fake Telegram: from the allowed user, in the
+// test chat, in a given topic.
+let tgUpdateId = 0;
+const tgMessage = (threadId, text) => ({
+  update_id: ++tgUpdateId,
+  message: {
+    message_id: 5000 + tgUpdateId,
+    from: { id: 1, is_bot: false },
+    chat: { id: -100111 },
+    message_thread_id: threadId,
+    date: Math.floor(Date.now() / 1000),
+    text,
+  },
+});
+
+// Read a fixture's JSONL request log ({at, method, params} lines).
+function readJsonl(file) {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, 'utf8')
+    .split('\n')
+    .filter((l) => l.trim())
+    .map((l) => JSON.parse(l));
 }
 
 // --- scenario 1: Codex-default never touches zcode ---
@@ -532,12 +582,390 @@ async function scenario7() {
 }
 
 try {
-  // EACH SCENARIO REPORTS ITS OWN FAILURE, so one scenario's throw (which is
-  // how a bridge that dies at boot usually surfaces -- a waitFor timeout)
-  // doesn't silently skip the scenarios after it: on the :546 boot-crash
-  // this file exists to catch, EVERY non-zcode-default scenario is red, and
-  // the run must say so rather than stop at the first.
-  for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7]) {
+// --- scenario 8: cross-backend /model in Telegram (D3). A codex-default
+// topic lists BOTH backends (zcode constructed lazily by the command),
+// picking a zai/* ref moves the topic to a fresh zcode session opened with
+// that model, symmetrically codex-ward, and an unconfigured backend degrades
+// to a one-line note. Model assertions are on the FIXTURES' RECORDED
+// requests, not on reply text. ---
+async function scenario8() {
+  console.log('\n--- scenario 8: cross-backend /model — list both backends, switch both ways, degrade cleanly ---');
+  const { srv, port, calls, pushUpdate } = await startFakeTelegram();
+  const zcodeMarker = path.join(TMP, 's8-zcode-started.json');
+  const zcodeLog = path.join(TMP, 's8-zcode-log.jsonl');
+  const codexLog = path.join(TMP, 's8-codex-log.jsonl');
+  const storePath = path.join(TMP, 's8-store.json');
+  const b = startBridge(
+    {
+      TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+      TELEGRAM_BOT_TOKEN: 'fake',
+      TELEGRAM_CHAT_ID: '-100111',
+      TELEGRAM_ALLOWED_USER_ID: '1',
+      DEFAULT_BACKEND: 'codex',
+      ZCODE_NODE_BIN: NODE,
+      ZCODE_BIN: ZCODE_FIXTURE,
+      ZCODE_WORKSPACE_DIR: TMP,
+      CODEX_HOME: TMP,
+      CODEX_BIN: CODEX_FIXTURE,
+      FIXTURE_ZCODE_MARKER: zcodeMarker,
+      FIXTURE_ZCODE_LOG: zcodeLog,
+      FIXTURE_CODEX_LOG: codexLog,
+      STORE_PATH: storePath,
+      MCP_HTTP_PORT: '0',
+    },
+    's8',
+  );
+  try {
+    await waitFor(() => b.log.includes('starting.'), 15000, 'bridge boot');
+    const call = await waitFor(() => {
+      try {
+        return httpMcpCaller(b.log);
+      } catch {
+        return null;
+      }
+    }, 15000, 'mcp http listener');
+
+    // (a) the listing: a codex-default topic's /model shows both backends
+    const created = await call(1, 'session_create', { name: 'tg-cross', backend: 'codex', chat_id: -100111 });
+    const threadA = JSON.parse(created.result.content[0].text).thread_id;
+    pushUpdate(tgMessage(threadA, '/model'));
+    const listing = await waitFor(
+      () => calls.send.find((m) => m.message_thread_id === threadA && /Models across backends/.test(m.text || '')),
+      20000,
+      '(a) the /model listing reply',
+    );
+    check('(a) the listing shows the codex fixture models AND the zcode fixture zai/* models', /gpt-5\.6-terra/.test(listing.text) && /zai\/glm-5\.3-flash/.test(listing.text), listing.text);
+    check('(a) the listing marks the topic\u2019s current backend+model (codex · terra, \u25b6)', /current: codex · gpt-5\.6-terra/.test(listing.text) && /▶ gpt-5\.6-terra/.test(listing.text), listing.text);
+    check('(a) nothing was unavailable', !/unavailable/.test(listing.text), listing.text);
+    check('(a) zcode was constructed lazily by that command (start-marker now exists)', existsSync(zcodeMarker), b.log.slice(-2000));
+
+    // (b) picking a zai/* ref from the codex topic: fresh zcode session
+    pushUpdate(tgMessage(threadA, '/model zai/glm-5.3-flash'));
+    const switchReplyB = await waitFor(() => calls.send.find((m) => m.message_thread_id === threadA && /fresh session/.test(m.text || '')), 20000, '(b) the fresh-session switch reply');
+    check('(b) the reply says a new session began because backends do not share history', /fresh session starts on your next message/.test(switchReplyB.text) && /don't share/.test(switchReplyB.text), switchReplyB.text);
+    // The next turn: wait for ANY further send to this topic (the turn's
+    // placeholder), then judge the fixture records -- so the assertions
+    // below are clean ❌ lines when the model went to the WRONG backend,
+    // not harness timeouts.
+    const sendsBeforeTurn = calls.send.length;
+    pushUpdate(tgMessage(threadA, 'hello over there'));
+    await waitFor(() => calls.send.length > sendsBeforeTurn, 20000, '(b) the next turn to start');
+    const zreqs = readJsonl(zcodeLog);
+    check('(b) the fresh zcode session was created (fixture-recorded session/create)', zreqs.some((r) => r.method === 'session/create'), JSON.stringify(zreqs.map((r) => r.method)));
+    check(
+      '(b) that session was created WITH the picked model (fixture-recorded setModel {providerId:zai, modelId:glm-5.3-flash})',
+      zreqs.some((r) => r.method === 'session/setModel' && r.params?.model?.providerId === 'zai' && r.params?.model?.modelId === 'glm-5.3-flash'),
+      JSON.stringify(zreqs),
+    );
+    const storeDoc = JSON.parse(readFileSync(storePath, 'utf8'));
+    const topicA = Object.values(storeDoc.topics ?? {}).find((t) => t.threadId === threadA);
+    check('(b) the topic now stores backend=zcode and the picked model', topicA?.backend === 'zcode' && topicA?.model === 'zai/glm-5.3-flash', JSON.stringify(topicA));
+
+    // (c) symmetric: a zcode-default topic picks a codex ref. LUNA, not
+    // terra -- terra is the codex DEFAULT (cfg.codexDefaultModel), so a
+    // thread/start carrying luna can only come from a session actually
+    // opened by this switch; a terra assertion would pass off the default
+    // alone.
+    const created2 = await call(4, 'session_create', { name: 'tg-zcode-side', backend: 'zcode', chat_id: -100111 });
+    const threadB = JSON.parse(created2.result.content[0].text).thread_id;
+    pushUpdate(tgMessage(threadB, '/model gpt-5.6-luna'));
+    const switchReplyC = await waitFor(() => calls.send.find((m) => m.message_thread_id === threadB && /fresh session/.test(m.text || '')), 20000, '(c) the fresh-session switch reply');
+    check('(c) the zcode topic\u2019s switch to a codex model announces the fresh session', /runs gpt-5\.6-luna on 'codex'/.test(switchReplyC.text), switchReplyC.text);
+    const sendsBeforeTurnC = calls.send.length;
+    pushUpdate(tgMessage(threadB, 'hello again'));
+    await waitFor(() => calls.send.length > sendsBeforeTurnC, 20000, '(c) the next turn to start');
+    const creqs = readJsonl(codexLog);
+    check(
+      '(c) the new codex session opened WITH the picked model (fixture-recorded thread/start params.model=gpt-5.6-luna)',
+      creqs.some((r) => r.method === 'thread/start' && r.params?.model === 'gpt-5.6-luna'),
+      JSON.stringify(creqs.map((r) => ({ method: r.method, model: r.params?.model }))),
+    );
+    const storeDocC = JSON.parse(readFileSync(storePath, 'utf8'));
+    const topicB = Object.values(storeDocC.topics ?? {}).find((t) => t.threadId === threadB);
+    check('(c) the topic now stores backend=codex and the picked model', topicB?.backend === 'codex' && topicB?.model === 'gpt-5.6-luna', JSON.stringify(topicB));
+  } finally {
+    b.proc.kill('SIGKILL');
+    srv.close();
+  }
+
+  // (d) an unconfigured backend degrades to a note; the rest still lists
+  const { srv: srvD, port: portD, calls: callsD, pushUpdate: pushUpdateD } = await startFakeTelegram();
+  const b2 = startBridge(
+    {
+      TELEGRAM_API_ROOT: `http://127.0.0.1:${portD}`,
+      TELEGRAM_BOT_TOKEN: 'fake',
+      TELEGRAM_CHAT_ID: '-100111',
+      TELEGRAM_ALLOWED_USER_ID: '1',
+      DEFAULT_BACKEND: 'zcode',
+      CODEX_HOME: '', // UNCONFIGURED -- the factory must refuse it without killing the bridge
+      ZCODE_NODE_BIN: NODE,
+      ZCODE_BIN: ZCODE_FIXTURE,
+      ZCODE_WORKSPACE_DIR: TMP,
+      FIXTURE_ZCODE_MARKER: path.join(TMP, 's8d-zcode-started.json'),
+      STORE_PATH: path.join(TMP, 's8d-store.json'),
+      MCP_HTTP_PORT: '0',
+    },
+    's8d',
+  );
+  try {
+    await waitFor(() => b2.log.includes('starting.'), 15000, 'bridge boot (d)');
+    pushUpdateD(tgMessage(950, '/model'));
+    const listingD = await waitFor(
+      () => callsD.send.find((m) => /Models across backends/.test(m.text || '')),
+      20000,
+      '(d) the /model listing reply with codex unconfigured',
+    );
+    check('(d) the unconfigured backend is a one-line note naming why', /codex: unavailable/.test(listingD.text) && /CODEX_HOME/.test(listingD.text), listingD.text);
+    check('(d) the zcode list still shows', /zai\/glm-5\.3-flash/.test(listingD.text), listingD.text);
+    check('(d) the bridge is still alive after the refused construction', b2.proc.exitCode === null, `exitCode=${b2.proc.exitCode}\n${b2.log.slice(-2000)}`);
+  } finally {
+    b2.proc.kill('SIGKILL');
+    srvD.close();
+  }
+}
+
+// --- scenario 9: tools/list is honest about the configured model list --
+// the model/model_set inputSchema enums must be derived from the bridge's
+// CODEX_MCP_MODELS, not a static three (a tool schema is an output too). ---
+async function scenario9() {
+  console.log('\n--- scenario 9: tools/list advertises exactly the configured CODEX_MCP_MODELS enum ---');
+  const sock = path.join(TMP, 's9-state', 'mock-tg', 'mcp.sock');
+  const b = startBridge(
+    {
+      TELEGRAM_API_ROOT: 'http://127.0.0.1:1', // never reached; no Telegram call precedes tools/list
+      TELEGRAM_BOT_TOKEN: 'fake',
+      TELEGRAM_CHAT_ID: '-100111',
+      TELEGRAM_ALLOWED_USER_ID: '1',
+      DEFAULT_BACKEND: 'mock',
+      ZCODE_NODE_BIN: NODE,
+      ZCODE_BIN: ZCODE_FIXTURE,
+      ZCODE_WORKSPACE_DIR: TMP,
+      STORE_PATH: path.join(TMP, 's9-store.json'),
+      MCP_UNIX_SOCKET: sock,
+      CODEX_MCP_MODELS: 'gpt-5.6-terra',
+    },
+    's9',
+  );
+  try {
+    await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, 'mcp unix socket bind');
+    const lines = await unixJsonRpc(sock, [{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }]);
+    const tools = lines[0]?.result?.tools ?? [];
+    const sc = tools.find((t) => t.name === 'session_create');
+    const ms = tools.find((t) => t.name === 'model_set');
+    check(
+      'tools/list: session_create\u2019s model enum is exactly the configured list',
+      JSON.stringify(sc?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra']),
+      JSON.stringify(sc?.inputSchema?.properties?.model),
+    );
+    check(
+      'tools/list: model_set\u2019s model enum is exactly the configured list',
+      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra']),
+      JSON.stringify(ms?.inputSchema?.properties?.model),
+    );
+  } finally {
+    b.proc.kill('SIGKILL');
+  }
+
+  // And with the knob unset, the schemas still carry today's three tiers.
+  const sockB = path.join(TMP, 's9b-state', 'mock-tg', 'mcp.sock');
+  const b2 = startBridge(
+    {
+      TELEGRAM_API_ROOT: 'http://127.0.0.1:1',
+      TELEGRAM_BOT_TOKEN: 'fake',
+      TELEGRAM_CHAT_ID: '-100111',
+      TELEGRAM_ALLOWED_USER_ID: '1',
+      DEFAULT_BACKEND: 'mock',
+      ZCODE_NODE_BIN: NODE,
+      ZCODE_BIN: ZCODE_FIXTURE,
+      ZCODE_WORKSPACE_DIR: TMP,
+      STORE_PATH: path.join(TMP, 's9b-store.json'),
+      MCP_UNIX_SOCKET: sockB,
+    },
+    's9b',
+  );
+  try {
+    await waitFor(() => b2.log.includes(`mcp gateway listening on unix:${sockB}`), 15000, 'mcp unix socket bind (default run)');
+    const lines = await unixJsonRpc(sockB, [{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }]);
+    const ms = (lines[0]?.result?.tools ?? []).find((t) => t.name === 'model_set');
+    check(
+      'with CODEX_MCP_MODELS unset the enum is today\u2019s three tiers',
+      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol']),
+      JSON.stringify(ms?.inputSchema?.properties?.model),
+    );
+  } finally {
+    b2.proc.kill('SIGKILL');
+  }
+}
+
+// --- scenario 10: the /model span (MODEL_BACKENDS). A real bridge must not
+// list, construct, or resolve to mock; a mock-default bridge sees itself; a
+// named list is honored wholesale; unknown names refuse to boot. ---
+async function scenario10() {
+  console.log('\n--- scenario 10: MODEL_BACKENDS — mock excluded by default, named lists honored, unknown names refuse ---');
+
+  // (i) codex-default, MODEL_BACKENDS unset: no mock in the listing, mock
+  // never constructed, zcode still there
+  {
+    const { srv, port, calls, pushUpdate } = await startFakeTelegram();
+    const zcodeMarker = path.join(TMP, 's10a-zcode-started.json');
+    const b = startBridge(
+      {
+        TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+        TELEGRAM_BOT_TOKEN: 'fake',
+        TELEGRAM_CHAT_ID: '-100111',
+        TELEGRAM_ALLOWED_USER_ID: '1',
+        DEFAULT_BACKEND: 'codex',
+        ZCODE_NODE_BIN: NODE,
+        ZCODE_BIN: ZCODE_FIXTURE,
+        ZCODE_WORKSPACE_DIR: TMP,
+        CODEX_HOME: TMP,
+        CODEX_BIN: CODEX_FIXTURE,
+        FIXTURE_ZCODE_MARKER: zcodeMarker,
+        STORE_PATH: path.join(TMP, 's10a-store.json'),
+        MCP_HTTP_PORT: '0',
+      },
+      's10a',
+    );
+    try {
+      await waitFor(() => b.log.includes('starting.'), 15000, 'bridge boot (i)');
+      const call = await waitFor(() => {
+        try {
+          return httpMcpCaller(b.log);
+        } catch {
+          return null;
+        }
+      }, 15000, 'mcp http listener (i)');
+      const created = await call(1, 'session_create', { name: 'span-check', backend: 'codex', chat_id: -100111 });
+      const thread = JSON.parse(created.result.content[0].text).thread_id;
+      pushUpdate(tgMessage(thread, '/model'));
+      const listing = await waitFor(() => calls.send.find((m) => /Models across backends/.test(m.text || '')), 20000, '(i) the /model listing');
+      check('(i) the listing has NO mock entries (no mock-1, no mock: group)', !/mock/i.test(listing.text), listing.text);
+      check('(i) mock is not reported as unavailable either — it is simply not in the span', !/unavailable/.test(listing.text), listing.text);
+      check('(i) the zcode models are still listed', /zai\/glm-5\.3-flash/.test(listing.text), listing.text);
+      check('(i) zcode was still constructed lazily by that command', existsSync(zcodeMarker), b.log.slice(-2000));
+    } finally {
+      b.proc.kill('SIGKILL');
+      srv.close();
+    }
+  }
+
+  // (ii) mock-default: the bridge is a test bridge and sees itself
+  {
+    const { srv, port, calls, pushUpdate } = await startFakeTelegram();
+    const b = startBridge(
+      {
+        TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+        TELEGRAM_BOT_TOKEN: 'fake',
+        TELEGRAM_CHAT_ID: '-100111',
+        TELEGRAM_ALLOWED_USER_ID: '1',
+        DEFAULT_BACKEND: 'mock',
+        ZCODE_NODE_BIN: NODE,
+        ZCODE_BIN: ZCODE_FIXTURE,
+        ZCODE_WORKSPACE_DIR: TMP,
+        STORE_PATH: path.join(TMP, 's10b-store.json'),
+        MCP_HTTP_PORT: '0',
+      },
+      's10b',
+    );
+    try {
+      await waitFor(() => b.log.includes('starting.'), 15000, 'bridge boot (ii)');
+      pushUpdate(tgMessage(920, '/model'));
+      const listing = await waitFor(() => calls.send.find((m) => /Models across backends/.test(m.text || '')), 20000, '(ii) the /model listing');
+      check('(ii) a mock-default bridge lists mock', /mock-1/.test(listing.text) && /mock:/.test(listing.text), listing.text);
+    } finally {
+      b.proc.kill('SIGKILL');
+      srv.close();
+    }
+  }
+
+  // (iv) an unknown MODEL_BACKENDS name refuses to boot, naming entry+knob
+  // (runs before (iii) so a (iii) timeout can't skip it)
+  {
+    const { srv, port } = await startFakeTelegram();
+    const b = startBridge(
+      {
+        TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+        TELEGRAM_BOT_TOKEN: 'fake',
+        TELEGRAM_CHAT_ID: '-100111',
+        TELEGRAM_ALLOWED_USER_ID: '1',
+        DEFAULT_BACKEND: 'mock',
+        MODEL_BACKENDS: 'mock,nonsense',
+        ZCODE_NODE_BIN: NODE,
+        ZCODE_BIN: ZCODE_FIXTURE,
+        ZCODE_WORKSPACE_DIR: TMP,
+        STORE_PATH: path.join(TMP, 's10d-store.json'),
+        MCP_HTTP_PORT: '0',
+      },
+      's10d',
+    );
+    try {
+      const exitInfo = await waitFor(() => (b.proc.exitCode !== null ? { code: b.proc.exitCode } : null), 15000, 'bridge exit on unknown MODEL_BACKENDS entry');
+      check('(iv) an unknown MODEL_BACKENDS name refuses to boot (nonzero exit)', exitInfo.code === 1, `exitCode=${exitInfo.code}\n${b.log.slice(-2000)}`);
+      check('(iv) the boot failure NAMES the bad entry and the knob', /unknown backend in MODEL_BACKENDS: nonsense/.test(b.log), b.log.slice(-2000));
+    } finally {
+      b.proc.kill('SIGKILL');
+      srv.close();
+    }
+  }
+
+  // (iii) MODEL_BACKENDS=codex alone: only codex lists; a zai/* ref and a
+  // mock: qualified ref are both refused as unknown -- never constructed
+  {
+    const { srv, port, calls, pushUpdate } = await startFakeTelegram();
+    const zcodeMarker = path.join(TMP, 's10c-zcode-started.json');
+    const b = startBridge(
+      {
+        TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+        TELEGRAM_BOT_TOKEN: 'fake',
+        TELEGRAM_CHAT_ID: '-100111',
+        TELEGRAM_ALLOWED_USER_ID: '1',
+        DEFAULT_BACKEND: 'codex',
+        MODEL_BACKENDS: 'codex',
+        ZCODE_NODE_BIN: NODE,
+        ZCODE_BIN: ZCODE_FIXTURE,
+        ZCODE_WORKSPACE_DIR: TMP,
+        CODEX_HOME: TMP,
+        CODEX_BIN: CODEX_FIXTURE,
+        FIXTURE_ZCODE_MARKER: zcodeMarker, // must stay unwritten: zcode is outside the span
+        STORE_PATH: path.join(TMP, 's10c-store.json'),
+        MCP_HTTP_PORT: '0',
+      },
+      's10c',
+    );
+    try {
+      await waitFor(() => b.log.includes('starting.'), 15000, 'bridge boot (iii)');
+      const call = await waitFor(() => {
+        try {
+          return httpMcpCaller(b.log);
+        } catch {
+          return null;
+        }
+      }, 15000, 'mcp http listener (iii)');
+      const created = await call(1, 'session_create', { name: 'codex-only-span', backend: 'codex', chat_id: -100111 });
+      const thread = JSON.parse(created.result.content[0].text).thread_id;
+      pushUpdate(tgMessage(thread, '/model'));
+      const listing = await waitFor(() => calls.send.find((m) => /Models across backends/.test(m.text || '')), 20000, '(iii) the /model listing');
+      check('(iii) the listing shows ONLY the named backend', /codex:/.test(listing.text) && !/zai\//.test(listing.text) && !/mock/i.test(listing.text), listing.text);
+      check('(iii) zcode was never constructed (outside the span, no start-marker)', !existsSync(zcodeMarker), b.log.slice(-2000));
+      pushUpdate(tgMessage(thread, '/model zai/glm-5.3-flash'));
+      const zaiRefusal = await waitFor(() => calls.send.find((m) => /unknown model "zai\/glm-5\.3-flash"/.test(m.text || '')), 20000, '(iii) the zai refusal');
+      check('(iii) a zai/* ref is refused as unknown', !!zaiRefusal, zaiRefusal?.text);
+      pushUpdate(tgMessage(thread, '/model mock:mock-1'));
+      const mockRefusal = await waitFor(() => calls.send.find((m) => /unknown backend "mock"/.test(m.text || '')), 20000, '(iii) the mock: refusal');
+      check('(iii) a mock: qualified ref is refused as an unknown backend (not constructed to answer)', !!mockRefusal, mockRefusal?.text);
+    } finally {
+      b.proc.kill('SIGKILL');
+      srv.close();
+    }
+  }
+}
+
+// EACH SCENARIO REPORTS ITS OWN FAILURE, so one scenario's throw (which is
+// how a bridge that dies at boot usually surfaces -- a waitFor timeout)
+// doesn't silently skip the scenarios after it: on the :546 boot-crash
+// this file exists to catch, EVERY non-zcode-default scenario is red, and
+// the run must say so rather than stop at the first.
+for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10]) {
     try {
       await s();
     } catch (e) {
