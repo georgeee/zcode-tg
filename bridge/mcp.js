@@ -250,28 +250,58 @@ export function createMcpGateway({
     },
   ];
 
+  // A MISSING REQUIRED ARGUMENT MUST FAIL, NOT BECOME THE STRING "undefined".
+  //
+  // Every required argument below used to be coerced with String(args.x), and
+  // String(undefined) is "undefined" -- a perfectly valid string that flows on
+  // as if the caller had meant it. Measured live on the Mochi fleet
+  // (2026-09-18): a senior model began sending session_create {title: "..."}
+  // instead of {name}, and the bridge created seven consecutive forum topics
+  // whose Telegram title AND stored name were both the literal "undefined".
+  // They are indistinguishable in the topic list, and this bridge wraps no
+  // Telegram method that renames a forum topic, so undoing it needed a human
+  // in the Telegram UI.
+  //
+  // The schemas above have always declared these fields `required`. Nothing
+  // enforced it -- the gateway does no schema validation, so `required` was
+  // documentation. Throwing turns a silent, permanent mistake into an isError
+  // reply the caller sees at once and can correct on its next call, which is
+  // what should have happened on the first of those seven rather than the
+  // seventh.
+  //
+  // The OPTIONAL arguments -- session_create's chat_id, backend and model,
+  // replies_get's after_seq, message_send's wait, and model_get's key -- keep
+  // their conditional coercion below. A required-check on an optional field
+  // would turn "omit" into an error: a new bug, not a fix.
+  function requiredString(tool, field, value) {
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw new Error(`${tool}: "${field}" is required and must be a non-empty string`);
+    }
+    return value;
+  }
+
   async function callTool(name, args) {
     if (!handlers) throw new Error('mcp gateway not wired to the bridge');
     switch (name) {
       case 'session_create':
         return handlers.sessionCreate(
-          String(args.name),
+          requiredString('session_create', 'name', args.name),
           args.chat_id != null ? Number(args.chat_id) : undefined,
           args.backend ? String(args.backend) : undefined,
           args.model ? String(args.model) : undefined,
         );
       case 'session_close':
-        return handlers.sessionClose(String(args.key));
+        return handlers.sessionClose(requiredString('session_close', 'key', args.key));
       case 'message_send':
-        return handlers.messageSend(String(args.key), String(args.text), args.wait !== false);
+        return handlers.messageSend(requiredString('message_send', 'key', args.key), requiredString('message_send', 'text', args.text), args.wait !== false);
       case 'replies_get':
-        return handlers.repliesGet(String(args.key), Number(args.after_seq) || 0);
+        return handlers.repliesGet(requiredString('replies_get', 'key', args.key), Number(args.after_seq) || 0);
       case 'model_get':
         return handlers.modelGet(args.key ? String(args.key) : undefined);
       case 'usage_get':
         return handlers.usageGet();
       case 'model_set':
-        return handlers.modelSet(String(args.key), String(args.model));
+        return handlers.modelSet(requiredString('model_set', 'key', args.key), requiredString('model_set', 'model', args.model));
       default:
         throw new Error(`unknown tool: ${name}`);
     }
