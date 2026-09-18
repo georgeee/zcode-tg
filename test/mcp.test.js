@@ -389,6 +389,7 @@ test('a required string argument that is missing is refused, never coerced to "u
 test('every required string argument is checked, not just session_create\'s', async (t) => {
   const seen = [];
   const h = await startGateway(t, {
+    sessionCreate: async (name) => { seen.push(name); return { key: 'k' }; },
     sessionClose: async (k) => { seen.push(k); return {}; },
     messageSend: async (k, text) => { seen.push(k, text); return {}; },
     repliesGet: async (k) => { seen.push(k); return {}; },
@@ -398,6 +399,7 @@ test('every required string argument is checked, not just session_create\'s', as
 
   // Blank is as wrong as absent: "   " would have sailed through String().
   for (const [tool, args, field] of [
+    ['session_create', {}, 'name'],
     ['session_close', {}, 'key'],
     ['message_send', { text: 'x' }, 'key'],
     ['message_send', { key: 'k' }, 'text'],
