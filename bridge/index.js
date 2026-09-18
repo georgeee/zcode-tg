@@ -1154,7 +1154,21 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
   let entry = forceFresh ? null : store.getTopic(threadId);
   let resumed = false;
 
-  if (entry && !subscribedSessions.has(entry.sessionId)) {
+  // THE RECORD EXISTING IS NOT THE SESSION EXISTING. A topic record is
+  // written before any session is bound to it -- sessionCreate stores
+  // {chatId, threadId, name, model, mode} the moment the forum topic is made,
+  // and the forum_topic_created handler seeds even less than that -- so a
+  // brand-new topic reaches here with `entry` set and `entry.sessionId`
+  // undefined. Guarding on the record alone sent every one of them into the
+  // resume branch to call session/resume with sessionId: undefined, which the
+  // runtime rejects ("Invalid params -- sessionId: expected string, received
+  // undefined") and which this function then reported as
+  // "session/resume failed for undefined, starting a fresh session (history
+  // lost)". Nothing was lost -- there was no history to lose -- but the line
+  // fired on every new topic and buried the real resume failures it shares a
+  // log with. The two other call sites that read entry.sessionId already
+  // guard it; this one did not.
+  if (entry?.sessionId && !subscribedSessions.has(entry.sessionId)) {
     // Every bridge start spawns a brand-new `zcode app-server` child
     // process (zcodeClient.js) -- there is no reconnection to a lingering
     // daemon. That fresh process's live session registry is empty; a

@@ -166,3 +166,48 @@ test('unknown tool names an error', async (t) => {
   assert.equal(r.body.result.isError, true);
   assert.match(r.body.result.content[0].text, /unknown tool/);
 });
+
+// THE REGRESSION TEST FOR SEVEN TOPICS NAMED "undefined". A caller that sends
+// the wrong field name -- observed live: session_create {title} instead of
+// {name} -- used to reach the handler as the string "undefined" and create a
+// forum topic titled that, permanently. The handler must never be called at
+// all in that case.
+test('a required string argument that is missing is refused, never coerced to "undefined"', async (t) => {
+  const created = [];
+  const h = await startGateway(t, { sessionCreate: async (name) => { created.push(name); return { key: 'k' }; } });
+  t.after(() => h.close());
+
+  const r = await rpc(h.url, {
+    jsonrpc: '2.0', id: 1, method: 'tools/call',
+    params: { name: 'session_create', arguments: { title: 'codex final grid e5f4e7e' } },
+  });
+
+  assert.equal(r.status, 200); // JSON-RPC succeeded; the TOOL reports the error
+  assert.equal(r.body.result.isError, true);
+  assert.match(r.body.result.content[0].text, /session_create: "name" is required/);
+  assert.deepEqual(created, [], 'the handler must not run with a coerced argument');
+});
+
+test('every required string argument is checked, not just session_create\'s', async (t) => {
+  const seen = [];
+  const h = await startGateway(t, {
+    sessionClose: async (k) => { seen.push(k); return {}; },
+    messageSend: async (k, text) => { seen.push(k, text); return {}; },
+    repliesGet: async (k) => { seen.push(k); return {}; },
+  });
+  t.after(() => h.close());
+
+  // Blank is as wrong as absent: "   " would have sailed through String().
+  for (const [tool, args, field] of [
+    ['session_close', {}, 'key'],
+    ['message_send', { text: 'x' }, 'key'],
+    ['message_send', { key: 'k' }, 'text'],
+    ['replies_get', { key: '   ' }, 'key'],
+  ]) {
+    // eslint-disable-next-line no-await-in-loop
+    const r = await rpc(h.url, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: tool, arguments: args } });
+    assert.equal(r.body.result.isError, true, `${tool} missing ${field} must error`);
+    assert.match(r.body.result.content[0].text, new RegExp(`${tool}: "${field}" is required`));
+  }
+  assert.deepEqual(seen, [], 'no handler runs on a rejected call');
+});
