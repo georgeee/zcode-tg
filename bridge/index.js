@@ -68,9 +68,10 @@ import { Store } from './store.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
 import { ProgressReporter, stepDetail, noteActivity, progressForTopic } from './progress.js';
-import { readZaiApiKey, readZaiProvider, fetchUsage, usagePercentages, usageSnapshotOrThrow, codexUsageSnapshotOrThrow, codexUsageFetchError, usageTelegramText, createUsageCache, unconfiguredUsageError } from './usage.js';
+import { readZaiApiKey, readZaiProvider, fetchUsage, usageSnapshotOrThrow, codexUsageSnapshotOrThrow, codexUsageFetchError, usageTelegramText, createUsageCache, unconfiguredUsageError, statusPercentages, statusModelFor, statusLineText } from './usage.js';
 import { runtimePreferences } from './runtimePrefs.js';
 import { mergeModelLists, resolveModelRef } from './modelref.js';
+import { parseCommandText, commandIsOurs } from './commands.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
 // a session running in this same directory could read that file as part of
@@ -118,6 +119,12 @@ const cfg = {
   // 'backend' argument). Left at 'zcode' so the live deployment's behavior
   // is unchanged unless this is deliberately switched.
   defaultBackend: process.env.DEFAULT_BACKEND || 'zcode',
+  // WHICH FLEET this bridge serves, as the relay records it at auth time
+  // (TELEGRAM_FLEET, shared-group design section 3). OPTIONAL: empty means
+  // "not managed", and the pinned status line renders its model segment
+  // alone -- a pre-shared-group deployment changes only by gaining the
+  // model. A string, not a derivation: a name is a spelling.
+  fleet: process.env.TELEGRAM_FLEET || '',
   // Which backends are constructed AND started eagerly at boot: a comma
   // list, defaulting to the default backend alone -- the bug-#3 property (a
   // codex-default bridge never spawns `zcode app-server` at boot) is the
@@ -1496,23 +1503,26 @@ const zaiUsageCache = createUsageCache({
   onFailure: (e) => console.error(`[bridge] usage refresh failed (figures will lag or be omitted): ${e.message}`),
 });
 
-// getUsageData returns whatever is cached RIGHT NOW, stale or not, and
-// refreshes the cache in the background if it is due.
-//
-// THE STALE VALUE, IMMEDIATELY, NEVER AWAITED: a status write fires on
-// every turn start/end across every topic, and must never stall one on a
-// call to an endpoint that can itself hang or 429 -- so this renders the
-// PREVIOUS cache and figures lag by at most one refresh cycle.
-function getUsageData() {
-  return zaiUsageCache.heartbeat();
+// The cache the status line renders from: the SAME source selection
+// usage_get uses (usageGetForMcp's branch on cfg.defaultBackend), on the
+// HEARTBEAT path -- whatever is cached RIGHT NOW, refreshes fired
+// fire-and-forget below, never explicitAsk, never awaited: a status write
+// fires on every turn start/end across every topic and must never stall
+// one on a call to an endpoint that can itself hang or 429. Mock &c keep
+// the z.ai cache (its unconfigured classification expects exactly that).
+function statusUsageCache() {
+  return cfg.defaultBackend === 'codex' ? codexUsageCache : zaiUsageCache;
 }
 
 function refreshUsagePercentages() {
-  getUsageData(); // fire-and-forget: this call alone is what keeps the cache warm
+  statusUsageCache().heartbeat(); // fire-and-forget: this call alone is what keeps the selected cache warm
 }
 
 function statusUsageText() {
-  const { shortPct, weekPct } = usagePercentages(zaiUsageCache.data);
+  const { shortPct, weekPct } = statusPercentages(cfg.defaultBackend, {
+    zaiData: zaiUsageCache.data,
+    codexData: codexUsageCache.data,
+  });
   const seg = [];
   if (shortPct != null) seg.push(`${shortPct}% session`);
   if (weekPct != null) seg.push(`${weekPct}% week`);
@@ -1588,14 +1598,23 @@ async function usageGetForMcp() {
   return snap;
 }
 
-// Owner-specified format (2026-09-01): one compact line -- one-word state,
-// "N queued" / "no queued", and usage as percentages only. Model and mode
-// are deliberately not here; /model and /mode each confirm their own effect.
+// Owner-specified format: the tail is the 2026-09-01 line (one-word state,
+// "N queued" / "no queued", usage as percentages only); the shared-group
+// design (section 3) prepends identity -- fleet/model when TELEGRAM_FLEET
+// is set, the model alone when not -- so the pinned line names what the
+// topic runs. The model segment is the topic's STORED model, never the
+// backend default when one is stored. Mode stays off the line; /mode
+// confirms its own effect. All wording lives in usage.js's statusLineText,
+// pure and unit-tested; this only gathers what the topic actually is.
 function topicStatusText(threadId, state) {
-  const parts = [state === 'busy' ? 'busy' : 'idle', `${store.getQueue(threadId).length || 'no'} queued`];
-  const usage = statusUsageText();
-  if (usage) parts.push(usage);
-  return `📌 ${parts.join(' · ')}`;
+  const entry = store.getTopic(threadId);
+  return statusLineText({
+    fleet: cfg.fleet,
+    model: statusModelFor(entry, cfg.defaultBackend, defaultModelFor),
+    state,
+    queued: store.getQueue(threadId).length,
+    ...statusUsageText(),
+  });
 }
 
 async function tryPinTopicStatus(threadId, st) {
@@ -2113,13 +2132,31 @@ async function interruptTurn(sessionId, { killEverything }) {
 
 // --- Telegram message handling ---
 
-// '/usage@botname arg' -> 'usage'; null for anything that isn't a command.
-// Only the bridge's OWN commands are intercepted below -- anything else
-// starting with '/' (zcode's /init, /memo, ...) passes through to the model
-// as ordinary input.
-function parseCommand(text) {
-  const m = text.match(/^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s|$)/);
-  return m ? m[1].toLowerCase() : null;
+// '/usage@botname arg' -> 'usage'; null for anything that isn't a command
+// for us. Parsing is bridge/commands.js's; the @-addressing verdict is THIS
+// bridge's, because only it knows whether the suffix is its own name.
+// A command carrying @somename belongs to somename or nobody (shared-group
+// design section 1): ours only when the suffix equals our own username, and
+// NEVER while getMe hasn't answered -- "assume ours" is how two bots in one
+// group both end up answering. Only our own commands are intercepted below;
+// anything else starting with '/' (zcode's /init, /memo, ...) passes through
+// to the model as ordinary input. A foreign-suffixed command, though, is
+// dropped OUTRIGHT -- not run as a command and not passed to the model
+// either: an owner typing /stop@otherbot is talking to the other bot.
+function resolveOwnCommand(text) {
+  const parsed = parseCommandText(text);
+  if (!parsed) return { command: null };
+  if (parsed.suffix == null) return { command: parsed.name };
+  const own = botUsername();
+  if (!own) {
+    console.warn(`[bridge] /${parsed.name}@${parsed.suffix} dropped: own username unknown (getMe not answered yet) -- a suffixed command is never assumed ours`);
+    return { command: null, drop: true };
+  }
+  if (!commandIsOurs(parsed.suffix, own)) {
+    console.log(`[bridge] /${parsed.name}@${parsed.suffix} is addressed to another bot -- dropped`);
+    return { command: null, drop: true };
+  }
+  return { command: parsed.name };
 }
 
 async function handleUsageCommand(threadId) {
@@ -2196,12 +2233,24 @@ const chatOf = (key) => {
 };
 const threadOf = (key) => parseTopicKey(key).threadId;
 
-// The bot's own Telegram user id, fetched once -- getChatMember needs it to
-// ask about our own admin status when auto-picking a session target.
-let botUserId = null;
+// The bot's own Telegram identity, fetched once -- the id getChatMember
+// needs to ask about our own admin status when auto-picking a session
+// target, and the username a command's @suffix is compared against
+// (resolveOwnCommand above). Until getMe answers, username is null and a
+// suffixed command is treated as NOT ours, never assumed ours.
+let botSelf = null; // { id, username }
+async function ensureBotSelf() {
+  if (botSelf == null) {
+    const me = await tg.getMe();
+    botSelf = { id: me.id, username: me.username ?? null };
+  }
+  return botSelf;
+}
 async function ensureBotUserId() {
-  if (botUserId == null) botUserId = (await tg.getMe()).id;
-  return botUserId;
+  return (await ensureBotSelf()).id;
+}
+function botUsername() {
+  return botSelf?.username ?? null;
 }
 
 // A group the bot is IN and has SERVED (the owner spoke in it, created a
@@ -2325,7 +2374,8 @@ async function handleMessage(message) {
     fileNote = await receiveInboundDocument(message, threadId);
     if (fileNote === null) return; // specific failure already posted to the topic
   }
-  const command = parseCommand(message.text ?? '');
+  const { command, drop } = resolveOwnCommand(message.text ?? '');
+  if (drop) return; // addressed to another bot (or ours not yet known): never ours to act on
 
   // Bridge-own commands that never need a session run before anything else,
   // so a stray /usage in a brand-new topic doesn't spawn a zcode session.
@@ -2981,7 +3031,13 @@ async function main() {
     });
   }
   restoreTopicStatuses();
-  refreshUsagePercentages(); // warm the cache so the first status write has figures
+  refreshUsagePercentages(); // warm the selected usage cache so the first status write has figures
+  // Warm the own-identity cache too: a suffixed command arriving before getMe
+  // answers is dropped as not-ours (never assumed ours), so the answer should
+  // be in hand well before the first owner message. Fire-and-forget -- a getMe
+  // failure costs the username, never the boot; the next ensureBotUserId
+  // call retries it.
+  ensureBotSelf().catch((e) => console.error('[bridge] getMe failed (suffixed commands stay unclaimed until it answers):', e.message));
   await cleanupOrphanedPermissionRequests();
 
   // Command autocomplete: idempotent, safe on every boot. The chat scope is

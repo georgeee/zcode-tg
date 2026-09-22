@@ -203,6 +203,63 @@ export function usagePercentages(data) {
   return { shortPct: pct(short), weekPct: pct(week) };
 }
 
+// --- the pinned per-topic status line (shared-group design, section 3) ---
+//
+// The line renders on every turn start/end without anyone asking, so every
+// decision in it lives here as a pure function; index.js only feeds cached
+// data and calls the renderer.
+
+// The codex twin of usagePercentages, over the COMMON snapshot shape: the
+// primary window is the status line's "session" figure, the secondary its
+// "week" one. codexUsageSnapshot does the raw->common mapping once, and the
+// digest reads the same rounded `percentage` fields renderUsage prints, so
+// the pinned line and /usage can never disagree about a number.
+export function codexUsagePercentages(data) {
+  const windows = codexUsageSnapshot(data).windows;
+  const pct = (w) => (w && Number.isFinite(w.percentage) ? w.percentage : null);
+  return { shortPct: pct(windows[0]), weekPct: pct(windows[1]) };
+}
+
+// THE SOURCE SELECTION usage_get USES (usageGetForMcp's branch on the
+// default backend), for the status line's usage segment. This is the fix
+// for statusUsageText reading zaiUsageCache unconditionally: on a
+// codex-default bridge the pinned line silently dropped its usage segment
+// while /usage answered correctly. Data arrives PRE-FETCHED (both caches'
+// current contents); what happens when a cache is cold is the caller's
+// heartbeat discipline, not this function's.
+export function statusPercentages(defaultBackend, { zaiData, codexData } = {}) {
+  if (defaultBackend === 'codex') return codexUsagePercentages(codexData);
+  if (defaultBackend === 'zcode') return usagePercentages(zaiData);
+  return { shortPct: null, weekPct: null }; // mock &c: no quota, no segment
+}
+
+// The model segment: the topic's STORED model -- what the topic actually
+// runs -- never the backend default when a stored one exists; the default
+// fills only a topic that hasn't got a model yet. defaultModelFor is
+// injected (index.js owns the per-backend defaults); entry may be null.
+export function statusModelFor(entry, defaultBackend, defaultModelFor) {
+  return entry?.model || defaultModelFor(entry?.backend || defaultBackend);
+}
+
+// The whole pinned line, pure so the wording is unit-testable. Order fixed:
+// identity first (fleet/model -- the model alone when unmanaged), then the
+// dynamics, then usage as percentages only. The tail is the owner-agreed
+// 2026-09-01 format; fleet/model is the shared-group design's addition.
+// A missing fleet degrades to the model alone -- a pre-shared-group
+// deployment changes only by gaining the model.
+export function statusLineText({ fleet, model, state, queued, shortPct, weekPct }) {
+  const parts = [];
+  const identity = fleet ? `${fleet}/${model}` : model;
+  if (identity) parts.push(identity);
+  parts.push(state === 'busy' ? 'busy' : 'idle');
+  parts.push(`${queued || 'no'} queued`);
+  const seg = [];
+  if (shortPct != null) seg.push(`${shortPct}% session`);
+  if (weekPct != null) seg.push(`${weekPct}% week`);
+  if (seg.length) parts.push(seg.join(' / '));
+  return `📌 ${parts.join(' · ')}`;
+}
+
 // usageSnapshot: the same figures renderUsage turns into Telegram HTML, as
 // plain data rather than markup -- for the MCP usage_get tool, where the
 // field names ARE the interface. The API's own names are misleading (`usage`
