@@ -184,6 +184,18 @@ export class CodexBackend extends Backend {
     return (res.data ?? []).map((m) => ({ ref: m.model, label: m.displayName || m.model }));
   }
 
+  // The account-level quota view usage_get reports on a codex-default
+  // bridge (owner decision, 2026-09-22). FROM SCHEMA DUMP:
+  // Account/rateLimits/readRequest in the generated app-server schema
+  // (codex-cli 0.153.4); the method takes no params and the response is
+  // GetAccountRateLimitsResponse -- mapped to usage_get's shape in
+  // usage.js's codexUsageSnapshot, not here. The credential is the codex
+  // subprocess's own (auth.json under CODEX_HOME), read by codex itself at
+  // its point of use; this call never sees it.
+  readAccountRateLimits() {
+    return this.client.call('account/rateLimits/read', {});
+  }
+
   listModes() {
     return []; // no mode concept -- see setMode()
   }

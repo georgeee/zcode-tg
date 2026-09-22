@@ -68,7 +68,7 @@ import { Store } from './store.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
 import { ProgressReporter } from './progress.js';
-import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages, usageSnapshotOrThrow } from './usage.js';
+import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages, usageSnapshotOrThrow, codexUsageSnapshotOrThrow, codexUsageFetchError } from './usage.js';
 import { runtimePreferences } from './runtimePrefs.js';
 import { mergeModelLists, resolveModelRef } from './modelref.js';
 
@@ -1548,7 +1548,66 @@ function statusUsageText() {
   return seg.length ? seg.join(' / ') : null;
 }
 
+// --- the codex side of usage_get (owner decision, 2026-09-22) ---
+//
+// usage_get reports the quota of THIS BRIDGE's own default backend; on a
+// codex-default bridge that is the codex account's rate limits, read over
+// the `codex app-server` connection the bridge already holds -- no new
+// external endpoint, no new configuration knob (see usageGetForMcp for the
+// branch). Cached exactly the way the z.ai fetch above is cached: one
+// shared in-flight fetch, ~5 min TTL, a second caller joins the first's
+// fetch rather than stampeding the RPC.
+let codexUsageCache = { at: 0, data: null, pending: null, failure: null };
+
+// A FAILED fetch is remembered for the same TTL a success is, and
+// re-classified per call (codexUsageGetForMcp): usage_get's contract is an
+// honest WHICH-failure, so a caller retrying 10s after a rejection must get
+// the same sentence, not a silent second RPC -- repeated calls cost one RPC
+// per 5 minutes after failures too, not just after successes.
+function ensureCodexUsageFetch() {
+  if (Date.now() - codexUsageCache.at < 5 * 60_000) return codexUsageCache.pending;
+  if (codexUsageCache.pending) return codexUsageCache.pending;
+  codexUsageCache.at = Date.now(); // set eagerly: concurrent callers don't stampede
+  const p = Promise.resolve()
+    .then(() => getBackend('codex').readAccountRateLimits()) // getBackend lazily starts the app-server if eager boot didn't
+    .then((data) => {
+      codexUsageCache = { at: Date.now(), data, pending: null, failure: null };
+      return data;
+    })
+    .catch((e) => {
+      codexUsageCache.pending = null;
+      codexUsageCache.failure = { at: Date.now(), error: e };
+      throw e;
+    });
+  codexUsageCache.pending = p;
+  return p;
+}
+
+async function codexUsageGetForMcp() {
+  if (!codexUsageCache.data && codexUsageCache.failure && Date.now() - codexUsageCache.failure.at < 5 * 60_000) {
+    // Still inside a remembered failure's TTL: same verdict as the call
+    // that fetched, no new RPC.
+    throw codexUsageFetchError(codexUsageCache.failure.error);
+  }
+  let data;
+  try {
+    data = await ensureCodexUsageFetch();
+  } catch (e) {
+    throw codexUsageFetchError(e);
+  }
+  return codexUsageSnapshotOrThrow(data, codexUsageCache.at);
+}
+
 // usageGetForMcp is the usage_get tool's handler.
+//
+// ROUTING, owner decision 2026-09-22: it reports the quota of THIS BRIDGE's
+// own backend, and cfg.defaultBackend is the signal the bridge already uses
+// to decide which backend a brand-new session gets -- the same identity,
+// no new knob. zcode-default keeps the z.ai path below byte for byte;
+// codex-default reads codex's account rate limits (codexUsageGetForMcp
+// above); anything else (mock) has no quota and says so. A caller should
+// not have to know which bridge it is talking to -- but neither should it
+// ever be handed a figure from an account the bridge isn't running on.
 //
 // A COLD CACHE AWAITS ONE FETCH RATHER THAN ERRORING. The status line has
 // nowhere to put a wait -- it fires inline with every turn -- but an MCP
@@ -1560,6 +1619,12 @@ function statusUsageText() {
 // this only changes the one case that used to be an error a model had no
 // way to act on.
 async function usageGetForMcp() {
+  if (cfg.defaultBackend === 'codex') return codexUsageGetForMcp();
+  if (cfg.defaultBackend !== 'zcode') {
+    throw new Error(
+      `usage_get reports this bridge's own backend's quota, and the default backend here is '${cfg.defaultBackend}', ` +
+      'which has no quota to report. Retrying will not change this.');
+  }
   let data = usageCache.data;
   if (!data) {
     try {

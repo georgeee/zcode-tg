@@ -232,7 +232,7 @@ export function createMcpGateway({
     {
       name: 'usage_get',
       description:
-        'Return this account\'s Z.ai coding-plan usage, per quota window (short-term and weekly): credits used, the cap, what remains, and when it resets — READ-ONLY. Lets a supervisor model track spend across the sessions it delegates without going through Telegram\'s /usage command. Figures may lag up to 5 minutes: the account\'s usage endpoint is rate-limit-sensitive, so this is served from the same cache the topic status line uses rather than fetched fresh on every call.',
+        'Return THIS BRIDGE\'s own backend quota — READ-ONLY, as { level, windows: [{window, used, cap, remaining, percentage, resetsAt}], cachedAt }. On a zcode-default bridge that is the account\'s Z.ai coding-plan usage (absolute credits per window: used, cap, remaining all populated). On a codex-default bridge it is the codex account\'s plan rate limits (plan name plus primary/secondary windows); codex reports only a used percentage and a reset time, so there used/cap/remaining are null rather than invented — treat them as "percentage of quota used", not as missing data. Lets a supervisor model track spend across the sessions it delegates without going through Telegram\'s /usage command. Figures may lag up to 5 minutes: both sources are rate-limit-sensitive, so each is served from a shared cache with one shared in-flight refresh rather than fetched fresh on every call.',
       inputSchema: { type: 'object', properties: {} },
     },
     {

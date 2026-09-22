@@ -166,10 +166,11 @@ export function usageSnapshotOrThrow(data, cachedAt, opts = {}) {
     // 2026-09-22 after three calls minutes apart returned the identical
     // sentence, against a zcode bridge that answered on the first call.
     //
-    // Usage here is a Z.AI CODING-PLAN figure specifically -- the tool's own
-    // description says so, it takes no session argument, and it is read from
-    // that account's monitoring endpoint with that account's key. There is no
-    // Codex equivalent to fall back to, so the honest answer is that this
+    // Usage here is a Z.AI CODING-PLAN figure specifically -- this function
+    // is only reached on a zcode-default bridge (a codex-default one is
+    // routed to codexUsageSnapshotOrThrow below, before this runs), it takes
+    // no session argument, and it is read from that account's monitoring
+    // endpoint with that account's key. So the honest answer is that this
     // bridge has no such plan to report, not that the number is late.
     if (opts.unconfigured) {
       throw new Error(
@@ -184,4 +185,114 @@ export function usageSnapshotOrThrow(data, cachedAt, opts = {}) {
 
 function utc(epochMs) {
   return new Date(epochMs).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+}
+
+// --- Codex: usage_get's answer on a codex-default bridge ---
+//
+// Owner decision (2026-09-22): usage_get reports the quota of the bridge's
+// OWN default backend. On a codex-default bridge that is the codex account's
+// rate limits, read over the `codex app-server` connection the bridge
+// already holds (RPC `account/rateLimits/read`), mapped onto the SAME shape
+// usageSnapshot produces for z.ai -- a caller should not have to know which
+// bridge it is talking to. Response shape is the generated app-server
+// schema's GetAccountRateLimitsResponse (codex-cli 0.153.4,
+// `codex app-server generate-json-schema --experimental`):
+//   rateLimits: RateLimitSnapshot { planType?, credits?, primary?, secondary? }
+//   RateLimitWindow { usedPercent (required), windowDurationMins?, resetsAt? }
+//
+// THE TWO UPSTREAM APIs DISAGREE ABOUT WHAT THEY REPORT, and the mapping
+// does not paper over that: z.ai gives absolute credits (used/cap/remaining
+// all real numbers), codex gives only a used PERCENTAGE and a reset time.
+// So the codex windows carry used/cap/remaining as null -- never a cap
+// back-computed from a percentage. A number upstream never reported would
+// read downstream as a measurement, which is the exact failure this effort
+// exists to prevent; the nulls are the interface.
+export function codexUsageSnapshot(data) {
+  const snap = data?.rateLimits;
+  const windows = [];
+  for (const [name, w] of [['Primary', snap?.primary], ['Secondary', snap?.secondary]]) {
+    if (!w || !Number.isFinite(w.usedPercent)) continue;
+    windows.push({
+      window: codexWindowLabel(name, w),
+      used: null,
+      cap: null,
+      remaining: null,
+      percentage: Math.round(w.usedPercent),
+      resetsAt: codexResetsAtIso(w.resetsAt),
+    });
+  }
+  return { level: snap?.planType ?? null, windows };
+}
+
+// windowDurationMins -> "Primary (~5h)" / "Secondary (~45m)"; absent or
+// nonsense -> the bare window name, never a guessed duration.
+export function codexWindowLabel(name, w) {
+  const mins = w?.windowDurationMins;
+  if (!Number.isFinite(mins) || mins <= 0) return name;
+  if (mins < 60) return `${name} (~${mins}m)`;
+  const hours = mins / 60;
+  return Number.isInteger(hours) ? `${name} (~${hours}h)` : `${name} (~${hours.toFixed(1)}h)`;
+}
+
+// The schema types resetsAt as a bare int64 with no unit. Codex's own epoch
+// fields in the SAME generated dump are documented "Unix timestamp in
+// seconds" (RateLimitResetCredit.grantedAt/expiresAt), so seconds it is.
+// FLAG (unverified live -- this host has no codex credential): if a real
+// account shows reset times a multiple of 1000 off, this one `* 1000` is
+// the whole fix.
+export function codexResetsAtIso(resetsAt) {
+  if (!Number.isFinite(resetsAt)) return null;
+  return new Date(resetsAt * 1000).toISOString();
+}
+
+// codexUsageSnapshotOrThrow is the codex side of usage_get, enforcing the
+// same policy usageSnapshotOrThrow enforces for z.ai: an answer that cannot
+// actually answer is an ERROR, never `{windows: []}` -- an empty success
+// reads as "unlimited" to a caller deciding whether to spend.
+export function codexUsageSnapshotOrThrow(data, cachedAt) {
+  if (!data || typeof data !== 'object') {
+    throw new Error('usage could not be fetched: codex account/rateLimits/read returned no payload');
+  }
+  const snap = codexUsageSnapshot(data);
+  if (!snap.windows.length) {
+    // The RPC succeeded and said nothing usable. Not "unlimited", not
+    // "retry shortly" on a loop: say what happened and that retrying is
+    // unlikely to change it.
+    throw new Error(
+      'usage could not be fetched: codex account/rateLimits/read answered but reported no populated window ' +
+      '(no primary or secondary usedPercent). Retrying will not help unless the account state just changed.');
+  }
+  return { ...snap, cachedAt: new Date(cachedAt).toISOString() };
+}
+
+// codexUsageFetchError turns a REJECTED account/rateLimits/read into the
+// error usage_get surfaces: WHICH failure it was, and whether retrying can
+// help -- the same discipline as usageSnapshotOrThrow's
+// unconfigured-vs-not-yet split. Pure (error in, error out) so it is
+// unit-testable without a codex credential.
+//
+// What the classifier can actually distinguish: codexClient preserves the
+// JSON-RPC error code on the rejected Error (codexClient.js's _onMessage
+// response path), so "this build lacks the RPC" is precise (-32601); login
+// state, by contrast, arrives as a server-authored MESSAGE with no
+// reserved code, and the exact wording is UNVERIFIED LIVE (no credential on
+// this host) -- hence the pattern match plus the verbatim server text in
+// every message, so a mismatch on a real account is visible, not hidden.
+export function codexUsageFetchError(e) {
+  const detail = e?.message || String(e);
+  if (e?.code === -32601 || /method not found/i.test(detail)) {
+    return new Error(
+      `usage could not be fetched: this codex version does not support account/rateLimits/read (codex said: ${detail}). ` +
+      'Retrying will not help; the codex CLI needs upgrading.');
+  }
+  if (/not logged in|not authenticated|unauthorized|login required|no credentials|api key/i.test(detail)) {
+    return new Error(
+      `usage could not be fetched: the codex account on this bridge is not logged in (codex said: ${detail}). ` +
+      'Retrying will not help until the credential under CODEX_HOME is fixed.');
+  }
+  // Process death, spawn failure, timeout: the bridge restarts a dead
+  // default backend automatically, so these genuinely can clear.
+  return new Error(
+    `usage could not be fetched: codex account/rateLimits/read failed (codex said: ${detail}). ` +
+    'This may be transient; retrying may help.');
 }
