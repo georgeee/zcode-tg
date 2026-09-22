@@ -127,3 +127,27 @@ test('usageSnapshotOrThrow returns the reshaped data plus when it was fetched', 
 test('usageSnapshotOrThrow refuses to answer before anything has been fetched', () => {
   assert.throws(() => usageSnapshotOrThrow(null, 0), /has not been fetched yet/);
 });
+
+// A BRIDGE WITH NO Z.AI CREDENTIAL IS NOT A COLD CACHE, and until this test
+// existed both answered the same sentence.
+//
+// usage is a Z.ai coding-plan figure: the tool takes no session argument and
+// reads that account's monitoring endpoint with that account's key. A
+// codex-default deployment has no such credential BY DESIGN -- index.js says
+// so where it skips the fetch ("expected on a non-zcode-default deployment")
+// -- so its cache is empty for ever, and "retry shortly" sends a caller round
+// a loop with no exit. Reported from the field 2026-09-22: three calls minutes
+// apart, identical sentence, against a zcode bridge that answered first time.
+test('usageSnapshotOrThrow says nothing will arrive when no z.ai credential is configured', () => {
+  assert.throws(() => usageSnapshotOrThrow(null, 0, { unconfigured: true }), /no usage to report/);
+  assert.throws(() => usageSnapshotOrThrow(null, 0, { unconfigured: true }), /Retrying will not change this/);
+  // AND IT MUST NOT SAY THE OTHER THING: the two causes want opposite advice,
+  // so a message carrying both is no better than the one it replaced.
+  assert.doesNotMatch(
+    (() => { try { usageSnapshotOrThrow(null, 0, { unconfigured: true }); } catch (e) { return e.message; } })(),
+    /retry shortly/);
+});
+
+test('usageSnapshotOrThrow still says "not yet" for a cold cache that WILL fill', () => {
+  assert.throws(() => usageSnapshotOrThrow(null, 0, { unconfigured: false }), /has not been fetched yet/);
+});

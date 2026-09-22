@@ -153,8 +153,32 @@ export function usageSnapshot(data) {
 // out) so this policy is unit-testable the same way every other rule in
 // this file is, rather than living unreachably inside index.js, which
 // exports nothing.
-export function usageSnapshotOrThrow(data, cachedAt) {
-  if (!data) throw new Error('usage has not been fetched yet; retry shortly');
+export function usageSnapshotOrThrow(data, cachedAt, opts = {}) {
+  if (!data) {
+    // AN EMPTY CACHE HAS TWO CAUSES AND THEY WANT OPPOSITE ADVICE.
+    //
+    // "retry shortly" is true of a cold or a failed fetch and FALSE of a
+    // bridge that has no z.ai credential at all -- which is the normal state
+    // of a codex- or mock-default deployment, and is described as such where
+    // the fetch is skipped ("expected on a non-zcode-default deployment").
+    // On such a bridge nothing will ever arrive, and telling a caller to
+    // retry sends it round a loop with no exit: reported from the field on
+    // 2026-09-22 after three calls minutes apart returned the identical
+    // sentence, against a zcode bridge that answered on the first call.
+    //
+    // Usage here is a Z.AI CODING-PLAN figure specifically -- the tool's own
+    // description says so, it takes no session argument, and it is read from
+    // that account's monitoring endpoint with that account's key. There is no
+    // Codex equivalent to fall back to, so the honest answer is that this
+    // bridge has no such plan to report, not that the number is late.
+    if (opts.unconfigured) {
+      throw new Error(
+        'no usage to report: this is a Z.ai coding-plan figure and this bridge has no z.ai ' +
+        'credential configured, which is expected on a codex- or mock-default deployment. ' +
+        'Retrying will not change this.');
+    }
+    throw new Error('usage has not been fetched yet; retry shortly');
+  }
   return { ...usageSnapshot(data), cachedAt: new Date(cachedAt).toISOString() };
 }
 

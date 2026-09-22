@@ -1454,7 +1454,7 @@ const topicStatus = new Map(); // threadId -> { messageId, pinned, gone }
 // that matters most. Cached with a TTL: status writes fire on every turn
 // start/end across every topic, and this is one call per 5 minutes
 // regardless of how much of that traffic there is.
-let usageCache = { at: 0, data: null, pending: null, warned: false };
+let usageCache = { at: 0, data: null, pending: null, warned: false, unconfigured: false };
 
 // ensureUsageFetch starts a fetch if the cache is stale and none is already
 // in flight, and returns whatever fetch IS in flight (possibly one a
@@ -1493,6 +1493,10 @@ function ensureUsageFetch() {
   try {
     apiKey = readZaiApiKey(cfg.zaiConfigPath);
   } catch (e) {
+    // REMEMBERED, not just logged: usage_get has to tell a caller that
+    // nothing will ever arrive here, which is a different sentence from
+    // "not yet". See usageSnapshotOrThrow.
+    usageCache.unconfigured = true;
     if (!usageCache.warned) {
       usageCache.warned = true;
       console.error(`[bridge] usage fetch skipped (no zcode credential configured -- expected on a non-zcode-default deployment): ${e.message}`);
@@ -1566,7 +1570,7 @@ async function usageGetForMcp() {
   } else {
     ensureUsageFetch()?.catch(() => {}); // still keep the cache warm in the background
   }
-  return usageSnapshotOrThrow(data, usageCache.at);
+  return usageSnapshotOrThrow(data, usageCache.at, { unconfigured: usageCache.unconfigured });
 }
 
 // Owner-specified format (2026-09-01): one compact line -- one-word state,
