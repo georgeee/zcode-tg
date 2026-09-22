@@ -1,4 +1,7 @@
-// /usage: Z.ai coding-plan quota, straight from the monitoring endpoint the
+// Usage figures for the Telegram /usage command and the MCP usage_get tool:
+// one snapshot shape, one renderer, one failure wording, two backends. The
+// z.ai leg below reads the coding-plan quota straight from the monitoring
+// endpoint the
 // account's own dashboard uses (GET /api/monitor/usage/quota/limit with the
 // same API key the zcode session runs on). Field names are misleading and
 // were confirmed against a live response, not guessed:
@@ -22,9 +25,33 @@ export function readZaiApiKey(configPath) {
 // index.js): a "user"-source registry push needs the kind/baseURL/apiKey
 // that builtins resolve internally.
 export function readZaiProvider(configPath) {
-  const zai = JSON.parse(readFileSync(configPath, 'utf8'))?.provider?.zai;
+  // MISSING FILE counts exactly like a missing key block -- both mean "no
+  // z.ai credential HERE", which is PERMANENT, not transient. The owner's
+  // reported case was precisely this: a codex bridge's HOME has no
+  // config.json, readFileSync threw ENOENT, and because only the key-block
+  // check below was coded, the cache classified it transient -- 60s backoff,
+  // retried forever, and usage_get said "usage could not be fetched: ENOENT"
+  // instead of the honest no-credential sentence. So the read and parse are
+  // inside the tag too: ANY failure from this function carries
+  // ZAI_UNCONFIGURED, with the original message (and stack) untouched, so
+  // every caller and classifier agrees.
+  let zai;
+  try {
+    zai = JSON.parse(readFileSync(configPath, 'utf8'))?.provider?.zai;
+  } catch (e) {
+    e.code = 'ZAI_UNCONFIGURED';
+    throw e;
+  }
   const apiKey = zai?.options?.apiKey;
-  if (!zai || !apiKey) throw new Error(`no provider.zai.options.apiKey in ${configPath}`);
+  if (!zai || !apiKey) {
+    // CODED, not just worded: the usage cache classifies this failure as
+    // PERMANENT (no credential here, now or later -- "expected on a
+    // non-zcode-default deployment"), so it is remembered and never retried
+    // rather than backed off like a 429. See createUsageCache.
+    const e = new Error(`no provider.zai.options.apiKey in ${configPath}`);
+    e.code = 'ZAI_UNCONFIGURED';
+    throw e;
+  }
   return { providerId: 'zai', kind: zai.kind, label: zai.name, baseURL: zai.options.baseURL, apiKey };
 }
 
@@ -88,18 +115,80 @@ function grouped(n) {
   return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
-export function renderUsage(data, now = Date.now()) {
-  const head = `📊 <b>Z.ai usage</b>${data.level ? ` · plan <i>${esc(data.level)}</i>` : ''}`;
-  const blocks = data.limits.map((l) => {
-    const pct = Number.isFinite(l.percentage) ? Math.round(l.percentage) : 0;
-    const remaining = Number.isFinite(l.remaining) ? `${grouped(l.remaining)} cr left · ` : '';
+// Ages are short (a cached figure served after a failed refresh is minutes
+// old, not hours): seconds under a minute, minutes under an hour, then
+// hours+minutes. Grouping by hand like `grouped` above -- no ICU dependence.
+function humanAge(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h${m % 60}m`;
+}
+
+// renderUsage consumes the COMMON usage snapshot -- the exact {level,
+// windows[{window, used, cap, remaining, percentage, resetsAt}], cachedAt}
+// shape usageSnapshotOrThrow and codexUsageSnapshotOrThrow return -- not
+// either upstream API's raw fields. ONE renderer for both backends: neither
+// API's misleading names (`usage` is a cap) can leak into the wording, and a
+// caller cannot get two different sentences for the same question. Windows
+// where codex reports no absolutes (used/cap/remaining null -- "the nulls
+// are the interface") render percentage-led, never as a fabricated "0/0" or
+// "0 cr left"; a z.ai window keeps its long-standing wording byte for byte.
+// `label` names the account in the headline (z.ai keeps its long-standing
+// "Z.ai usage"; the codex command passes "codex usage"). cachedAt is part of
+// the shape but stays unrendered: a figure inside the normal cache window
+// does not announce its age -- staleness is only NEWS when a refresh FAILED
+// and the cached figure is served anyway, and that case arrives marked as
+// `stale: {ageMs, reason}`, rendered as the ⚠️ trailing line below.
+export function renderUsage(snapshot, { label = 'Z.ai usage', now = Date.now() } = {}) {
+  const head = `📊 <b>${label}</b>${snapshot.level ? ` · plan <i>${esc(snapshot.level)}</i>` : ''}`;
+  const blocks = (Array.isArray(snapshot.windows) ? snapshot.windows : []).map((w) => {
+    const pct = Number.isFinite(w.percentage) ? Math.round(w.percentage) : 0;
+    // Absolute credits are a z.ai capability, not a default: printed only
+    // when BOTH endpoints are real numbers, so a codex window (used/cap
+    // null) falls to the percentage alone rather than to invented zeros.
+    const measure = Number.isFinite(w.used) && Number.isFinite(w.cap)
+      ? `${grouped(w.used)} / ${grouped(w.cap)} cr (${pct}%)`
+      : `${pct}% used`;
+    const remaining = Number.isFinite(w.remaining) ? `${grouped(w.remaining)} cr left · ` : '';
+    const resetsAtMs = typeof w.resetsAt === 'number' ? w.resetsAt : Date.parse(w.resetsAt);
+    const reset = Number.isFinite(resetsAtMs)
+      ? `resets in ~${humanRemaining(resetsAtMs - now)} · ${utc(resetsAtMs)}`
+      : 'reset time unknown';
     return [
-      `${dot(pct)} <b>${windowLabel(l)}</b> — ${grouped(l.currentValue)} / ${grouped(l.usage)} cr (${pct}%)`,
+      `${dot(pct)} <b>${w.window}</b> — ${measure}`,
       `<code>${bar(pct)}</code>`,
-      `${remaining}resets in ~${humanRemaining(l.nextResetTime - now)} · ${utc(l.nextResetTime)}`,
+      `${remaining}${reset}`,
     ].join('\n');
   });
-  return [head, '', ...blocks].join('\n\n');
+  const lines = [head, '', ...blocks];
+  if (snapshot.stale) {
+    // Half-2 policy (owner decision, 2026-09-22): an explicit ask whose
+    // refresh FAILED is answered from the cache -- but a stale figure that
+    // looks fresh is a lie, so the age and the reason travel with it. The
+    // reason is upstream text: escaped like everything else.
+    lines.push(`⚠️ figures ${humanAge(snapshot.stale.ageMs)} old · refresh failed: ${esc(snapshot.stale.reason)}`);
+  }
+  return lines.join('\n\n');
+}
+
+// usageTelegramText is the Telegram /usage command's WHOLE render, and exists
+// to enforce the two halves of "one wording, both surfaces" by construction:
+// the command's source selection is the SAME call usage_get makes (index.js
+// hands over usageGetForMcp itself as a thunk -- no re-branch on
+// cfg.defaultBackend here to drift out of sync), and a failure renders the
+// SAME sentence usage_get throws, behind the command's own ⚠️ prefix. Pulled
+// out as a pure function (a snapshot thunk in, Telegram text out) for the
+// usual reason: index.js exports nothing, so this is the only testable seam.
+// The prefix is the command surface's failure affordance, predating
+// backend-awareness; everything after it is the shared sentence, byte for byte.
+export async function usageTelegramText(getSnapshot, opts = {}) {
+  try {
+    return renderUsage(await getSnapshot(), opts);
+  } catch (e) {
+    return `⚠️ /usage failed: ${e.message}`;
+  }
 }
 
 // Percentages-only digest for the per-topic status line ("11% session /
@@ -153,6 +242,18 @@ export function usageSnapshot(data) {
 // out) so this policy is unit-testable the same way every other rule in
 // this file is, rather than living unreachably inside index.js, which
 // exports nothing.
+// The unconfigured sentence, its own function so BOTH surfaces throw the
+// same object: usageSnapshotOrThrow (direct callers, tested below) and
+// index.js's usageGetForMcp, whose explicit-ask path discovers
+// unconfigured-ness through the cache rather than through a null data
+// argument.
+export function unconfiguredUsageError() {
+  return new Error(
+    'no usage to report: this is a Z.ai coding-plan figure and this bridge has no z.ai ' +
+    'credential configured, which is expected on a codex- or mock-default deployment. ' +
+    'Retrying will not change this.');
+}
+
 export function usageSnapshotOrThrow(data, cachedAt, opts = {}) {
   if (!data) {
     // AN EMPTY CACHE HAS TWO CAUSES AND THEY WANT OPPOSITE ADVICE.
@@ -166,18 +267,13 @@ export function usageSnapshotOrThrow(data, cachedAt, opts = {}) {
     // 2026-09-22 after three calls minutes apart returned the identical
     // sentence, against a zcode bridge that answered on the first call.
     //
-    // Usage here is a Z.AI CODING-PLAN figure specifically -- this function
+    // Usage here is a Z.AI CODING-PLAN FIGURE SPECIFICALLY -- this function
     // is only reached on a zcode-default bridge (a codex-default one is
     // routed to codexUsageSnapshotOrThrow below, before this runs), it takes
     // no session argument, and it is read from that account's monitoring
     // endpoint with that account's key. So the honest answer is that this
     // bridge has no such plan to report, not that the number is late.
-    if (opts.unconfigured) {
-      throw new Error(
-        'no usage to report: this is a Z.ai coding-plan figure and this bridge has no z.ai ' +
-        'credential configured, which is expected on a codex- or mock-default deployment. ' +
-        'Retrying will not change this.');
-    }
+    if (opts.unconfigured) throw unconfiguredUsageError();
     throw new Error('usage has not been fetched yet; retry shortly');
   }
   return { ...usageSnapshot(data), cachedAt: new Date(cachedAt).toISOString() };
@@ -295,4 +391,137 @@ export function codexUsageFetchError(e) {
   return new Error(
     `usage could not be fetched: codex account/rateLimits/read failed (codex said: ${detail}). ` +
     'This may be transient; retrying may help.');
+}
+
+// --- the cache policy both backends' usage figures are served under ---
+//
+// ONE POLICY, TWO INSTANCES (owner decision 2026-09-22, "half 2"). An
+// EXPLICIT ask (MCP usage_get, TG /usage) and the background status line
+// have opposite shapes, and the old single-TTL cache served both badly: the
+// status line wants a slow cache and must never stall a turn, while a person
+// or model ASKING wants movement -- twice a minute apart must show two
+// different numbers when the account is moving, and a failed refresh must
+// degrade to the cached figure WITH ITS AGE rather than to an error.
+//
+//   - heartbeat(): the status line's path. Fire-and-forget on the 5-minute
+//     TTL, never awaited, exactly the old getUsageData contract.
+//   - explicitAsk(floorMs): the ask path. Fresh-enough cache answers at
+//     once; a staler one AWAITED its own refresh (the old warm path returned
+//     stale and refreshed behind the answer -- that was the bug); a failed
+//     refresh with a cached figure returns {data, stale:{ageMs, reason}},
+//     and with nothing cached throws as before.
+//   - failUntil: after ANY failed refresh, explicit asks for the next
+//     failBackoffMs serve the cache instead of re-hitting upstream. Does not
+//     touch the heartbeat, whose 5-minute TTL already governs it (60s < 5min,
+//     so the backoff can only ever be the shorter suppression).
+//
+// The machinery lives here and not in index.js for the standing reason:
+// index.js exports nothing, and a time-based policy is exactly the thing
+// that must be pinned against an injected clock and a counting fetch.
+export function createUsageCache({
+  fetch, // async () => raw upstream payload; throws on failure
+  failBackoffMs = 60_000,
+  ttlMs = 5 * 60_000, // the status line's 5-minute cache
+  now = Date.now, // injectable clock
+  isUnconfigured = () => false, // a PERMANENT failure (no credential): remembered, never retried, never backed off
+  onUnconfigured = () => {}, // called once, on first discovery
+  onFailure = () => {}, // called once per failure streak (resets on success)
+}) {
+  let at = 0; // last refresh ATTEMPT, set eagerly -- the stampede guard; drives ttlMs
+  let dataAt = 0; // when `data` was actually fetched; drives cachedAt and stale.ageMs
+  let data = null; // last successful fetch
+  let pending = null; // in-flight refresh; a second caller JOINS it, never stampedes
+  let failUntil = 0; // explicit asks before this instant must not touch upstream
+  let failure = null; // the last failure (stale.reason; the cold-cache throw)
+  let unconfigured = false;
+  let unconfiguredReported = false;
+  let failureReported = false;
+
+  function startFetch() {
+    at = now(); // eager: concurrent callers join rather than stampede
+    const p = Promise.resolve()
+      .then(fetch)
+      .then((fresh) => {
+        data = fresh;
+        dataAt = now();
+        pending = null;
+        failure = null;
+        failureReported = false;
+        return fresh;
+      })
+      .catch((e) => {
+        pending = null;
+        failure = e;
+        if (isUnconfigured(e)) {
+          // Permanent: remembered and reported once. No backoff -- backoff
+          // is for rate limits, and this needs no retry at all. The eager
+          // `at` still keeps the heartbeat quiet for a TTL, as before.
+          unconfigured = true;
+          if (!unconfiguredReported) {
+            unconfiguredReported = true;
+            onUnconfigured(e);
+          }
+        } else {
+          failUntil = now() + failBackoffMs;
+          if (!failureReported) {
+            failureReported = true;
+            onFailure(e);
+          }
+        }
+        throw e;
+      });
+    pending = p;
+    return p;
+  }
+
+  // ensure(maxAgeMs): the shared refresh decision, parameterised per
+  // decision 1 (default: the 5-minute heartbeat TTL). Returns the in-flight
+  // promise when a refresh is being or about to be fetched -- JOIN it; null
+  // when nothing should happen: cache fresh enough for this caller's bar,
+  // inside the failure backoff, or permanently unconfigured.
+  function ensure(maxAgeMs = ttlMs) {
+    if (unconfigured) return null;
+    if (now() - at < maxAgeMs) return pending;
+    if (now() < failUntil) return null;
+    if (pending) return pending;
+    return startFetch();
+  }
+
+  // heartbeat: the status line's path. Fire-and-forget BY CONTRACT -- the
+  // caller is never made to wait on upstream; whatever is cached RIGHT NOW
+  // comes back, and a due refresh happens in the background.
+  function heartbeat() {
+    const p = ensure();
+    if (p) p.catch(() => {}); // rejection is handled (and reported) inside startFetch
+    return data;
+  }
+
+  // explicitAsk: the usage_get / /usage path. Returns {data} for a fresh
+  // answer, {data, stale:{ageMs, reason}} when a failed refresh (or the
+  // backoff behind one) forced the cached figure, and throws when there is
+  // nothing cached to fall back to.
+  async function explicitAsk(floorMs) {
+    if (unconfigured) throw failure;
+    if (data != null && now() - dataAt < floorMs) return { data }; // fresh enough: answer at once, no fetch
+    if (now() < failUntil) {
+      if (data != null) return { data, stale: { ageMs: now() - dataAt, reason: failure.message } };
+      throw failure; // cold and cooling down: the same verdict as the call that failed, no fetch
+    }
+    try {
+      await (ensure(floorMs) ?? 0); // AWAITED: the answer waits for its own refresh
+      return { data };
+    } catch (e) {
+      if (data != null) return { data, stale: { ageMs: now() - dataAt, reason: e.message } };
+      throw e; // nothing cached: throw as before
+    }
+  }
+
+  return {
+    ensure,
+    heartbeat,
+    explicitAsk,
+    get data() { return data; },
+    get dataAt() { return dataAt; },
+    get unconfigured() { return unconfigured; },
+  };
 }

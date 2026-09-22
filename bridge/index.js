@@ -11,7 +11,7 @@
 //
 // Bridge commands (intercepted before anything reaches the model; anything
 // else starting with / is passed through to zcode's own command handling):
-//   /usage      Z.ai plan quota, from the account's monitoring endpoint
+//   /usage      plan quota for this bridge's own backend (the usage_get path)
 //   /stop /cancel   cancel the topic's running turn
 //   /queue      list this topic's queued messages
 //   /clearqueue drop this topic's queued messages
@@ -68,7 +68,7 @@ import { Store } from './store.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
 import { ProgressReporter, stepDetail, noteActivity, progressForTopic } from './progress.js';
-import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages, usageSnapshotOrThrow, codexUsageSnapshotOrThrow, codexUsageFetchError } from './usage.js';
+import { readZaiApiKey, readZaiProvider, fetchUsage, usagePercentages, usageSnapshotOrThrow, codexUsageSnapshotOrThrow, codexUsageFetchError, usageTelegramText, createUsageCache, unconfiguredUsageError } from './usage.js';
 import { runtimePreferences } from './runtimePrefs.js';
 import { mergeModelLists, resolveModelRef } from './modelref.js';
 
@@ -215,7 +215,7 @@ let mcp = null;
 // Registered with Telegram on boot so these show as / autocomplete in the
 // client. Keep in sync with the command handling in handleMessage().
 const BOT_COMMANDS = [
-  { command: 'usage', description: 'Z.ai plan usage & quota' },
+  { command: 'usage', description: "Plan usage & quota (this bridge's backend)" },
   { command: 'stop', description: "Cancel this topic's running turn" },
   { command: 'cancel', description: "Cancel this topic's running turn" },
   { command: 'queue', description: 'Show queued messages in this topic' },
@@ -1468,79 +1468,33 @@ const topicStatus = new Map(); // threadId -> { messageId, pinned, gone }
 // percentages AND the MCP usage_get tool a supervisor model may poll before
 // delegating each task. ONE cache rather than one per consumer: this
 // endpoint is the account's rate-limit-sensitive monitor (observed to 429
-// under load), and a second independent fetch path would double the
-// outbound rate exactly when the account is busiest, which is exactly when
-// that matters most. Cached with a TTL: status writes fire on every turn
-// start/end across every topic, and this is one call per 5 minutes
-// regardless of how much of that traffic there is.
-let usageCache = { at: 0, data: null, pending: null, warned: false, unconfigured: false };
-
-// ensureUsageFetch starts a fetch if the cache is stale and none is already
-// in flight, and returns whatever fetch IS in flight (possibly one a
-// concurrent caller already started), or null when the cache is fresh and
-// nothing needs to happen.
+// under load), and a second independent fetch path would double the outbound
+// rate exactly when the account is busiest.
 //
-// SHARED, NOT RESTARTED: the status line and usage_get can both be asking
-// at once, and the second one to ask must join the first one's fetch rather
-// than opening a second connection to an endpoint that already 429s under
-// load.
-function ensureUsageFetch() {
-  if (Date.now() - usageCache.at < 5 * 60_000) return usageCache.pending;
-  if (usageCache.pending) return usageCache.pending;
-  usageCache.at = Date.now(); // set eagerly: concurrent callers don't stampede
-  // readZaiApiKey() reads ~/.zcode/cli/config.json SYNCHRONOUSLY and THROWS
-  // if it's missing or malformed (by design -- see usage.js and
-  // zcodeBackend.js's _warmWorkspaceCatalog, which already relies on that
-  // throw). A codex- or mock-DEFAULT deployment (this runs unconditionally
-  // in main() via refreshUsagePercentages(), regardless of
-  // cfg.defaultBackend) has no reason to have this file at all -- "no zcode
-  // credential configured" is the whole point of such a deployment, not a
-  // misconfiguration. A bare `readZaiApiKey(...)` used to be evaluated as
-  // fetchUsage()'s ARGUMENT, so the throw happened before fetchUsage() (and
-  // its own .catch() below) ever got involved -- an uncaught synchronous
-  // exception straight out of main(), which main().catch() treats as fatal
-  // (process.exit(1)). Found live (test/e2e-codex-bug3-smoke.mjs): this
-  // crashed a codex-default bridge with an isolated $HOME on its very first
-  // call, DURING main(), before the "mcp gateway listening" log line ever
-  // printed -- a second, independent way "bug #3" could manifest as "the
-  // Codex MCP socket never binds", on top of the eager-start and
-  // spawn-'error' fixes elsewhere in this file/zcodeClient.js. No usage
-  // figures is an ordinary, already-supported degradation (the status line
-  // already renders nothing when the cache is empty) -- not a reason to
-  // take the whole bridge down.
-  let apiKey;
-  try {
-    apiKey = readZaiApiKey(cfg.zaiConfigPath);
-  } catch (e) {
-    // REMEMBERED, not just logged: usage_get has to tell a caller that
-    // nothing will ever arrive here, which is a different sentence from
-    // "not yet". See usageSnapshotOrThrow.
-    usageCache.unconfigured = true;
-    if (!usageCache.warned) {
-      usageCache.warned = true;
-      console.error(`[bridge] usage fetch skipped (no zcode credential configured -- expected on a non-zcode-default deployment): ${e.message}`);
-    }
-    return null;
-  }
-  const p = fetchUsage({ apiKey })
-    .then((data) => {
-      usageCache = { at: Date.now(), data, pending: null, warned: false };
-      return data;
-    })
-    .catch((e) => {
-      usageCache.pending = null;
-      // Log once per failure streak, not per call: this endpoint 429s when
-      // the account runs hot (observed live), and a stale answer is a
-      // degradation, not an emergency.
-      if (!usageCache.warned) {
-        usageCache.warned = true;
-        console.error(`[bridge] usage refresh failed (figures will lag or be omitted): ${e.message}`);
-      }
-      throw e;
-    });
-  usageCache.pending = p;
-  return p;
-}
+// The POLICY lives in createUsageCache (usage.js) -- explicit asks (usage_get,
+// /usage) refresh once the cache is older than a 30s floor and await their own
+// refresh, the status line keeps the 5-minute cache fire-and-forget, and a
+// failed refresh backs explicit asks off for 60s and serves the cached figure
+// with its age -- because index.js exports nothing and that policy is
+// unit-tested there against an injected clock and a counting fetch.
+//
+// The key read is INSIDE the fetch, never evaluated as a bare argument:
+// readZaiApiKey() throws synchronously when the file is missing, and a
+// codex- or mock-DEFAULT deployment (this cache is built regardless of
+// cfg.defaultBackend) has no reason to have that file at all. It used to
+// crash such a bridge straight out of main() before the MCP socket ever
+// bound (found live, test/e2e-codex-bug3-smoke.mjs); inside the promise
+// chain it is classified instead (ZAI_UNCONFIGURED -- permanent: remembered,
+// logged once, never retried).
+const zaiUsageCache = createUsageCache({
+  // explicit asks pass their 30s floor at the explicitAsk() call sites (see
+  // usageGetForMcp) -- the floor is a property of the ASK, not of this cache,
+  // whose own TTL is the status line's 5 minutes.
+  fetch: () => fetchUsage({ apiKey: readZaiApiKey(cfg.zaiConfigPath) }),
+  isUnconfigured: (e) => e?.code === 'ZAI_UNCONFIGURED',
+  onUnconfigured: (e) => console.error(`[bridge] usage fetch skipped (no zcode credential configured -- expected on a non-zcode-default deployment): ${e.message}`),
+  onFailure: (e) => console.error(`[bridge] usage refresh failed (figures will lag or be omitted): ${e.message}`),
+});
 
 // getUsageData returns whatever is cached RIGHT NOW, stale or not, and
 // refreshes the cache in the background if it is due.
@@ -1548,11 +1502,9 @@ function ensureUsageFetch() {
 // THE STALE VALUE, IMMEDIATELY, NEVER AWAITED: a status write fires on
 // every turn start/end across every topic, and must never stall one on a
 // call to an endpoint that can itself hang or 429 -- so this renders the
-// PREVIOUS cache and figures lag by at most one refresh cycle, same as
-// before ensureUsageFetch existed.
+// PREVIOUS cache and figures lag by at most one refresh cycle.
 function getUsageData() {
-  ensureUsageFetch()?.catch(() => {}); // fire-and-forget: rejection is logged inside ensureUsageFetch already
-  return usageCache.data; // the previous successful fetch, or null before the first one ever lands
+  return zaiUsageCache.heartbeat();
 }
 
 function refreshUsagePercentages() {
@@ -1560,7 +1512,7 @@ function refreshUsagePercentages() {
 }
 
 function statusUsageText() {
-  const { shortPct, weekPct } = usagePercentages(usageCache.data);
+  const { shortPct, weekPct } = usagePercentages(zaiUsageCache.data);
   const seg = [];
   if (shortPct != null) seg.push(`${shortPct}% session`);
   if (weekPct != null) seg.push(`${weekPct}% week`);
@@ -1573,48 +1525,27 @@ function statusUsageText() {
 // codex-default bridge that is the codex account's rate limits, read over
 // the `codex app-server` connection the bridge already holds -- no new
 // external endpoint, no new configuration knob (see usageGetForMcp for the
-// branch). Cached exactly the way the z.ai fetch above is cached: one
-// shared in-flight fetch, ~5 min TTL, a second caller joins the first's
-// fetch rather than stampeding the RPC.
-let codexUsageCache = { at: 0, data: null, pending: null, failure: null };
-
-// A FAILED fetch is remembered for the same TTL a success is, and
-// re-classified per call (codexUsageGetForMcp): usage_get's contract is an
-// honest WHICH-failure, so a caller retrying 10s after a rejection must get
-// the same sentence, not a silent second RPC -- repeated calls cost one RPC
-// per 5 minutes after failures too, not just after successes.
-function ensureCodexUsageFetch() {
-  if (Date.now() - codexUsageCache.at < 5 * 60_000) return codexUsageCache.pending;
-  if (codexUsageCache.pending) return codexUsageCache.pending;
-  codexUsageCache.at = Date.now(); // set eagerly: concurrent callers don't stampede
-  const p = Promise.resolve()
-    .then(() => getBackend('codex').readAccountRateLimits()) // getBackend lazily starts the app-server if eager boot didn't
-    .then((data) => {
-      codexUsageCache = { at: Date.now(), data, pending: null, failure: null };
-      return data;
-    })
-    .catch((e) => {
-      codexUsageCache.pending = null;
-      codexUsageCache.failure = { at: Date.now(), error: e };
-      throw e;
-    });
-  codexUsageCache.pending = p;
-  return p;
-}
+// branch). SAME cache policy as the z.ai cache (createUsageCache, usage.js):
+// one shared in-flight fetch, a second caller joins rather than stampedes --
+// with the floors that fit a LOCAL RPC: floorMs 0, so every explicit ask may
+// refresh (a local round trip cannot 429), and the 60s failure backoff,
+// which is what bounds the cost of asking while the app-server is dead --
+// getBackend lazily starts it, and a dead one is re-attempted at most once
+// per backoff, never once per ask.
+const codexUsageCache = createUsageCache({
+  fetch: () => getBackend('codex').readAccountRateLimits(), // getBackend lazily starts the app-server if eager boot didn't
+});
 
 async function codexUsageGetForMcp() {
-  if (!codexUsageCache.data && codexUsageCache.failure && Date.now() - codexUsageCache.failure.at < 5 * 60_000) {
-    // Still inside a remembered failure's TTL: same verdict as the call
-    // that fetched, no new RPC.
-    throw codexUsageFetchError(codexUsageCache.failure.error);
-  }
-  let data;
+  let result;
   try {
-    data = await ensureCodexUsageFetch();
+    result = await codexUsageCache.explicitAsk(0);
   } catch (e) {
     throw codexUsageFetchError(e);
   }
-  return codexUsageSnapshotOrThrow(data, codexUsageCache.at);
+  const snap = codexUsageSnapshotOrThrow(result.data, codexUsageCache.dataAt);
+  if (result.stale) snap.stale = result.stale;
+  return snap;
 }
 
 // usageGetForMcp is the usage_get tool's handler.
@@ -1628,15 +1559,16 @@ async function codexUsageGetForMcp() {
 // not have to know which bridge it is talking to -- but neither should it
 // ever be handed a figure from an account the bridge isn't running on.
 //
-// A COLD CACHE AWAITS ONE FETCH RATHER THAN ERRORING. The status line has
-// nowhere to put a wait -- it fires inline with every turn -- but an MCP
-// tool call is exactly the place a real answer belongs: the gateway already
-// lets message_send block for up to ten minutes waiting on a model turn, so
-// blocking for the ~10s fetchUsage's own timeout allows, on the FIRST call
-// this bridge has ever made, is a real answer rather than a degradation. A
-// warm cache is still returned immediately, unawaited, exactly as before --
-// this only changes the one case that used to be an error a model had no
-// way to act on.
+// AN EXPLICIT ASK REFRESHES ONCE THE CACHE IS OLDER THAN THE 30s FLOOR, AND
+// AWAITS ITS OWN REFRESH (owner decision, half 2, 2026-09-22): twice a
+// minute apart must show movement, so the old warm path -- answer stale
+// immediately, refresh behind the answer -- is gone. A failed refresh with
+// a cached figure degrades to cached + `stale: {ageMs, reason}` rather than
+// an error; with nothing cached it throws as before. A COLD CACHE STILL
+// AWAITS ONE FETCH RATHER THAN ERRORING: the gateway already lets
+// message_send block for up to ten minutes, so blocking for the ~10s
+// fetchUsage's own timeout allows, on the FIRST call this bridge has ever
+// made, is a real answer rather than a degradation.
 async function usageGetForMcp() {
   if (cfg.defaultBackend === 'codex') return codexUsageGetForMcp();
   if (cfg.defaultBackend !== 'zcode') {
@@ -1644,17 +1576,16 @@ async function usageGetForMcp() {
       `usage_get reports this bridge's own backend's quota, and the default backend here is '${cfg.defaultBackend}', ` +
       'which has no quota to report. Retrying will not change this.');
   }
-  let data = usageCache.data;
-  if (!data) {
-    try {
-      data = await ensureUsageFetch();
-    } catch (e) {
-      throw new Error(`usage could not be fetched: ${e.message}`);
-    }
-  } else {
-    ensureUsageFetch()?.catch(() => {}); // still keep the cache warm in the background
+  let result;
+  try {
+    result = await zaiUsageCache.explicitAsk(30_000);
+  } catch (e) {
+    if (zaiUsageCache.unconfigured) throw unconfiguredUsageError();
+    throw new Error(`usage could not be fetched: ${e.message}`);
   }
-  return usageSnapshotOrThrow(data, usageCache.at, { unconfigured: usageCache.unconfigured });
+  const snap = usageSnapshotOrThrow(result.data, zaiUsageCache.dataAt, { unconfigured: zaiUsageCache.unconfigured });
+  if (result.stale) snap.stale = result.stale;
+  return snap;
 }
 
 // Owner-specified format (2026-09-01): one compact line -- one-word state,
@@ -2192,20 +2123,21 @@ function parseCommand(text) {
 }
 
 async function handleUsageCommand(threadId) {
-  let text;
-  try {
-    const apiKey = readZaiApiKey(cfg.zaiConfigPath);
-    text = renderUsage(await fetchUsage({ apiKey }));
-  } catch (e) {
-    text = `⚠️ /usage failed: ${e.message}`;
-  }
+  // The SAME source-selection path usage_get takes: usageGetForMcp itself,
+  // handed over as the thunk usageTelegramText renders from -- not a
+  // re-branch here, and not the direct readZaiApiKey+fetchUsage this used to
+  // be (which read the z.ai key unconditionally and crashed a codex-default
+  // bridge with ENOENT on its isolated $HOME; reported 2026-09-22). Failure
+  // sentences are usage_get's, byte for byte -- one wording, both surfaces.
+  const label = cfg.defaultBackend === 'codex' ? 'codex usage' : 'Z.ai usage';
+  const text = await usageTelegramText(usageGetForMcp, { label });
   await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text, parseMode: 'HTML' }).catch((e) => console.error('[bridge] failed to post usage:', e.message));
 }
 
 function helpText() {
   return [
     'Bridge commands (each scoped to this topic):',
-    '/usage — Z.ai plan usage & quota',
+    '/usage — plan usage & quota for this bridge’s backend',
     '/stop, /cancel — cancel the running turn',
     '/queue — show queued messages',
     '/clearqueue — drop queued messages',
