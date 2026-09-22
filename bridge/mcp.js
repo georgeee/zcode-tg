@@ -221,6 +221,18 @@ export function createMcpGateway({
       },
     },
     {
+      name: 'progress_get',
+      description:
+        'Return whether a session is IDLE, actively PROGRESSING, or STUCK — a read-only liveness probe; never contains reply text. Reports whether a turn is in flight, when it started and how long it has run, a monotonically growing count of activities observed this turn, the timestamp of the most recent activity and how long ago it was, and the last few activity labels (the same tool names the Telegram topic shows). To tell WORKING from WEDGED, poll twice ~30s apart: activityCount or lastActivityAt advanced means alive; neither moved and lastActivityAgeMs is large means stuck. There is no bridge-side stuck verdict — thresholds are the caller\'s. Unknown or closed keys are errors, never a hollow idle.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: 'Conversation key from session_create.' },
+        },
+        required: ['key'],
+      },
+    },
+    {
       name: 'model_get',
       description:
         "Return the backend and model a session runs, and whether model_set can change it (true for codex, always false for zcode and mock -- both are single-model/no-switching backends, for different reasons: zcode's own MCP contract never offered a switch, mock has only ever had the one synthetic model). The backend itself is still only chosen at session_create time. Omit `key` to get the bridge's own defaults instead of a specific session's.",
@@ -296,6 +308,8 @@ export function createMcpGateway({
         return handlers.messageSend(requiredString('message_send', 'key', args.key), requiredString('message_send', 'text', args.text), args.wait !== false);
       case 'replies_get':
         return handlers.repliesGet(requiredString('replies_get', 'key', args.key), Number(args.after_seq) || 0);
+      case 'progress_get':
+        return handlers.progressGet(requiredString('progress_get', 'key', args.key));
       case 'model_get':
         return handlers.modelGet(args.key ? String(args.key) : undefined);
       case 'usage_get':

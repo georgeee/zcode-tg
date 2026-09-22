@@ -67,7 +67,7 @@ import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
-import { ProgressReporter } from './progress.js';
+import { ProgressReporter, stepDetail, noteActivity, progressForTopic } from './progress.js';
 import { readZaiApiKey, readZaiProvider, fetchUsage, renderUsage, usagePercentages, usageSnapshotOrThrow, codexUsageSnapshotOrThrow, codexUsageFetchError } from './usage.js';
 import { runtimePreferences } from './runtimePrefs.js';
 import { mergeModelLists, resolveModelRef } from './modelref.js';
@@ -679,8 +679,12 @@ async function onUserInputRequest(params) {
   }
 
   // The turn is now blocked on this answer -- say so on the ⌛ placeholder.
+  // Mirrored into progress_get's log on purpose: a turn waiting on the USER
+  // otherwise looks exactly like a wedged one (aging last-activity), and a
+  // caller reading '❓' as the last label knows the next move is theirs.
   const turn = activeTurns.get(params.sessionId);
   if (turn?.streamer) turn.streamer.update({ status: '❓ waiting for your answer above' });
+  noteActivity(turn, '❓ waiting for your answer');
 
   return new Promise((resolve) => {
     state.resolve = resolve;
@@ -974,34 +978,49 @@ function onBackendEvent(msg) {
       // 2026-09-02): narration blocks become per-milestone messages, tool
       // calls become the steps listed inside them -- see bridge/progress.js.
       // textBuffer still accumulates for the final-text fallback below.
+      // noteActivity mirrors each of these into progress_get's activity log
+      // at the same instant the Telegram view is fed, so the two views of a
+      // turn cannot disagree.
       if (payload?.kind === 'text_delta' && typeof payload.delta === 'string') {
         turn.textBuffer += payload.delta;
         turn.progress.narration(payload.delta);
+        noteActivity(turn, '💭 narration');
       } else if (payload?.kind === 'tool_call') {
         if (payload.toolCallId) turn.toolNames.set(payload.toolCallId, payload.toolName);
         turn.progress.toolCall(payload);
+        // Same label construction the milestone step line renders (tool +
+        // the model's own description, stepDetail's 80-char budget) -- the
+        // caller sees what the topic shows, minus all reply text.
+        const detail = stepDetail(payload.toolName, payload.input);
+        noteActivity(turn, `🔧 ${payload.toolName}${detail ? ` · ${detail}` : ''}`, { toolCallId: payload.toolCallId });
       } else if (payload?.kind === 'result') {
         turn.progress.toolResult(payload);
+        noteActivity(turn, `🔧 ${payload.toolName ?? 'tool'}`, { toolCallId: payload.toolCallId, done: true });
       }
     } else if (payload?.kind === 'text_delta' && typeof payload.delta === 'string') {
       turn.textBuffer += payload.delta;
       turn.streamer?.update({ text: turn.textBuffer, status: null });
+      noteActivity(turn, '💭 narration');
     } else if (payload?.kind === 'reasoning_delta') {
       turn.streamer?.update({ status: '💭' });
+      noteActivity(turn, '💭');
     } else if ((payload?.kind === 'started' || payload?.kind === 'scheduled' || payload?.kind === 'tool_input_start') && payload.toolName) {
       if (payload.toolCallId) turn.toolNames.set(payload.toolCallId, payload.toolName);
       turn.streamer?.update({ status: `🔧 ${payload.toolName}` });
+      noteActivity(turn, `🔧 ${payload.toolName}`, { toolCallId: payload.toolCallId });
     } else if (payload?.kind === 'result') {
       // result payloads carry toolCallId but not toolName; look up the name
       // learned at started/scheduled time.
       const name = payload.toolName ?? (payload.toolCallId && turn.toolNames.get(payload.toolCallId)) ?? 'tool';
       turn.streamer?.update({ status: `🔧 ${name} ✓` });
+      noteActivity(turn, `🔧 ${name}`, { toolCallId: payload.toolCallId, done: true });
     } else if (payload?.taskId && payload.status) {
       noteTaskLifecycle(sessionId, payload);
       // Task finished while THIS turn is still running: the notification is
       // injected into the model's next request anyway; a status hint on the
       // placeholder is enough.
       turn.streamer?.update({ status: `🌀 task ${payload.status}` });
+      noteActivity(turn, `🌀 task ${payload.status}`);
     }
 
     if (typeof payload?.response === 'string' && payload.usage) {
@@ -2978,6 +2997,9 @@ async function main() {
         }
       },
       repliesGet: (key, afterSeq) => ({ replies: mcp.repliesSince(key, afterSeq) }),
+      // The liveness probe: working vs wedged, from the same activity log
+      // the Telegram progress views are fed (see bridge/progress.js).
+      progressGet: (key) => progressForTopic({ getTopic: (k) => store.getTopic(k), activeTurns, key }),
       // Now backend-aware: a session can run zcode or Codex, and reporting
       // just "the model" without which backend it's on is no longer the
       // whole answer (the same model NAME could plausibly exist under two

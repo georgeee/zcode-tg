@@ -274,3 +274,95 @@ function elapsedLabel(ms) {
   if (m < 60) return `${m}m${String(s % 60).padStart(2, '0')}s`;
   return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`;
 }
+
+// --- machine-readable liveness: the progress_get tool's data ---
+//
+// progress_get must let an MCP caller tell a WORKING turn from a WEDGED one
+// -- the thing replies_get's identical-looking empty answers hide (the
+// failure that got a live session closed mid-work, 2026-09-22). Its data is
+// the SAME event stream the Telegram views render: noteActivity is called
+// from index.js's dispatch chain at the exact points that feed
+// turn.progress / turn.streamer, so this log and the progress line are two
+// views of one source and cannot disagree. Labels are TOOL/ACTIVITY labels
+// only -- never reply text (narration text is rendered for the human; here
+// it is one fixed word) -- capped at the last few, with the full count kept
+// separately so a poll-and-compare caller sees monotonic life even when a
+// label is coalesced.
+export function noteActivity(turn, label, { toolCallId, done = false, now = Date.now() } = {}) {
+  if (!turn) return;
+  const a = (turn.activity ??= { count: 0, lastAt: 0, labels: [] });
+  a.count += 1;
+  a.lastAt = now;
+  if (toolCallId) {
+    const prev = a.labels.find((x) => x.toolCallId === toolCallId);
+    if (prev) {
+      // Same tool call seen again: a start after start just refreshes its
+      // time; the completion stamps ' ✓' (the milestone line's own done
+      // mark) and releases the id so later events can't re-touch it.
+      if (done && !prev.label.endsWith(' ✓')) prev.label += ' ✓';
+      prev.at = now;
+      if (done) prev.toolCallId = undefined;
+      return;
+    }
+  }
+  const text = done ? `${label} ✓` : label;
+  const last = a.labels[a.labels.length - 1];
+  if (last && last.label === text && last.toolCallId === undefined) {
+    last.at = now; // one activity continuing (a narration stream) -- refresh, don't spam
+    return;
+  }
+  a.labels.push({ at: now, label: text, toolCallId });
+  while (a.labels.length > 6) a.labels.shift();
+}
+
+// progressSnapshot renders a turn entry (or its absence) as the payload
+// progress_get returns. IDLE IS EXPLICIT: active:false, state:'idle' and
+// nulls for every per-turn field -- a caller never infers idle from absent
+// fields. There is no bridge-side "stuck" verdict on purpose: what counts
+// as stuck depends on the model and the tool, so the payload carries the
+// raw evidence (activityCount, lastActivityAt, lastActivityAgeMs,
+// recentActivity) and the caller compares two polls.
+export function progressSnapshot({ key, turn, now = Date.now() }) {
+  if (!turn) {
+    return {
+      key,
+      active: false,
+      state: 'idle',
+      startedAt: null,
+      runningMs: null,
+      activityCount: null,
+      lastActivityAt: null,
+      lastActivityAgeMs: null,
+      recentActivity: [],
+    };
+  }
+  const a = turn.activity;
+  const startedAt = turn.startedAt ?? null;
+  const lastAt = a?.lastAt ?? null;
+  const iso = (t) => (t != null ? new Date(t).toISOString() : null);
+  return {
+    key,
+    active: true,
+    state: 'active',
+    startedAt: iso(startedAt),
+    runningMs: startedAt != null ? Math.max(0, now - startedAt) : null,
+    activityCount: a?.count ?? 0,
+    lastActivityAt: iso(lastAt),
+    lastActivityAgeMs: lastAt != null ? Math.max(0, now - lastAt) : null,
+    recentActivity: (a?.labels ?? []).map((x) => ({ at: iso(x.at), label: x.label })),
+  };
+}
+
+// progressForTopic is the progress_get handler's whole logic, minus the
+// index.js it lives in (which exports nothing, like usageSnapshotOrThrow's
+// comment says): key -> topic -> the session's in-flight turn. An unknown
+// or closed key THROWS -- the same sentences model_set and message_send use
+// -- never a hollow "idle" that a caller could read as a live session
+// resting between turns.
+export function progressForTopic({ getTopic, activeTurns, key, now = Date.now() }) {
+  const topic = getTopic(key);
+  if (!topic) throw new Error(`unknown session: ${key}`);
+  if (topic.closed) throw new Error(`session ${key} is closed`);
+  const turn = topic.sessionId ? activeTurns.get(topic.sessionId) : undefined;
+  return progressSnapshot({ key, turn, now });
+}

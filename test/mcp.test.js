@@ -42,12 +42,12 @@ test('initialize handshake returns the protocol version and capabilities', async
   assert.equal(r.body.result.serverInfo.name, 'cage-pod-zcode-mcp');
 });
 
-test('tools/list advertises the six tools with schemas', async (t) => {
+test('tools/list advertises the eight tools with schemas', async (t) => {
   const h = await startGateway(t, {});
   t.after(() => h.close());
   const r = await rpc(h.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const names = r.body.result.tools.map((x) => x.name).sort();
-  assert.deepEqual(names, ['message_send', 'model_get', 'model_set', 'replies_get', 'session_close', 'session_create', 'usage_get']);
+  assert.deepEqual(names, ['message_send', 'model_get', 'model_set', 'progress_get', 'replies_get', 'session_close', 'session_create', 'usage_get']);
   for (const tool of r.body.result.tools) assert.ok(tool.inputSchema, `${tool.name} carries a schema`);
 });
 
