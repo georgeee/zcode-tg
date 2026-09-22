@@ -53,7 +53,7 @@
 // unit); it does not daemonize itself.
 
 import { randomBytes } from 'node:crypto';
-import { createMcpGateway, raceReply } from './mcp.js';
+import { createMcpGateway, raceReply, repliesForTopic } from './mcp.js';
 import { pickForumChat } from './chatpick.js';
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -2996,7 +2996,9 @@ async function main() {
           throw e;
         }
       },
-      repliesGet: (key, afterSeq) => ({ replies: mcp.repliesSince(key, afterSeq) }),
+      // The key guard lives here (repliesForTopic): unknown and closed keys
+      // are errors, not a hollow [] a caller reads as "quiet session".
+      repliesGet: (key, afterSeq) => repliesForTopic({ getTopic: (k) => store.getTopic(k), repliesSince: (k, s) => mcp.repliesSince(k, s), key, afterSeq }),
       // The liveness probe: working vs wedged, from the same activity log
       // the Telegram progress views are fed (see bridge/progress.js).
       progressGet: (key) => progressForTopic({ getTopic: (k) => store.getTopic(k), activeTurns, key }),

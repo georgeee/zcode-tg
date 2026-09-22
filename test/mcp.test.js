@@ -4,7 +4,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createMcpGateway } from '../bridge/mcp.js';
+import { createMcpGateway, repliesForTopic } from '../bridge/mcp.js';
 
 async function startGateway(t, impl) {
   const gw = createMcpGateway({ port: 0, log: () => {} });
@@ -413,4 +413,72 @@ test('every required string argument is checked, not just session_create\'s', as
     assert.match(r.body.result.content[0].text, new RegExp(`${tool}: "${field}" is required`));
   }
   assert.deepEqual(seen, [], 'no handler runs on a rejected call');
+});
+
+// --- repliesForTopic: replies_get's key guard ---
+//
+// `[]` used to mean BOTH "this session has produced nothing yet" and "there
+// is no such session", and those want opposite reactions -- wait, versus fix
+// your key. These tests pin the split: unknown and closed keys are errors
+// naming the key; the two TRUE empties (live-but-quiet, after_seq past the
+// end) stay cheap and non-throwing.
+
+function fakeBridge() {
+  const topics = new Map([
+    ['k-live', { sessionId: 's1' }],
+    ['k-closed', { sessionId: 's1', closed: true }],
+  ]);
+  const log = new Map([['k-live', [{ seq: 1, text: 'first reply', at: 'x' }]]]);
+  return {
+    getTopic: (k) => topics.get(k),
+    repliesSince: (k, s) => (log.get(k) ?? []).filter((r) => r.seq > s),
+  };
+}
+
+test('replies_get refuses an unknown key, naming it -- never a hollow []', () => {
+  const bridge = fakeBridge();
+  assert.throws(
+    () => repliesForTopic({ ...bridge, key: 'typo-key' }),
+    /unknown session: typo-key/,
+  );
+});
+
+test('replies_get refuses a closed key with its own message, distinct from unknown', () => {
+  const bridge = fakeBridge();
+  assert.throws(
+    () => repliesForTopic({ ...bridge, key: 'k-closed' }),
+    /session k-closed is closed/,
+  );
+  assert.throws(
+    () => repliesForTopic({ ...bridge, key: 'k-closed' }),
+    (e) => !/unknown session/.test(e.message),
+    'closed must not read as unknown',
+  );
+});
+
+test('replies_get still returns [] for a live key with no replies yet, without throwing', () => {
+  const bridge = fakeBridge();
+  const out = repliesForTopic({ ...bridge, key: 'k-live', afterSeq: 999 });
+  assert.deepEqual(out, { replies: [] });
+});
+
+test('replies_get returns the log for a live key, and [] again once after_seq passes the end', () => {
+  const bridge = fakeBridge();
+  assert.equal(repliesForTopic({ ...bridge, key: 'k-live', afterSeq: 0 }).replies.length, 1);
+  assert.deepEqual(repliesForTopic({ ...bridge, key: 'k-live', afterSeq: 1 }), { replies: [] });
+});
+
+test('over the gateway: replies_get wired the way index.js wires it refuses unknown keys as a tool error', async (t) => {
+  const bridge = fakeBridge();
+  const h = await startGateway(t, {
+    repliesGet: (key, afterSeq) => repliesForTopic({ getTopic: bridge.getTopic, repliesSince: bridge.repliesSince, key, afterSeq }),
+  });
+  t.after(() => h.close());
+  const refused = await rpc(h.url, { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'replies_get', arguments: { key: 'typo-key' } } });
+  assert.equal(refused.body.result.isError, true);
+  assert.match(refused.body.result.content[0].text, /unknown session: typo-key/);
+
+  const quiet = await rpc(h.url, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'replies_get', arguments: { key: 'k-live', after_seq: 999 } } });
+  assert.equal(quiet.body.result.isError, false, 'a live key past the end is a true empty, not an error');
+  assert.deepEqual(JSON.parse(quiet.body.result.content[0].text), { replies: [] });
 });

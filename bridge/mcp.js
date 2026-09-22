@@ -551,3 +551,28 @@ export function createMcpGateway({
 export function raceReply(pending, dispatched) {
   return Promise.race([pending, dispatched.then(() => pending)]);
 }
+
+// repliesForTopic is the replies_get handler's whole logic, minus index.js
+// (which exports nothing, the same seam progressForTopic and
+// usageSnapshotOrThrow follow).
+//
+// THE GUARD IS THE POINT. replies_get used to answer `[]` for an UNKNOWN key
+// exactly as for a live-but-quiet one, and those two want opposite reactions
+// -- wait, versus fix your key. A caller with a typo'd or stale key polled
+// forever against nothing, and every poll looked like a session that was
+// merely quiet: the same disease progress_get exists to cure, one tool over
+// (a live session was closed mid-work on 2026-09-22 after an empty answer
+// was read as death). So: unknown and closed keys are ERRORS naming the key;
+// a live key still returns `[]` freely, both when it has produced nothing
+// yet and when after_seq is simply past the end -- those empties are true
+// and must stay cheap and non-throwing. repo check before the change (all
+// in-repo callers): e2e-codex-tg.mjs, e2e-mcp.mjs and mock-backend.test.js
+// all pass a real session_create key, and the test harnesses that touch the
+// log directly use gw.repliesSince() -- nothing relied on [] for an unknown
+// key.
+export function repliesForTopic({ getTopic, repliesSince, key, afterSeq = 0 }) {
+  const topic = getTopic(key);
+  if (!topic) throw new Error(`unknown session: ${key}`);
+  if (topic.closed) throw new Error(`session ${key} is closed`);
+  return { replies: repliesSince(key, afterSeq) };
+}
