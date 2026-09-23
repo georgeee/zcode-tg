@@ -41,6 +41,18 @@ export class ReplyStreamer {
     this.lastText = null;
     this.dirty = false;
     this.dead = false; // placeholder deleted / unrecoverable -- stop trying
+    // Sealed by stop(): no edit may be ISSUED after it, because finalizeTurn's
+    // final delivery is the terminal render and any later preview edit would
+    // clobber it (relay-owned-group design D1: "no edit for a message follows
+    // its terminal render" -- the relay's coalescer is latest-text-wins, so a
+    // stale preview arriving late would BE the message's final state). stop()
+    // runs while a flush is commonly still in flight, and that flush's error
+    // path re-arms a timer that fires after the terminal render; whether it
+    // then actually EDITS used to hinge on _flush's lastText dedupe swallowing
+    // a same-text retry -- i.e. it held only while the rendered elapsed second
+    // had not ticked. Relying on that coincidence is exactly the leak this
+    // flag closes.
+    this.stopped = false;
     this._timer = null;
     // update() -- and so a fresh elapsed-time render -- is only ever called
     // from a real protocol event (index.js). A single long-running tool call
@@ -65,7 +77,7 @@ export class ReplyStreamer {
   // (index.js owns the buffer); `status` the latest activity marker, or null
   // to clear it (text is arriving again).
   update({ text, status }) {
-    if (this.dead) return;
+    if (this.dead || this.stopped) return;
     if (text !== undefined) this.text = text;
     if (status !== undefined) this.status = status;
     this.dirty = true;
@@ -74,6 +86,7 @@ export class ReplyStreamer {
 
   // Halt pending flushes (called before final delivery replaces the preview).
   stop() {
+    this.stopped = true;
     if (this._timer) clearTimeout(this._timer);
     this._timer = null;
     if (this._heartbeat) clearInterval(this._heartbeat);
@@ -82,6 +95,7 @@ export class ReplyStreamer {
   }
 
   _schedule() {
+    if (this.stopped) return; // sealed: never re-arm past the terminal render
     if (this._timer) return; // a flush is already scheduled; state will be read then
     const wait = Math.max(0, this.lastEditAt + this.minEditIntervalMs - Date.now());
     this._timer = setTimeout(() => {
@@ -91,7 +105,7 @@ export class ReplyStreamer {
   }
 
   async _flush() {
-    if (!this.dirty || this.dead) return;
+    if (!this.dirty || this.dead || this.stopped) return;
     // Adopted turn whose placeholder hasn't arrived yet -- try again on the
     // next update.
     if (!this.messageId) return;

@@ -1296,8 +1296,33 @@ setInterval(async () => {
 // to creating a brand new one) -- see the caller in startTurn for why that
 // distinction matters despite resumeConversation itself having succeeded.
 async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
+  // A CLOSED entry is a finished conversation -- MCP session_close marked it,
+  // and in proxied mode so does the relay-synthesized forum_topic_deleted
+  // handler below (relay-owned-group design section 4: after a /rebind moves
+  // the topic away and it later comes BACK to this agent, the next message
+  // must start a FRESH session, not resume the closed one -- the closed
+  // session's upstream thread may not even exist anymore, and resuming would
+  // silently append a new conversation onto a session messageSend already
+  // refuses). Read off the store regardless of forceFresh, because a fresh
+  // session written over a closed entry must lift that mark: setTopic MERGES,
+  // so merely creating would leave closed:true stamped on the new session and
+  // messageSend would refuse a conversation that is demonstrably live again.
+  // The mark is cleared only by the successful creation write, so if
+  // session/create throws the topic stays closed and refuses, as it should.
+  // Applies in legacy mode too (there `closed` only ever comes from MCP
+  // session_close, whose topic Telegram itself has closed -- a message
+  // arriving after a reopen is a new conversation all the same).
+  const wasClosed = !!store.getTopic(threadId)?.closed;
   let entry = forceFresh ? null : store.getTopic(threadId);
   let resumed = false;
+  if (entry?.closed) {
+    console.log(`[bridge] topic ${threadId}: previous session was closed -- starting a fresh session for the new conversation`);
+    // Strip ONLY the session: the topic's own identity (backend, model, mode)
+    // survives into the fresh session, exactly as a /model fresh-switch keeps
+    // it. The `!entry.sessionId` stub branch below then routes this to the
+    // ordinary creation path.
+    entry = { ...entry, sessionId: undefined };
+  }
 
   // Migration for a store entry written before this backend refactor: its
   // sessionId is a bare zcode id with no "backend:" prefix. Treat it as
@@ -1356,7 +1381,9 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
     const mode = stored?.mode || cfg.defaultSessionMode;
     const created = await backend.createConversation({ workspaceDir: cfg.workspaceDir, workspaceKey, model, mode });
     entry = { sessionId: created.sessionId, model: created.model ?? model, mode: created.mode ?? mode, backend: backendName };
-    store.setTopic(threadId, entry);
+    // See wasClosed above: the explicit false is the point -- a plain entry
+    // merge would leave the old closed:true in place underneath it.
+    store.setTopic(threadId, wasClosed ? { ...entry, closed: false } : entry);
     console.log(`[bridge] topic ${threadId}: created ${backendName} session ${created.sessionId} (${entry.model}${entry.mode ? `, mode=${entry.mode}` : ''})`);
   }
 
@@ -2285,8 +2312,108 @@ function handleMyChatMember(m) {
     .catch((e) => console.error('[bridge] leaveChat failed:', e.message));
 }
 
+// --- the relay's synthetic topic deletion (relay-owned-group design §4,
+// "Re-bind and close") ---
+//
+// In proxied mode the relay stands between this bridge and Telegram, and
+// when a bound topic moves away -- an owner's /rebind or /close, or the
+// topic physically deleted through the Telegram UI -- the relay synthesizes
+// a Bot-API-shaped MESSAGE update carrying `forum_topic_deleted: {}` into
+// this bridge's getUpdates stream. It is NOT a real Bot API field (Telegram
+// itself has forum_topic_closed, and sends it as a service message) -- it is
+// the relay's agreed synthetic marker for "this topic is no longer yours".
+//
+// NOT forum_topic_closed, deliberately: a human closing a topic in the
+// Telegram UI is REVERSIBLE (they can reopen it), so it must not end the
+// session here; only the deletion marker does. A real forum_topic_closed
+// service message therefore falls through to the ordinary message path and
+// is ignored like any other service message.
+//
+// THE TRUST BOUNDARY is the transport, not the message: the synthetic
+// update's `from` is the relay's synthetic identity -- not the owner -- so
+// the owner gate must not (and does not) see this message. It is accepted
+// ONLY when cfg.proxied (TELEGRAM_API_ROOT is a unix: root): only the relay
+// can inject updates into that stream, because only the relay is on the
+// other end of the socket. In legacy mode a real Telegram never sends this
+// field, and a bridge must ignore it rather than let any injected-looking
+// update close a session -- the field's arrival there would mean something
+// is wrong, and closing a session is the one act we do not take on a
+// maybe-hostile maybe-nothing.
+//
+// What it does is the MCP session_close path MINUS the Telegram half:
+//   - any in-flight turn for the topic is stopped cleanly (the turn's
+//     session is cancelled; background tasks keep running so their
+//     completion notifications still land -- the circuit-breaker rule,
+//     since killing them would orphan exactly the work the model was
+//     waiting on);
+//   - queued messages are dropped and their parked MCP callers told why;
+//   - the store entry is marked closed, which messageSend then refuses;
+//   - and closeForumTopic is NOT called: the topic is no longer ours (it is
+//     deleted, or the binding has moved), the relay owns the real topic
+//     lifecycle, and the proxy's scope check would 403 the call anyway.
+// No chat writes at all, for the same reason: the topic may already be gone
+// or re-bound elsewhere, and every send would just 403.
+//
+// Idempotent by design: the relay may deliver the delete more than once
+// (at-least-once across a restart, design section 9), and a second delete
+// for an unknown or already-closed topic is a logged no-op.
+async function handleRelayTopicDeleted(message) {
+  if (!cfg.proxied) {
+    console.warn(`[bridge] ignoring forum_topic_deleted for thread ${message.message_thread_id} in chat ${message.chat?.id}: not in proxied mode (a real Telegram never sends this field)`);
+    return;
+  }
+  const threadId = keyFor(message.chat?.id, message.message_thread_id);
+  const entry = store.getTopic(threadId);
+  if (!entry) {
+    console.log(`[bridge] forum_topic_deleted: no session for topic ${threadId} -- nothing to close (already gone, or never bound)`);
+    return;
+  }
+  if (entry.closed) {
+    console.log(`[bridge] forum_topic_deleted: topic ${threadId} is already closed -- ignoring duplicate`);
+    return;
+  }
+  console.log(`[bridge] forum_topic_deleted: closing session for topic ${threadId} (relay reports the topic deleted or re-bound)`);
+  // Stop the in-flight turn FIRST, so its streamer/progress views cannot
+  // fire another edit into a topic that is leaving, and so the turn's own
+  // terminal (if the cancel races one) finalizes into a topic entry that is
+  // already closed rather than re-busying it.
+  const sessionId = entry.sessionId;
+  if (sessionId && activeTurns.has(sessionId)) {
+    const turn = activeTurns.get(sessionId);
+    console.log(`[bridge] forum_topic_deleted: interrupting in-flight turn on session ${sessionId}`);
+    await interruptTurn(sessionId, { killEverything: false });
+    busySessions.delete(sessionId);
+    activeTurns.delete(sessionId);
+    turn.streamer?.stop();
+    turn.progress?.stop();
+    // The session is finished; drop the mapping so a straggler turn.started
+    // on it can never be adopted into a ghost turn for a topic we no longer
+    // serve (adoptUnclaimedTurn keys off this map).
+    sessionToTopic.delete(sessionId);
+  }
+  // Queued prompts would otherwise drain straight into a fresh session after
+  // a re-bind -- a message the user sent to the OLD conversation must not run
+  // on a new one. Parked MCP waiters are told why their reply never comes.
+  const queued = store.getQueue(threadId).length;
+  if (queued) {
+    store.setQueue(threadId, []);
+    stranded(threadId, `the topic was deleted or re-bound to another agent while this message was queued, so it was DROPPED and will not be answered`);
+    console.log(`[bridge] forum_topic_deleted: dropped ${queued} queued message(s) for topic ${threadId}`);
+  }
+  // The sessionClose mark: messageSend refuses from here on. Deliberately
+  // NOT tg.closeForumTopic() -- see this function's comment.
+  store.setTopic(threadId, { closed: true });
+}
+
 async function handleMessage(message) {
   try {
+  // The relay's synthetic deletion arrives with a non-owner `from`, so it
+  // must be handled BEFORE the owner gate (which would drop it). The handler
+  // itself carries the proxied-mode trust boundary.
+  if (message.forum_topic_deleted) {
+    await handleRelayTopicDeleted(message);
+    return;
+  }
   if (message.from?.is_bot) return;
   if (!isOwner(message.from?.id)) {
     console.warn(`[bridge] ignoring message from unauthorized user ${message.from?.id} in chat ${message.chat?.id}`);

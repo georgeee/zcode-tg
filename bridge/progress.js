@@ -122,6 +122,20 @@ export class ProgressReporter {
   // exactly the bug reported live on the first milestone-mode turn.
   async settle() {
     this._cancelTimer();
+    // Sealed as surely as stop() seals it: settle() is the terminal render's
+    // on-ramp (finalizeTurn delivers the reply right after), and a live-label
+    // edit ISSUED after it would violate the D1 invariant -- "no edit for a
+    // message follows its terminal render" (relay-owned-group design
+    // section 6). The concrete leak: a _flush() already in flight here whose
+    // edit fails transiently re-arms a timer via its catch/_touch tail, and
+    // the label re-render then lands after the final reply on the same
+    // message -- latest-text-wins makes the stale label the message's final
+    // state. _dead gates _touch/_flush and every input, and the freeze edit
+    // chained below is a _postChain edit, not a _flush one, so it still goes
+    // out. (_flush's m.closed check happens to seal the same leak today --
+    // settle always closes the current milestone -- but that seal is
+    // incidental to what m.closed means, so this flag makes it explicit.)
+    this._dead = true;
     const last = this.current;
     if (last && !last.steps.length && last.messageId != null) {
       last.closed = true;

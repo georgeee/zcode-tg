@@ -46,11 +46,24 @@
 //                                 entries this fixture's workspace/readState
 //                                 advertises (default two GLM models). Drives
 //                                 listModels() -- and so what /model shows.
+//   FIXTURE_ZCODE_TURN_SCRIPT     if set, a path to a JSON file describing a
+//                                 STREAMED turn to emit on every session/send:
+//                                 { "deltas": ["…", "…"], "deltaDelayMs": N,
+//                                 "terminalDelayMs": M } -- delta i goes out as
+//                                 a session/event text_delta at (i+1)*N ms, a
+//                                 final 'result' session/event and the
+//                                 turn.terminal telemetry land at M ms. This
+//                                 is what lets a test race a mid-stream
+//                                 preview flush against the terminal render
+//                                 (the terminal-edit invariant e2e) without a
+//                                 real model: the bridge sees genuine wire
+//                                 notifications, on a schedule it doesn't
+//                                 control.
 // With any of LOG/RP_REPLY set it answers the calls the bridge actually
 // issues (session/create, session/setModel, session/setMode, session/subscribe,
 // session/close, session/stop, session/send, workspace/readState) so a topic
 // can really be created on it, listed, and switched away from.
-import { writeFileSync, appendFileSync } from 'node:fs';
+import { writeFileSync, appendFileSync, readFileSync } from 'node:fs';
 
 if (process.env.FIXTURE_ZCODE_MARKER) {
   writeFileSync(process.env.FIXTURE_ZCODE_MARKER, JSON.stringify({ pid: process.pid, at: Date.now(), argv: process.argv.slice(2) }));
@@ -118,12 +131,51 @@ process.stdin.on('data', (chunk) => {
     // rejects one) -- reply mirrors the request's {id, result} shape.
     if (msg.method === 'session/create') reply(msg.id, { session: { sessionId: `fake-z-${nextSessionId++}` } });
     else if (msg.method === 'workspace/readState') reply(msg.id, readState);
-    else reply(msg.id, {}); // setModel, setMode, subscribe, close, stop, send: acknowledged, nothing to say
+    else if (msg.method === 'session/send') {
+      reply(msg.id, {});
+      emitScriptedTurn(msg.params.sessionId);
+    } else reply(msg.id, {}); // setModel, setMode, subscribe, close, stop: acknowledged, nothing to say
   }
 });
 
 if (process.env.FIXTURE_ZCODE_CRASH_AFTER_MS) {
   setTimeout(() => process.exit(1), Number(process.env.FIXTURE_ZCODE_CRASH_AFTER_MS));
+}
+
+// The scripted streamed turn (FIXTURE_ZCODE_TURN_SCRIPT, documented above).
+// Emits the exact wire shapes bridge/zcodeClient.js passes through as backend
+// events -- notifications with a method, no id -- mirroring the vocabulary
+// bridge/backends/mockBackend.js synthesizes in-process: turn.started
+// telemetry, session/event text_delta payloads, a final 'result' session
+// event (the authoritative reply text), then turn.terminal. Deltas are
+// scheduled on REAL timers so the bridge's own view machinery (streamer or
+// milestone reporter) runs at its natural pace against them.
+let scriptedTurnSeq = 0;
+function emitScriptedTurn(sessionId) {
+  if (!process.env.FIXTURE_ZCODE_TURN_SCRIPT) return;
+  let script;
+  try {
+    script = JSON.parse(readFileSync(process.env.FIXTURE_ZCODE_TURN_SCRIPT, 'utf8'));
+  } catch (e) {
+    process.stderr.write(`fixture: bad FIXTURE_ZCODE_TURN_SCRIPT: ${e.message}\n`);
+    return;
+  }
+  const turnId = `fixture-turn-${++scriptedTurnSeq}`;
+  const deltas = Array.isArray(script.deltas) ? script.deltas : [];
+  const step = Number(script.deltaDelayMs) || 300;
+  const notify = (obj) => process.stdout.write(JSON.stringify(obj) + '\n');
+  notify({ method: 'v4/telemetry/event', params: { sessionId, turnId, kind: 'turn.started' } });
+  deltas.forEach((delta, i) => {
+    setTimeout(() => notify({ method: 'session/event', params: { sessionId, turnId, payload: { kind: 'text_delta', delta } } }), step * (i + 1));
+  });
+  setTimeout(() => {
+    const content = script.result ?? deltas.join('');
+    if (content) notify({ method: 'session/event', params: { sessionId, turnId, payload: { kind: 'result', content } } });
+    notify({
+      method: 'v4/telemetry/event',
+      params: { sessionId, turnId, kind: 'turn.terminal', status: 'success', durationMs: Number(script.terminalDelayMs) || 0, tokenCount: 1, toolCallCount: 0 },
+    });
+  }, Number(script.terminalDelayMs) || step * (deltas.length + 1));
 }
 
 // Keep stdin open (don't let EOF end the process).
