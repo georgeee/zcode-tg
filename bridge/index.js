@@ -71,7 +71,7 @@ import { ProgressReporter, stepDetail, noteActivity, progressForTopic } from './
 import { readZaiApiKey, readZaiProvider, fetchUsage, usageSnapshotOrThrow, codexUsageSnapshotOrThrow, codexUsageFetchError, usageTelegramText, createUsageCache, unconfiguredUsageError, statusPercentages, statusModelFor, statusLineText } from './usage.js';
 import { runtimePreferences } from './runtimePrefs.js';
 import { mergeModelLists, resolveModelRef } from './modelref.js';
-import { parseCommandText, commandIsOurs } from './commands.js';
+import { parseCommandText, commandIsOurs, proxiedBackendSwitchRefusal } from './commands.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
 // a session running in this same directory could read that file as part of
@@ -1711,6 +1711,19 @@ async function handleModelCommand(threadId, arg) {
   }
   const { backend: resolvedBackend, ref } = resolution;
 
+  // Proxied mode (relay-owned-group design, section 4): the resolver found
+  // the ref on ANOTHER backend -- the fresh-session switch below would move
+  // this topic to a provider its fleet/model binding does not name, so it
+  // is refused, exactly as /backend is. Within-backend switches (the
+  // resolved backend IS the topic's) fall through to the in-session switch,
+  // unchanged -- and with no unix: root this gate is inert, byte for byte
+  // today's cross-backend behavior.
+  const proxiedRefusal = proxiedBackendSwitchRefusal(cfg.proxied, currentBackend, resolvedBackend);
+  if (proxiedRefusal) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: proxiedRefusal });
+    return;
+  }
+
   // CODEX_DISALLOW_ASTRA (and any future per-backend dial) operates on the
   // backend the ref was FOUND in, not the topic's current one.
   if (resolvedBackend === 'codex' && ref === 'gpt-6-astra' && cfg.codexDisallowAstra) {
@@ -1871,6 +1884,19 @@ async function handleBackendCommand(threadId, arg) {
   }
   if (arg === current) {
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `Already on '${arg}'.` });
+    return;
+  }
+  // Proxied mode (relay-owned-group design, section 4): a unix: API root
+  // means a relay stands in for Telegram, and this topic's provider is fixed
+  // by its fleet/model binding -- moving the conversation to another backend
+  // would leave the relay filing its messages under the old agent. Refused
+  // before any state changes and before the getBackend probe (the refusal is
+  // the binding's, not the backend's configurability); in the direct world
+  // this gate is inert. The relay-native way to reach '${arg}' is a topic
+  // of its own, which the pick binds to the agent holding that provider.
+  const proxiedRefusal = proxiedBackendSwitchRefusal(cfg.proxied, current, arg);
+  if (proxiedRefusal) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: proxiedRefusal });
     return;
   }
   if (busySessions.has(entry.sessionId)) {

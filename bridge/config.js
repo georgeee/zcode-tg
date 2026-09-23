@@ -81,6 +81,12 @@ export function buildConfig(env = process.env) {
 
   return {
     telegramToken: token || undefined,
+    // Proxied mode (relay-owned-group design, section 4): the API root is a
+    // unix: socket, so a relay is standing in for Telegram -- parsed here,
+    // from the same env var bridge/telegram.js reads, so the proxied-mode
+    // command refusals are testable without the client. Any http(s) root
+    // (explicit or the absent default) is the direct world, not proxied.
+    proxied: (env.TELEGRAM_API_ROOT || '').startsWith('unix:'),
     chatId: Number(env.TELEGRAM_CHAT_ID || 0),
     allowedUserId: Number(env.TELEGRAM_ALLOWED_USER_ID || 0),
     nodeBin: env.ZCODE_NODE_BIN || process.execPath,

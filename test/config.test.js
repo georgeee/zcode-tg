@@ -118,3 +118,26 @@ test('non-Telegram required vars still throw plain Errors (as the old need() did
   assert.ok(!(wsErr instanceof ConfigError));
   assert.match(wsErr.message, /missing required env var: ZCODE_WORKSPACE_DIR/);
 });
+
+// Proxied mode (relay-owned-group design, section 4): cfg.proxied is the
+// bridge's local test for "a relay stands in for Telegram", decided from the
+// same env var bridge/telegram.js parses -- a unix: root, and only that form.
+test('cfg.proxied: a unix: TELEGRAM_API_ROOT is proxied mode', () => {
+  const cfg = buildConfig({
+    ...BASE,
+    TELEGRAM_BOT_TOKEN: 'tok',
+    TELEGRAM_CHAT_ID: '-100777',
+    TELEGRAM_ALLOWED_USER_ID: '42',
+    TELEGRAM_API_ROOT: 'unix:/tmp/state/zcode-tg/relay.sock',
+  });
+  assert.equal(cfg.proxied, true);
+});
+
+test('cfg.proxied: http(s) roots -- explicit or the absent default -- are NOT proxied', () => {
+  const telegramTrio = { TELEGRAM_BOT_TOKEN: 'tok', TELEGRAM_CHAT_ID: '-100777', TELEGRAM_ALLOWED_USER_ID: '42' };
+  // absent: the default https root bridge/telegram.js falls back to
+  assert.equal(buildConfig({ ...BASE, ...telegramTrio }).proxied, false);
+  assert.equal(buildConfig({ ...BASE, ...telegramTrio, TELEGRAM_API_ROOT: 'https://api.telegram.org' }).proxied, false);
+  // any http(s) root counts, not just Telegram's own host
+  assert.equal(buildConfig({ ...BASE, ...telegramTrio, TELEGRAM_API_ROOT: 'http://localhost:8081' }).proxied, false);
+});
