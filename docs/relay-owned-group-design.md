@@ -29,14 +29,17 @@ the function names are the durable half.
 > around it, not over it.
 >
 > **Amended 2026-09-23, on the owner's clarification, two things now explicit
-> rather than implied.** (a) ONE AGENT MAY OWN SEVERAL TOPICS: the binding
-> table is many-to-one, each topic stays an independent session inside the
+> rather than implied.** (a) THE BINDING IS MANY-TO-ONE: one agent may own
+> ANY NUMBER of topics, each topic stays an independent session inside the
 > bridge exactly as today, the agent's single proxy stream carries all its
-> topics, and per-topic `/model` may pick different models within the agent's
-> provider (section 3). (b) THE PICK IS TELEGRAM'S SELECT MENUS: when the
-> user creates a topic they choose fleet, then model, via inline keyboards the
-> relay posts in the new topic; the exact menus, the typed-before-choosing
-> rule, and the owner-only re-bind/close verbs are spelled in section 4.
+> bound topics, and per-topic `/model` may differ within the agent's
+> provider (section 3). (b) THE PICK IS TELEGRAM'S SELECT MENUS, POSTED AT
+> CREATION: when the user creates a topic the relay immediately posts the
+> fleet menu there, keyed off the `forum_topic_created` service message (the
+> first owner message is only the fallback for topics predating the relay's
+> presence in the group); the exact two menus, the typed-before-the-second-
+> tap rule, and the owner-only `/rebind`//`/close` verbs are spelled in
+> section 4.
 
 ---
 
@@ -708,14 +711,17 @@ proxied-mode refusal (section 4).
    lanes, 429-as-pressure-valve (section 6). Gated on: 5; fake-clock unit
    tests assert coalescing and fairness, the e2e asserts a burst from two
    topics emerges interleaved and capped.
-7. **The pick conversation.** The two Telegram select menus (fleet from the
-   relay's known fleets, then models.json's provisioned models for that
-   fleet) posted on `forum_topic_created`/first owner message, the re-ask on
-   typed-before-bound messages (delivered nowhere, buffered nowhere),
-   `pendingZAuth` discipline, binding written, the chosen agent's first
-   status pin as confirmation, auto-bind for agent-minted topics, and the
-   owner-only `/bind`//`/close` verbs with their `menuCommands` lines
-   (section 4). Gated on: 5.
+7. **The pick conversation.** The two Telegram select menus (the relay's
+   fleet records, then models.json's provisioned models for the chosen
+   fleet) posted immediately on `forum_topic_created`, the first owner
+   message kept only as the fallback for topics predating the relay's
+   presence in the group, the re-ask on anything typed before the second
+   tap (delivered to no agent, buffered nowhere), `pendingZAuth`
+   discipline, binding written, the chosen agent's first status pin as
+   confirmation, auto-bind for agent-minted topics, and the owner-only
+   `/rebind`//`/close` verbs — re-bind closes the old agent's session
+   through the `session_close` path and the topic's status pin is replaced
+   by the new agent's (section 4). Gated on: 5.
 8. **`/auth` rewrite + `PutZAuth` delivery.** `ops.ZAuth.APIRoot` (empty =
    compat), `putZcodeEnv` writes `TELEGRAM_API_ROOT`, `beginModelAuth`'s
    relay-owned path skips the token ask, virtual token minted and recorded.
