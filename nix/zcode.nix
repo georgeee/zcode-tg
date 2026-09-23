@@ -18,11 +18,11 @@
 
 stdenv.mkDerivation rec {
   pname = "zcode";
-  version = "3.10.2-18";
+  version = "3.11.2-25";
 
   src = fetchurl {
     url = "https://registry.npmjs.org/zcode-app-cli/-/zcode-app-cli-${version}.tgz";
-    sha256 = "37e90b514b1c4cfb9ae087426c0e7817dc9edd72e17b8f0384b59efc2e524c2e";
+    sha256 = "4f6c32ba56fe3c9fa032fccdbc0b935fe959064546b18c30e72d7cf12a6f329a";
   };
 
   nodejs = nodejs_22;
