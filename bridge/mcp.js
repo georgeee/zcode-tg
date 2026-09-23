@@ -159,7 +159,7 @@ export function createMcpGateway({
     {
       name: 'session_create',
       description:
-        'Create a named session: a Telegram forum topic in the target chat plus a fresh agent session bound to it. Messages sent to the topic (by the owner in Telegram, or via message_send) are answered by the agent; replies are mirrored into the topic.',
+        'Create a named session: a Telegram forum topic in the target chat plus a fresh agent session bound to it. Messages sent to the topic (by the owner in Telegram, or via message_send) are answered by the agent; replies are mirrored into the topic. On a bridge with no Telegram transport (MCP-only mode) no topic is created: chat_id must be omitted, the returned key is a synthetic "m<N>" carrying telegram: false, and replies reach you through message_send\'s wait or replies_get.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -187,7 +187,7 @@ export function createMcpGateway({
     },
     {
       name: 'session_close',
-      description: 'Close a previously created session and its Telegram topic.',
+      description: "Close a previously created session (and its Telegram topic, when the bridge has one -- skipped in MCP-only mode).",
       inputSchema: {
         type: 'object',
         properties: { key: { type: 'string', description: 'Conversation key from session_create.' } },
@@ -197,7 +197,7 @@ export function createMcpGateway({
     {
       name: 'message_send',
       description:
-        'Send a message to an agent session and wait for the final reply. The message and the reply are mirrored into the Telegram topic.',
+        'Send a message to an agent session and wait for the final reply. The message and the reply are mirrored into the Telegram topic when the bridge has one; in MCP-only mode delivery is this tool\'s reply (wait) and replies_get alone.',
       inputSchema: {
         type: 'object',
         properties: {
