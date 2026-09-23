@@ -369,7 +369,18 @@ async function scenario4() {
     await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, 'mcp unix socket bind');
     check('the MCP unix socket file exists', existsSync(sock), b.log.slice(-2000));
     const lines = await unixJsonRpc(sock, [{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }]);
-    check('tools/list over the unix socket advertises seven tools', lines[0]?.result?.tools?.length === 7, JSON.stringify(lines[0]).slice(0, 300));
+    // The ADVERTISED SET, BY NAME -- not a count (a count went stale when
+    // session_close joined and nobody could tell what drifted). A tool added
+    // or removed fails here naming the difference.
+    const ADVERTISED_TOOLS = ['session_create', 'session_close', 'message_send', 'replies_get', 'progress_get', 'model_get', 'usage_get', 'model_set'];
+    const advertised = (lines[0]?.result?.tools ?? []).map((t) => t.name).sort();
+    const missing = ADVERTISED_TOOLS.filter((n) => !advertised.includes(n));
+    const unexpected = advertised.filter((n) => !ADVERTISED_TOOLS.includes(n));
+    check(
+      `tools/list over the unix socket advertises exactly the agreed tool set by name`,
+      missing.length === 0 && unexpected.length === 0,
+      `missing: [${missing}] unexpected: [${unexpected}] -- advertised: [${advertised.join(', ')}]`,
+    );
     check('zcode was NEVER spawned for a mock-default bridge (no start-marker)', !existsSync(zcodeMarker), b.log.slice(-2000));
   } finally {
     b.proc.kill('SIGKILL');
