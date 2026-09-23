@@ -140,6 +140,102 @@ test('MockBackend model switching is a documented no-op, not a throw', async () 
   await assert.doesNotReject(() => backend.setMode(sessionId, 'anything'));
 });
 
+// --- streaming mode (MOCK_STREAM_CHUNKS / MOCK_STREAM_INTERVAL_MS) ---
+
+// Collects events with arrival timestamps so the spacing can be asserted.
+function collectEvents(backend, sessionId) {
+  const events = [];
+  backend.on('event', (m) => {
+    if (m.params.sessionId === sessionId) events.push({ at: Date.now(), ...m });
+  });
+  return events;
+}
+
+test('MockBackend explicit streamChunks: 0 keeps the instant single-burst reply byte for byte', async () => {
+  const backend = new MockBackend({ streamChunks: 0 });
+  const { sessionId } = await backend.createConversation({});
+  const events = collectEvents(backend, sessionId);
+  await backend.sendMessage(sessionId, 'quick');
+  await sleep(0);
+  assert.equal(events.length, 4, JSON.stringify(events));
+  assert.equal(events[1].params.payload.kind, 'text_delta');
+  assert.equal(events[1].params.payload.delta, '[mock echo] quick');
+  assert.equal(events[2].params.payload.content, '[mock echo] quick');
+});
+
+test('MockBackend streaming mode emits the echo as N spaced deltas, then the IDENTICAL final text', async () => {
+  const CHUNKS = 4, INTERVAL = 25;
+  const backend = new MockBackend({ streamChunks: CHUNKS, streamIntervalMs: INTERVAL });
+  const { sessionId } = await backend.createConversation({});
+  const t0 = Date.now();
+  const events = collectEvents(backend, sessionId);
+
+  await backend.sendMessage(sessionId, 'stream me');
+  const echo = '[mock echo] stream me';
+  await sleep(INTERVAL * (CHUNKS + 4)); // all deltas + the tail, with slack
+
+  assert.equal(events[0].params.kind, 'turn.started');
+  const deltas = events.filter((e) => e.params.payload?.kind === 'text_delta');
+  assert.equal(deltas.length, CHUNKS, JSON.stringify(events));
+  // The deltas are INCREMENTS of the one echo: concatenation is the whole
+  // text, byte-identical to the instant mode's single delta.
+  assert.equal(deltas.map((d) => d.params.payload.delta).join(''), echo);
+  // Spacing: delta i (0-based) lands no earlier than (i+1)*INTERVAL.
+  for (let i = 0; i < deltas.length; i++) {
+    assert.ok(
+      deltas[i].at - t0 >= INTERVAL * (i + 1) - 1,
+      `delta ${i} arrived at +${deltas[i].at - t0}ms, before its ${INTERVAL * (i + 1)}ms slot`,
+    );
+  }
+  // The final render source is IDENTICAL to instant mode, and terminal still
+  // closes the turn after it.
+  const result = events.find((e) => e.params.payload?.kind === 'result');
+  assert.equal(result.params.payload.content, echo);
+  const terminal = events.find((e) => e.params.kind === 'turn.terminal');
+  assert.equal(terminal.params.status, 'success');
+  assert.ok(events.indexOf(result) < events.indexOf(terminal), 'result must precede turn.terminal');
+});
+
+test('MockBackend reads MOCK_STREAM_CHUNKS / MOCK_STREAM_INTERVAL_MS from the env', async () => {
+  const prevChunks = process.env.MOCK_STREAM_CHUNKS;
+  const prevInterval = process.env.MOCK_STREAM_INTERVAL_MS;
+  process.env.MOCK_STREAM_CHUNKS = '3';
+  process.env.MOCK_STREAM_INTERVAL_MS = '15';
+  try {
+    const backend = new MockBackend(); // no injection: the env is the source
+    const { sessionId } = await backend.createConversation({});
+    const events = collectEvents(backend, sessionId);
+    const t0 = Date.now();
+    await backend.sendMessage(sessionId, 'env knobs');
+    await sleep(15 * 7);
+    const deltas = events.filter((e) => e.params.payload?.kind === 'text_delta');
+    assert.equal(deltas.length, 3, JSON.stringify(events));
+    assert.equal(deltas.map((d) => d.params.payload.delta).join(''), '[mock echo] env knobs');
+    assert.ok(deltas[2].at - t0 >= 15 * 2, 'deltas must be spaced by MOCK_STREAM_INTERVAL_MS');
+    assert.equal(events.find((e) => e.params.payload?.kind === 'result').params.payload.content, '[mock echo] env knobs');
+  } finally {
+    // Restore: the other tests in this file construct MockBackend too and
+    // must see the instant default.
+    if (prevChunks === undefined) delete process.env.MOCK_STREAM_CHUNKS; else process.env.MOCK_STREAM_CHUNKS = prevChunks;
+    if (prevInterval === undefined) delete process.env.MOCK_STREAM_INTERVAL_MS; else process.env.MOCK_STREAM_INTERVAL_MS = prevInterval;
+  }
+});
+
+test('MockBackend cancel() stops a streamed turn: no deltas or terminal after it', async () => {
+  const backend = new MockBackend({ streamChunks: 6, streamIntervalMs: 40 });
+  const { sessionId } = await backend.createConversation({});
+  const events = collectEvents(backend, sessionId);
+  await backend.sendMessage(sessionId, 'cancel me');
+  await sleep(90); // roughly two deltas in
+  const countAtCancel = events.length;
+  await backend.cancel(sessionId);
+  await sleep(400); // the rest of the schedule would be ~240ms more
+  const after = events.slice(countAtCancel);
+  assert.ok(countAtCancel >= 2, `expected the first deltas before the cancel, got ${countAtCancel} events`);
+  assert.equal(after.filter((e) => e.params.kind === 'turn.terminal' || e.params.payload?.kind === 'result').length, 0,
+    `a cancelled streamed turn must never emit result/terminal: ${JSON.stringify(after)}`);
+});
+
 // --- 2. Through the real MCP gateway, wired to a real MockBackend instance
 // -- mirrors what bridge/index.js's own wiring does (getOrCreateSession /
 // startTurn / finalizeTurn), just trimmed to what the mock backend needs

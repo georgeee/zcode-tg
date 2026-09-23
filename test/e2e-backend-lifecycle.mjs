@@ -960,12 +960,67 @@ async function scenario10() {
   }
 }
 
+// --- scenario 11: a Telegram-served mock-default bridge needs NO zcode
+// credential and never spawns zcode -- and with MOCK_STREAM_CHUNKS it
+// STREAMS: the ReplyStreamer edits a live preview, then the final render
+// lands with the identical echo text ---
+async function scenario11() {
+  console.log('\n--- scenario 11: mock-default + MOCK_STREAM_CHUNKS: no zcode anything, real streaming preview ---');
+  const { srv, port, calls, pushUpdate } = await startFakeTelegram();
+  const zcodeMarker = path.join(TMP, 's11-zcode-started.json');
+  const b = startBridge(
+    {
+      TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+      TELEGRAM_BOT_TOKEN: 'fake',
+      TELEGRAM_CHAT_ID: '-100111',
+      TELEGRAM_ALLOWED_USER_ID: '1',
+      DEFAULT_BACKEND: 'mock',
+      // ZCODE_BIN/ZCODE_WORKSPACE_DIR are demanded by config.js for every
+      // boot mode -- but for a mock-default bridge they are never USED: the
+      // fixture stand-in satisfies the variable and (asserted below) is
+      // never spawned, and no zcode credential exists anywhere in this run.
+      ZCODE_NODE_BIN: NODE,
+      ZCODE_BIN: ZCODE_FIXTURE,
+      ZCODE_WORKSPACE_DIR: TMP,
+      FIXTURE_ZCODE_MARKER: zcodeMarker, // must NEVER be written here
+      STORE_PATH: path.join(TMP, 's11-store.json'),
+      // The streaming knobs under test + a preview throttle small enough to
+      // flush mid-stream (the production default 5000ms would outlast it).
+      MOCK_STREAM_CHUNKS: '4',
+      MOCK_STREAM_INTERVAL_MS: '150',
+      STREAM_PROGRESS: 'preview',
+      STREAM_EDIT_INTERVAL_MS: '200',
+    },
+    's11',
+  );
+  try {
+    await waitFor(() => b.log.includes('starting.'), 15000, 'bridge boot');
+    check('the bridge boots Telegram-served with DEFAULT_BACKEND=mock and no zcode credential', b.proc.exitCode === null, `exitCode=${b.proc.exitCode}\n${b.log.slice(-2000)}`);
+    pushUpdate(tgMessage(77, 'stream this prompt'));
+    const final = await waitFor(
+      () => calls.edit.find((e) => (e.text || '').includes('[mock echo] stream this prompt')),
+      20000,
+      'the final render',
+    );
+    check('the streamed turn delivered the final render with the IDENTICAL echo text', !!final, JSON.stringify(calls.edit.map((e) => (e.text || '').slice(0, 50))));
+    const previewIdx = calls.edit.findIndex((e) => (e.text || '').startsWith('⌛'));
+    check('a live ⌛ preview edit landed BEFORE the final render (the ReplyStreamer streamed)', previewIdx >= 0 && previewIdx < calls.edit.indexOf(final), JSON.stringify(calls.edit.map((e) => (e.text || '').slice(0, 40))));
+    const previews = calls.edit.filter((e) => (e.text || '').startsWith('⌛'));
+    check('more than one preview edit (the deltas actually streamed, spaced apart)', previews.length >= 2, `${previews.length} preview edits`);
+    check('zcode was NEVER spawned (no credential, no install -- the fixture path is never executed)', !existsSync(zcodeMarker), b.log.slice(-2000));
+    check('no codex was involved either (mock-default touches nothing else)', !/codex/i.test(b.log), b.log.slice(-1000));
+  } finally {
+    b.proc.kill('SIGKILL');
+    srv.close();
+  }
+}
+
 // EACH SCENARIO REPORTS ITS OWN FAILURE, so one scenario's throw (which is
 // how a bridge that dies at boot usually surfaces -- a waitFor timeout)
 // doesn't silently skip the scenarios after it: on the :546 boot-crash
 // this file exists to catch, EVERY non-zcode-default scenario is red, and
 // the run must say so rather than stop at the first.
-for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10]) {
+for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11]) {
     try {
       await s();
     } catch (e) {
