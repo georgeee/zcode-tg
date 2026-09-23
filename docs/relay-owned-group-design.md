@@ -280,8 +280,11 @@ Non-429 failures are not retried anywhere in the bridge (`telegram.js:62-64`
 the caller, which is exactly what a bug here deserves.
 
 **Synthetic identity.** `getMe` answers per agent with a synthetic id and a
-username derived from the binding (`<fleet>_<model>`, sanitized, ending in
-`bot` as Telegram's own rule requires); `getChatMember` answers with the same
+username derived from the binding (`<fleet>_<model>_a<n>_bot` — sanitized,
+ending in `bot` as Telegram's own rule requires, with the agent's per-group
+index `n` assigned monotonic at mint and stored in `shared-group.json`'s
+agents map, so a re-issued credential never reuses a retired username —
+decision D7); `getChatMember` answers with the same
 synthetic user as administrator. This is not cosmetic: `commandIsOurs`
 (`bridge/commands.js:23`, landed in `1b980d1`) compares a command's `@suffix`
 against `getMe`'s username and drops mismatches (`bridge/index.js:2155`), and
@@ -393,6 +396,18 @@ relay auto-binds the returned `message_thread_id` to the creating agent at
 creation time. The pick exists for humans because the relay cannot tell which
 agent a human meant; it can always tell which agent asked for a topic.
 
+**The pre-pick buffer (decision D4).** Messages a human TYPES in an unbound
+topic of the shared group wait in that topic's buffer — bounded like a queue
+(64 updates or 24h, whichever first, drop-oldest, never silent: drops count
+toward the same one-notice-per-topic-per-hour duty). The moment the topic is
+bound — by the pick, or a rebind — the buffer MOVES, in update-id order, into
+the agent pair's delivery queue (decision D3's keying), counted once through
+that queue's own bound. `expirePrePick(topic)` drops the buffer and returns
+the count, so the pick conversation owes the topic one sentence with it.
+**Callback queries are never buffered** — a tap on a keyboard whose
+conversation nobody will serve is expired, not stored; that is the one
+sanctioned silent drop (section 9).
+
 **`/model` is structurally bounded.** The agent behind a topic holds one
 provider — the binding names the agent, the agent's account holds one
 provider's credential — so "switch within the topic's provider" is just
@@ -471,11 +486,13 @@ pins, deletes, documents — pass through one scheduler before the real API:
    text wins; an edit arriving within ~1.5s of the last one for the same
    message replaces the pending edit in place; one edit goes out per message
    per interval. Nothing is dropped that matters — coalescing a superseded
-   intermediate preview loses nothing the next edit doesn't carry. A
-   terminal-delivery edit (the streamer's authoritative final render,
-   `streamer.js:8-11` — "the final delivery on turn.terminal always runs
-   regardless of the throttle") is flagged by the bridge and bypasses
-   coalescing, though not the bucket.
+   intermediate preview loses nothing the next edit doesn't carry.
+   **NO TERMINAL-EDIT WIRE FLAG** (decision D1): there is no "final render"
+   marker on the wire, and the coalescer's contract is simply that the
+   LATEST text is always flushed within the window — so the streamer's
+   authoritative final render (`streamer.js:8-11`) needs no bypass. The
+   bridge-side invariant that makes that safe is stated as such, not
+   signaled: *no edit for a message follows its terminal render.*
 2. **Two token buckets.** A global bucket refilling at ~25 msg/s (burst 30)
    and a per-group bucket refilling at ~16 msg/min (burst 20) — headroom under
    both assumed limits, so one noisy fleet cannot spend another fleet's
@@ -576,6 +593,16 @@ already established.
 
 ## 9. Failure modes
 
+- **Two relays, one token.** The relay takes an exclusive `flock` on
+  `<secrets>/relay.lock` BEFORE its `getUpdates` loop starts (decision D5);
+  a second relay refuses to start with a sentence naming the lock file and,
+  when the file is readable, the holder pid. THE LOCK IS A COURTESY BETWEEN
+  WELL-BEHAVED RELAYS, NOT A BOUNDARY: the exchange group is the perimeter —
+  anyone who can reach the secrets directory or squat the lock is an agent
+  account, already trusted to exactly that degree. Two pollers on one token
+  would steal each other's updates even without the lock (Telegram answers
+  the second 409), but only once both are up; the lock closes the silent
+  window before it.
 - **Relay down.** The bridge sees `getUpdates` fail (ECONNREFUSED from the
   socket) and every outbound call fail — which is byte-for-byte what it sees
   when Telegram is down today: the poll loop logs and retries, sends surface
@@ -586,13 +613,15 @@ already established.
   undelivered updates on its own offset, which is also what bounds the
   relay's catch-up).
 - **Agent down (bridge process dead, fleet down).** The relay BUFFERS the
-  agent's updates (bounded: a few hundred updates or 24h, whichever first) —
-  dropping an owner's prompt silently is the one failure this design must not
-  have. When the backlog ages past a few minutes, the relay itself posts ONE
-  notice in the topic from its own identity ("builder-1/zcode has not
-  collected messages for 10m — I'll keep them; /status builder-1 to check the
-  fleet") and pins a matching status edit, rather than repeating itself per
-  message.
+  agent's updates (bounded: 512 updates or 24h age, whichever first;
+  drop-oldest) — dropping an owner's prompt silently is the one failure this
+  design must not have, and NO DROP IS SILENT: each drop counts toward ONE
+  notice the relay posts in the affected topic from its own identity
+  ("<fleet>/<model> has not collected N messages; dropped the oldest —
+  /status <fleet> to check the fleet"), rate-limited to one per topic per
+  hour. **The one sanctioned silent drop is a callback query**: a tap on a
+  keyboard nobody will serve is expired, never buffered and never mourned
+  (decision D4's boundary).
 - **Binding to a dead agent.** Deprovisioning is an operator act and the
   binding outlives the agent on purpose (a restarted fleet keeps its topics).
   A bound-but-unresolvable agent (no such model on that fleet per
