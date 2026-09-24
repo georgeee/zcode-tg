@@ -114,6 +114,9 @@ export class AntigravityBackend extends Backend {
     //     late-poll guard), watcher: ConversationWatcher | null,
     //     idleSince (GC clock: spawn or last result),
     //     turnStartedAt, creatorConn (C2), closeWhenIdle (C2 pending),
+    //     cancelPending (a SIGTERM was requested for the in-flight turn:
+    //       the verdict is failed/interrupted whatever envelope races in,
+    //       and the next send respawn-resumes -- agy exits on a cancel),
     //     closing/closePromise/lastExitAt (teardown bookkeeping) }
     // A GC-closed session KEEPS its entry (client.exited marks the death;
     // ownTurnTexts is dropped): the effort and workspaceDir on it are what
@@ -351,16 +354,38 @@ export class AntigravityBackend extends Backend {
     // turn.started FIRST: index.js correlates a turn's events on the turnId
     // learned from this event, and adopts backend-initiated turns from it.
     this._emitTelemetry(makeSessionId('antigravity', rawSessionId(sessionId)), turnId, 'turn.started');
-    session.client.sendUserTurn(text);
+    try {
+      await session.client.sendUserTurn(text);
+    } catch (err) {
+      // The child died between the respawn check in _runningSession and the
+      // write (crash, or a SIGTERM-cancel exit racing the next turn): the
+      // message never reached agy. End the turn HERE -- index.js's watchdog
+      // is off by default, so without this the topic would sit on its
+      // placeholder forever -- with the client's retryable delivery message.
+      // The conversation survives; the next send respawn-resumes.
+      session.turn = null;
+      session.ownTurnTexts.delete(text);
+      this._emitTelemetry(makeSessionId('antigravity', rawSessionId(sessionId)), turnId, 'turn.terminal', {
+        status: 'failed',
+        errorCode: err.message,
+      });
+    }
   }
 
   // Abort the in-flight turn: SIGTERM. agy answers with a structured
   // {"status":"ERROR","error":"interrupted"} result (VERIFIED LIVE, battery
-  // (f)) which flows through the normal result -> turn.terminal path; the
-  // conversation survives for later turns.
+  // (f)) which flows through the normal result -> turn.terminal path, and
+  // EXITS. cancelPending records the verdict from this instant -- see
+  // _onResult (the cancel wins over any envelope that races in) and
+  // _runningSession (the next send respawn-resumes instead of writing into
+  // the child that is on its way out). The conversation survives for later
+  // turns.
   async cancel(sessionId) {
     const session = this._sessions.get(rawSessionId(sessionId));
-    if (session && session.turn) session.client.kill('SIGTERM');
+    if (session && session.turn) {
+      session.cancelPending = true;
+      session.client.kill('SIGTERM');
+    }
   }
 
   // Stop the child but keep the conversation: agy's state is the SQLite db
@@ -471,7 +496,7 @@ export class AntigravityBackend extends Backend {
       // the only thing that distinguishes them from any other process.
       env: { CAGE_AGY_BRIDGE: this.bridgeMarker },
     });
-    const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null, idleSince: Date.now(), turnStartedAt: null, creatorConn: null, closeWhenIdle: null, closing: false, closePromise: null, lastExitAt: null };
+    const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null, idleSince: Date.now(), turnStartedAt: null, creatorConn: null, closeWhenIdle: null, cancelPending: false, closing: false, closePromise: null, lastExitAt: null };
     this._pending.add(session);
     session.initPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`agy did not initialize within ${this.initTimeoutMs}ms (agyBin=${this.agyBin})`)), this.initTimeoutMs);
@@ -519,13 +544,18 @@ export class AntigravityBackend extends Backend {
   }
 
   // The live child for a session, respawning (resume form: --conversation)
-  // when a previous child exited -- after closeConversation, a crash, or an
-  // effort change. Throws when the respawn itself fails (init never
-  // arrives), which startTurn's catch reports to the topic.
+  // when a previous child exited -- after closeConversation, a crash, an
+  // effort change, or a SIGTERM cancel. Throws when the respawn itself fails
+  // (init never arrives), which startTurn's catch reports to the topic.
   async _runningSession(sessionId) {
     const rawId = rawSessionId(sessionId);
     let session = this._sessions.get(rawId);
-    if (!session || !this._isLive(session)) {
+    if (!session || !this._isLive(session) || session.cancelPending) {
+      // cancelPending: the child was SIGTERM-cancelled and agy exits on a
+      // cancel (VERIFIED LIVE, battery (f)) -- but its exit event may still
+      // be in flight, so a "live" hit here would write the next turn into a
+      // child on its way out (an EPIPE, or a message swallowed by its
+      // death). Respawn instead; the dying entry is replaced at init.
       session = await this._spawn({ workspaceDir: session?.workspaceDir ?? this.cwd, effort: session?.effort ?? this.effort, conversationId: rawId });
       await session.initPromise;
     }
@@ -540,6 +570,7 @@ export class AntigravityBackend extends Backend {
     this._pending.delete(session); // died before init: its cap slot goes back
     session.lastExitAt = Date.now();
     session.closeWhenIdle = null; // the child is already gone; nothing left to close
+    session.cancelPending = false; // the doom it recorded has materialized
     // A child exiting mid-turn (crash, OOM, SIGKILL) must end that turn with
     // a failed terminal -- index.js's watchdog is off by default, so without
     // this the topic would sit on its placeholder forever. The normal paths
@@ -664,6 +695,13 @@ export class AntigravityBackend extends Backend {
 
   _onResult(session, sessionId, result) {
     const turn = session.turn;
+    // THE CANCEL IS THE VERDICT: a SIGTERM was already requested for this
+    // turn, so an envelope that races in after the signal -- a SUCCESS that
+    // was already in the pipe when the cancel landed -- does not un-cancel
+    // it. The turn ends failed/interrupted exactly as the deliberate
+    // interrupt envelope would; usage is still accounted (the spend
+    // happened either way).
+    const cancelled = turn != null && session.cancelPending === true;
     session.turn = null;
     // C1: the idle clock runs from the END of the last turn -- the result
     // event -- not from the turn's start.
@@ -686,14 +724,14 @@ export class AntigravityBackend extends Backend {
       this._lastQuotaError = { at: new Date().toISOString(), status: result.status, error: result.error };
     }
     if (!turn) return; // terminal already emitted via _onChildExit; nothing to double-emit
-    const success = statusOf(result);
+    const success = cancelled ? 'failed' : statusOf(result);
     // The turn's final answer: {response, usage} together is the shared
     // vocabulary's "authoritative full-turn text + cumulative usage" shape
     // (backend.js; index.js reads exactly this pair).
     if (success === 'success') {
       this._emitSession(sessionId, turn.id, { kind: 'result', response: result.response ?? '', usage });
     } else {
-      this._emitSession(sessionId, turn.id, { kind: 'result', error: { message: result.error || result.status || 'agy error' } });
+      this._emitSession(sessionId, turn.id, { kind: 'result', error: { message: cancelled ? 'interrupted' : (result.error || result.status || 'agy error') } });
     }
     this._emitTelemetry(sessionId, turn.id, 'usage.delta', {
       requestId: turn.id,
@@ -702,7 +740,7 @@ export class AntigravityBackend extends Backend {
     });
     this._emitTelemetry(sessionId, turn.id, 'turn.terminal', {
       status: success,
-      errorCode: success === 'success' ? undefined : [result.status, result.error].filter(Boolean).join(': '),
+      errorCode: success === 'success' ? undefined : cancelled ? 'ERROR: interrupted' : [result.status, result.error].filter(Boolean).join(': '),
       durationMs: Number.isFinite(result.duration_seconds) ? Math.round(result.duration_seconds * 1000) : undefined,
       tokenCount: usage.totalTokens ?? undefined,
       toolCallCount: turn.toolCallCount,

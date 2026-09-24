@@ -29,7 +29,10 @@
 //   FIXTURE_AGY_SLOW_MS        how long the AGY-SLOW trigger stalls (cancel tests)
 //   FIXTURE_AGY_STUBBORN       set: ignore stdin EOF and SIGTERM -- only
 //                              SIGKILL ends the process (GC escalation tests)
-import { appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+//   FIXTURE_AGY_CLOSE_STDIN    set: destroy the stdin READ end and stay
+//                              alive -- the parent's next write hits EPIPE
+//                              against a live child (client write-guard tests)
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync, closeSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 
 const STUBBORN = !!process.env.FIXTURE_AGY_STUBBORN;
@@ -37,6 +40,18 @@ const STUBBORN = !!process.env.FIXTURE_AGY_STUBBORN;
 // process would still exit naturally (code 0). A stubborn session holds the
 // event loop, so only SIGKILL ends it -- that is the point of the knob.
 if (STUBBORN) setInterval(() => {}, 10_000);
+
+// Unlike STUBBORN (EOF ignored, read end left open), this closes the read
+// end itself: fd 0 IS the read end of the pipe the parent writes turns into,
+// so closing it makes the kernel refuse the parent's writes with EPIPE while
+// the child lives on -- the exact shape of a write racing a dying agy.
+// (Measured: process.stdin.destroy() does NOT do this -- without a read the
+// handle never opens, the fd stays, and the parent's write just buffers.)
+const CLOSE_STDIN = !!process.env.FIXTURE_AGY_CLOSE_STDIN;
+if (CLOSE_STDIN) {
+  closeSync(0);
+  setInterval(() => {}, 10_000);
+}
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(name);
@@ -155,6 +170,7 @@ process.stdin.on('data', (chunk) => {
 });
 process.stdin.on('end', () => {
   if (STUBBORN) return; // the whole point: EOF alone does not end this one
+  if (CLOSE_STDIN) return; // fd 0 was closed at startup -- this 'end' is that artifact, not a shutdown signal
   process.exit(0);
 });
 

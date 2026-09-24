@@ -1,8 +1,11 @@
 // Unit tests for bridge/antigravityClient.js: the spawn contract (argv, HOME
 // override, cwd), NDJSON event parsing, the AGY_ERROR stderr tap, SIGTERM
-// semantics, --conversation resume, and the settings seeding merge -- all
-// against test/fixtures/fake-agy.mjs, which speaks the stream-json protocol
-// exactly as recorded live (see the fixture header for the protocol sources).
+// semantics, --conversation resume, the stdin write-guard (a delivery that
+// loses the race against the child's death is a rejection, never an
+// uncaughtException -- in the bridge that would be every session lost), and
+// the settings seeding merge -- all against test/fixtures/fake-agy.mjs,
+// which speaks the stream-json protocol exactly as recorded live (see the
+// fixture header for the protocol sources).
 //
 // Run: node --test test/antigravity-client.test.js
 import test from 'node:test';
@@ -14,6 +17,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AntigravityClient, AGY_SETTINGS_DEFAULTS, ensureAgySettings } from '../bridge/antigravityClient.js';
+
+// Catches the async face of a stdin error without letting it fail the run:
+// node:test only crashes the test on an uncaughtException when NO listener
+// exists, so this trap plus the assertion below is what turns "the spawn-time
+// stdin 'error' listener was removed" red.
+function trapUncaught(t) {
+  const uncaught = [];
+  const onUncaught = (e) => uncaught.push(e);
+  process.on('uncaughtException', onUncaught);
+  t.after(() => process.off('uncaughtException', onUncaught));
+  return uncaught;
+}
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(HERE, 'fixtures', 'fake-agy.mjs');
@@ -156,6 +171,58 @@ test('cancel: SIGTERM mid-turn produces the interrupted result and exit code 1 (
     assert.equal(exit.code, 1);
   } finally {
     client.stop();
+  }
+});
+
+test('a send to a child that already exited rejects with the delivery error -- no uncaughtException, no byte reaches the stream', async (t) => {
+  const dir = tmp('dead-send');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const uncaught = trapUncaught(t);
+  // effort: '' is the invalid selection: the fixture writes its refusal and
+  // exits(1) at once -- a child dead on arrival, no init to wait for.
+  const client = new AntigravityClient({
+    agyBin: FIXTURE,
+    agyHome: path.join(dir, 'home'),
+    cwd: dir,
+    model: 'gemini-3.8-flash',
+    effort: '',
+  });
+  const exits = [];
+  client.on('exit', (info) => exits.push(info));
+  client.start();
+  try {
+    await waitFor(() => exits[0], 'the child to exit');
+    let wrote = false;
+    const realWrite = client.proc.stdin.write.bind(client.proc.stdin);
+    client.proc.stdin.write = (...a) => { wrote = true; return realWrite(...a); };
+    await assert.rejects(client.sendUserTurn('a message for a dead child'), /exited before the message could be delivered/);
+    assert.equal(wrote, false, 'the exited guard keeps the write off the dead stream');
+    await new Promise((r) => setTimeout(r, 100)); // an async face would have surfaced by now
+    assert.deepEqual(uncaught, []);
+  } finally {
+    client.stop();
+  }
+});
+
+test('a write the child can never read (stdin read end closed mid-flight, child alive) rejects -- the EPIPE never becomes an uncaughtException', async (t) => {
+  const dir = tmp('epipe-send');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const uncaught = trapUncaught(t);
+  const { client, events } = startClient(t, {
+    agyHome: path.join(dir, 'home'),
+    state: path.join(dir, 'state'),
+    cwd: dir,
+    extraEnv: { FIXTURE_AGY_CLOSE_STDIN: '1' }, // the fixture closed its stdin read end before init
+  });
+  try {
+    await waitFor(() => events.find((e) => e.event === 'init'), 'init');
+    assert.equal(client.exited, false, 'the child is alive -- this is the mid-flight EPIPE face, not the exited guard');
+    await assert.rejects(client.sendUserTurn('into the void'), /exited before the message could be delivered/);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(uncaught, []);
+  } finally {
+    client.proc?.kill('SIGKILL');
+    await waitFor(() => client.exited, 'the fixture to die');
   }
 });
 

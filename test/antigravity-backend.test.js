@@ -14,6 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AntigravityBackend, AGY_MODEL_REF, parseAgyModelRef } from '../bridge/backends/antigravityBackend.js';
+import { AGY_DELIVERY_FAILED } from '../bridge/antigravityClient.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(HERE, 'fixtures', 'fake-agy.mjs');
@@ -146,6 +147,49 @@ test('cancel: SIGTERM mid-turn ends the turn failed with the interrupted error',
   // The conversation survives: a follow-up turn works on the same session.
   const terminal2 = await runOneTurn(backend, events, sessionId, 'say something short');
   assert.equal(terminal2.params.status, 'success');
+  await backend.stop();
+});
+
+test('cancel is the verdict: an envelope racing in after the SIGTERM still ends the turn failed with the interrupted error', async (t) => {
+  const dir = tmp('cancel-race');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { backend, events } = makeBackend(dir, { initTimeoutMs: 10_000 });
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  await backend.sendMessage(sessionId, 'AGY-SLOW'); // fixture stalls (its default for this trigger)
+  await waitFor(() => byMethod(events, 'session/event').length > 0, 'the turn to start');
+  await backend.cancel(sessionId);
+  // The race the SIGTERM can lose: agy finished the turn as the cancel
+  // landed and its SUCCESS envelope was already in the pipe. The fixture
+  // cannot time that on demand, so the envelope is injected on the client's
+  // event seam; the real interrupted envelope follows it and is ignored
+  // (the turn is already over).
+  const rawId = sessionId.slice('antigravity:'.length);
+  backend._sessions.get(rawId).client.emit('event', {
+    event: 'result',
+    result: { conversation_id: rawId, status: 'SUCCESS', response: 'FAKE-REPLY: AGY-SLOW', duration_seconds: 0.05, num_turns: 1, usage: { input_tokens: 12001, output_tokens: 42, thinking_tokens: 5, cache_read_tokens: 0, total_tokens: 24886 } },
+  });
+  const terminal = await waitFor(() => terminals(events)[0], 'turn.terminal after cancel');
+  assert.equal(terminal.params.status, 'failed', 'the cancel wins over a racing SUCCESS envelope');
+  assert.match(terminal.params.errorCode, /interrupted/);
+  await backend.stop();
+});
+
+test('a send the child refuses (died between the respawn check and the write) ends the turn failed with the delivery error', async (t) => {
+  const dir = tmp('deadwrite');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { backend, events } = makeBackend(dir);
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  const session = backend._sessions.get(sessionId.slice('antigravity:'.length));
+  // The refusal seam: whatever sendUserTurn rejects with (the real client
+  // rejects with AGY_DELIVERY_FAILED on a write that lost the race against
+  // the child's death) lands verbatim on the turn's terminal. This pins the
+  // mapping; the plumbing is pinned in antigravity-client.test.js.
+  session.client.sendUserTurn = () => Promise.reject(new Error(AGY_DELIVERY_FAILED));
+  await backend.sendMessage(sessionId, 'say something short');
+  const terminal = terminals(events)[0];
+  assert.equal(terminal.params.status, 'failed');
+  assert.equal(terminal.params.errorCode, AGY_DELIVERY_FAILED);
+  assert.equal(session.turn, null, 'the refused turn did not linger (the reaper can reap)');
   await backend.stop();
 });
 

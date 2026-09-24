@@ -37,6 +37,12 @@
 //     without --effort, or an effort-suffixed slug together with --effort,
 //     are both hard-errors (verified live, battery (d)). This file always
 //     emits exactly one valid form.
+//   - a stdin write can lose the race against the child's death (SIGTERM
+//     cancel, crash): the kernel refuses it with EPIPE, and an uncaught
+//     EPIPE in the bridge process takes down EVERY session. Writes are
+//     guarded (sendUserTurn below) and the stream's 'error' event is
+//     swallowed at spawn -- a refused delivery is a rejection, never a
+//     crash.
 
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
@@ -90,6 +96,11 @@ export function ensureAgySettings(agyHome, defaults = AGY_SETTINGS_DEFAULTS) {
   return file;
 }
 
+// AGY_DELIVERY_FAILED: the one error a refused stdin write maps to, verbatim
+// on the failed turn's terminal by the backend. "retry" is accurate: the
+// conversation survives on disk and the next sendMessage respawn-resumes.
+export const AGY_DELIVERY_FAILED = 'agy exited before the message could be delivered — retry';
+
 export class AntigravityClient extends EventEmitter {
   constructor({ agyBin, agyHome, cwd, model, effort, remoteControl = true, skipPermissions = true, env = {} }) {
     super();
@@ -105,6 +116,10 @@ export class AntigravityClient extends EventEmitter {
     this.exited = false;
     this.exitInfo = null;
     this._buf = '';
+    // Last error the child's stdin stream reported (EPIPE when the child died
+    // under a write, ERR_STREAM_DESTROYED on a closed pipe). Swallowed at the
+    // spawn-time listener below -- sendUserTurn turns it into a rejection.
+    this._stdinError = null;
     // Chunk-safe decoding, same requirement as codexClient.js: streamed
     // text_delta payloads split multibyte UTF-8 characters across reads.
     this._decoder = new StringDecoder('utf8');
@@ -156,6 +171,16 @@ export class AntigravityClient extends EventEmitter {
     });
     this.proc.stdout.on('data', (chunk) => this._onStdout(chunk));
     this.proc.stderr.on('data', (chunk) => this._onStderr(chunk));
+    // THE EPIPE SWALLOWER, attached before anything can write: a write that
+    // races the child's death surfaces as an async 'error' on this stream,
+    // and with no listener Node turns that into an uncaughtException -- in
+    // the bridge that is the whole process dying, every session with it.
+    // Recorded instead; sendUserTurn's write callback (and its exited guard)
+    // is what maps it to a rejection the backend can act on. Covers close()'s
+    // stdin.end() landing on a child that died first, too.
+    this.proc.stdin.on('error', (err) => {
+      this._stdinError = err;
+    });
     this.proc.on('exit', (code, signal) => {
       this.exited = true;
       this.exitInfo = { code, signal };
@@ -176,10 +201,35 @@ export class AntigravityClient extends EventEmitter {
   }
 
   // One user turn object per line (FROM DOCS + VERIFIED LIVE: the drivers
-  // send exactly this shape and agy runs a turn per message).
+  // send exactly this shape and agy runs a turn per message). Returns a
+  // promise -- it NEVER throws and NEVER emits: a write to a child that is
+  // dead or dying (this.exited, an already-broken pipe, EPIPE or
+  // ERR_STREAM_DESTROYED surfacing under the write, or a write that landed
+  // in the pipe buffer of a child that exited before reading it) rejects
+  // with AGY_DELIVERY_FAILED, which the backend maps to a failed turn. The
+  // spawn-time stdin 'error' listener is what keeps the EPIPE itself from
+  // becoming an uncaught exception; this wrapper is what turns it into a
+  // rejection with a caller-facing message.
   sendUserTurn(text) {
-    if (!this.proc || this.exited) throw new Error('antigravity client is not running');
-    this.proc.stdin.write(JSON.stringify({ event: 'user', message: { content: text } }) + '\n');
+    if (!this.proc || this.exited || this._stdinError) {
+      return Promise.reject(new Error(AGY_DELIVERY_FAILED));
+    }
+    return new Promise((resolve, reject) => {
+      try {
+        this.proc.stdin.write(JSON.stringify({ event: 'user', message: { content: text } }) + '\n', (err) => {
+          // err: the kernel refused the write (EPIPE) or the stream was
+          // already destroyed. No err but exited: the write landed in the
+          // pipe buffer of a child that died before reading it (the
+          // SIGTERM-cancel race) -- the message is lost either way.
+          if (err) reject(new Error(AGY_DELIVERY_FAILED, { cause: err }));
+          else if (this.exited) reject(new Error(AGY_DELIVERY_FAILED));
+          else resolve();
+        });
+      } catch (err) {
+        // Synchronous refusal (stream already ended): same contract.
+        reject(new Error(AGY_DELIVERY_FAILED, { cause: err }));
+      }
+    });
   }
 
   // Cancel = SIGTERM the child. VERIFIED LIVE (battery (f)): mid-turn this
@@ -220,6 +270,9 @@ export class AntigravityClient extends EventEmitter {
         done();
         return;
       }
+      // The try/catch covers the synchronous face; the spawn-time stdin
+      // 'error' listener covers the async one (EOF on a child that died
+      // first). Either way the escalation timers below still run.
       try {
         this.proc.stdin.end();
       } catch {}
