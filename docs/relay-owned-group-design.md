@@ -40,6 +40,42 @@ the function names are the durable half.
 > presence in the group); the exact two menus, the typed-before-the-second-
 > tap rule, and the owner-only `/rebind`//`/close` verbs are spelled in
 > section 4.
+>
+> **As built, on `agent-cage`'s `feat/single-group`: six deliberate
+> deviations from the text above**, each a decision made while implementing
+> against a real Bot API rather than a change of plan:
+>
+> - The scheduler's two sliding windows are 18 writes/60s per group and
+>   25 writes/1s globally (section 6 named "conservative, commonly reported"
+>   figures without committing to exact numbers; these are what shipped), and
+>   a scheduled write gives up after 75s rather than queuing forever.
+> - The relay's own UI writes (pick menus, record edits, pointers, notices,
+>   `closeForumTopic`, unpin) are debited to both windows the moment they are
+>   sent — never queued, never waiting on room — so an agent's write right
+>   after one still sees an honest budget instead of a window that forgot
+>   the relay's own traffic.
+> - The pick's trigger is OWNER-GATED, not creation-gated: a topic's
+>   `forum_topic_created` service message starts the pick only when its
+>   creator is an owner; a non-owner's topic gets its menu from the owner's
+>   first message instead (the design's own "fallback for topics predating
+>   the relay" path, generalized) — a member flood mints no menus, no
+>   reapers, no live state to reap.
+> - The fleet menu lists only fleets holding at least one MINTED agent in
+>   `shared-group.json`, not every fleet record on the host: a fleet with no
+>   `/auth`'d model would render a button whose second tap could never bind
+>   anything.
+> - `/close` calls the real `closeForumTopic` FIRST and only unbinds the
+>   topic on that call's success — the reverse order from `/rebind`, whose
+>   state half (retiring the old agent) rides the SAME locked section as the
+>   binding rewrite, before any upstream call. The two verbs made opposite
+>   choices deliberately: a failed close must leave the topic exactly as
+>   bound as it was, while a rebind's move-then-notify has nothing to roll
+>   back to.
+> - "Typed before the second tap" is NOT dropped, unlike an earlier draft of
+>   this document said: it is buffered (decision D4, section 4) and replayed
+>   into the agent's queue the moment the topic binds. Section 4's own text
+>   is the corrected version; this bullet exists only so the correction does
+>   not silently vanish from history.
 
 ---
 
@@ -349,12 +385,17 @@ way the zauth steps already assert their `✅` names the right holder
 
 **Typed before the second tap.** Anything typed in the topic before the
 binding exists — before the second tap, or with no menus answered at all —
-makes the relay re-ask (one short pointer at the buttons per typed message,
-from its own identity) and is delivered to NO agent: not fanned out, and not
-buffered for replay after the pick, because a message typed before the menu
-is answered may itself BE the pick's answer ("actually use codex"), and
-replaying it as a prompt at the later-chosen agent would act on the user's
-own menu reply. The menus stay the only path to a binding.
+is delivered to NO agent while it is unbound: the relay buffers it (the
+pre-pick buffer, decision D4, below) and re-asks, at most once per topic per
+60s, with a short pointer at the buttons from its own identity. The moment
+the topic IS bound — by the pick, or a rebind — the buffer moves into the
+agent pair's delivery queue and is replayed to it in arrival order. This is
+not a contradiction of "a message typed before the menu is answered may
+itself BE the pick's answer": the menus stay the only path to a BINDING (no
+amount of typing substitutes for a tap), but once a tap does bind the topic,
+what was typed along the way is still the owner's mail, addressed to
+whichever agent ends up serving the topic — dropping it silently was worse
+than delivering a stray "actually use codex" as an ordinary first message.
 
 **Re-bind and close are owner-only verbs, and they are relay verbs.** Both
 live in the driver's closed set (`internal/relay/driver.go:139-186`), both

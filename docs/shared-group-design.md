@@ -1,5 +1,7 @@
 # One Telegram group for every fleet: the shared-group design
 
+> **SUPERSEDED by `docs/relay-owned-group-design.md`.**
+
 How one Telegram supergroup with topics replaces today's one-group-per-`<fleet, model>`
 arrangement, without taking anything away from a deployment that never asks for it.
 
