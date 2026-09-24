@@ -124,6 +124,13 @@ export class AntigravityBackend extends Backend {
     this._usage = { since: Date.now(), turns: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     this._lastQuotaError = null;
     this._reapTimer = null; // armed with the first child, disarmed in stop()
+    // Children between spawn start and init (the conversation id, and the
+    // session's registration, only EXIST at init) -- counted toward the cap
+    // so concurrent creates cannot briefly overshoot it. A session leaves
+    // the set when it registers (onInit) or when its child dies
+    // (_onChildExit); one stuck mid-init keeps its slot, which is honest --
+    // its child is live.
+    this._pending = new Set();
   }
 
   async start() {
@@ -257,14 +264,22 @@ export class AntigravityBackend extends Backend {
   // escalation's TERM/KILL stages bound the pathological case). With every
   // live child mid-turn there is nothing evictable: refuse, naming the
   // busy keys and their turn ages, so the caller can retry or
-  // session_close one.
+  // session_close one. Children still mid-init count too, and a refusal is
+  // not issued while slots are merely in flight -- concurrent creates wait
+  // for each other instead of evicting or refusing on half-born children.
   async _admitNewChild() {
     if (!this.maxProcs || this.maxProcs < 1) return;
+    const pendingDeadline = Date.now() + this.initTimeoutMs;
     for (;;) {
       const live = [...this._sessions.values()].filter((s) => this._isLive(s));
-      if (live.length < this.maxProcs) return;
+      const count = live.length + this._pending.size;
+      if (count < this.maxProcs) return;
       const idle = live.filter((s) => !s.turn);
       if (!idle.length) {
+        if (live.length < count && Date.now() < pendingDeadline) {
+          await sleep(25);
+          continue;
+        }
         const busy = live.map((s) => `${this._keyOf(s)} ${formatAge(Date.now() - (s.turnStartedAt ?? s.idleSince))}`).join(', ');
         throw new Error(`antigravity: ${live.length} sessions busy (cap ${this.maxProcs}): ${busy}; retry or session_close one`);
       }
@@ -457,6 +472,7 @@ export class AntigravityBackend extends Backend {
       env: { CAGE_AGY_BRIDGE: this.bridgeMarker },
     });
     const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null, idleSince: Date.now(), turnStartedAt: null, creatorConn: null, closeWhenIdle: null, closing: false, closePromise: null, lastExitAt: null };
+    this._pending.add(session);
     session.initPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`agy did not initialize within ${this.initTimeoutMs}ms (agyBin=${this.agyBin})`)), this.initTimeoutMs);
       const onInit = (msg) => {
@@ -473,6 +489,7 @@ export class AntigravityBackend extends Backend {
         // spawning a SECOND process for the same conversation.
         session.rawId = conversationId ?? msg.conversation_id;
         this._sessions.set(session.rawId, session);
+        this._pending.delete(session);
         this._armReaper();
         this._startWatcher(session);
         // Auto-mode sanity check (VERIFIED LIVE: skip-permissions shows up as
@@ -520,6 +537,7 @@ export class AntigravityBackend extends Backend {
     // the child's, so nothing can journal new dashboard turns while it is
     // down (a respawn starts a fresh watcher with a fresh tail cursor).
     session.watcher?.stop();
+    this._pending.delete(session); // died before init: its cap slot goes back
     session.lastExitAt = Date.now();
     session.closeWhenIdle = null; // the child is already gone; nothing left to close
     // A child exiting mid-turn (crash, OOM, SIGKILL) must end that turn with
