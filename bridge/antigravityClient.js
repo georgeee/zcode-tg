@@ -113,6 +113,15 @@ export class AntigravityClient extends EventEmitter {
 
   // The exact argv, factored out so tests (and reviewers) can pin it without
   // spawning anything. Order follows the working research drivers verbatim.
+  //
+  // SECURITY INVARIANT: never `--add-dir` (nor any other flag attaching the
+  // workspace as a project). Measured on agy 1.2.9 under strace: with the
+  // workspace attached, agy reads .agents/ (.agent/, _agents/, _agent/)
+  // mcp_config.json, hooks.json, plugins -- and execs the MCP servers listed
+  // there DIRECTLY, as this (the agent) account, bypassing the executor
+  // shim. The workspace is executor-writable, so attaching it hands the
+  // executor code execution as the account that holds the credential. With
+  // cwd = workspace and no --add-dir, agy opens nothing in cwd.
   buildArgv(conversationId) {
     // FROM DOCS: stream-json input REQUIRES stream-json output (agy refuses
     // the combination otherwise -- --input-format's help text says so).

@@ -250,3 +250,17 @@ test('ensureAgySettings: is idempotent and tolerates a corrupt file', (t) => {
   ensureAgySettings(dir);
   assert.equal(JSON.parse(readFileSync(file, 'utf8')).toolPermission, AGY_SETTINGS_DEFAULTS.toolPermission);
 });
+
+// SECURITY INVARIANT (see buildArgv): no flag may attach the executor-writable
+// workspace as an agy project -- with it, agy execs .agents/mcp_config.json's
+// servers directly as the agent account (measured, agy 1.2.9 under strace).
+test('buildArgv: never attaches the workspace (--add-dir or any dir-ish flag), on every path', () => {
+  for (const remoteControl of [true, false]) {
+    const client = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-3.8-flash', effort: 'high', remoteControl });
+    for (const id of [null, 'abc-123']) {
+      const argv = client.buildArgv(id);
+      assert.ok(!argv.some((a) => /^--(add-dir|include-directories|dir|workspace|project)\b/.test(a)), `argv attaches a directory: ${argv.join(' ')}`);
+      assert.ok(!argv.includes('/w'), `argv carries the workspace path: ${argv.join(' ')}`);
+    }
+  }
+});
