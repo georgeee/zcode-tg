@@ -186,12 +186,48 @@ export class AntigravityClient extends EventEmitter {
     }
   }
 
+  // THE BOUNDED CLOSE (the one shape every agy child teardown goes through
+  // -- GC reaps, the cap eviction, and backend stop() alike): stdin EOF
+  // first -- an idle agy exits cleanly on EOF (VERIFIED LIVE) -- then, only
+  // if the child is still alive, SIGTERM, then SIGKILL. The whole
+  // escalation is bounded: eofGraceMs waiting on the clean EOF exit, then
+  // termGraceMs waiting on TERM to land. Resolves once the child is gone
+  // (immediately if it already was); the stage timers are unref'd so they
+  // never hold the bridge process open by themselves.
+  close({ eofGraceMs = 10_000, termGraceMs = 5_000 } = {}) {
+    if (!this.proc || this.exited) return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(termTimer);
+        clearTimeout(killTimer);
+        resolve();
+      };
+      let termTimer = null;
+      let killTimer = null;
+      // OUR 'exit' emission, not the subprocess's: a spawn failure
+      // (ENOENT...) emits 'exit' here without the child ever having existed.
+      this.once('exit', done);
+      if (this.exited) {
+        done();
+        return;
+      }
+      try {
+        this.proc.stdin.end();
+      } catch {}
+      termTimer = setTimeout(() => {
+        this.kill('SIGTERM');
+        killTimer = setTimeout(() => this.kill('SIGKILL'), termGraceMs);
+      }, eofGraceMs);
+      termTimer.unref?.();
+      killTimer.unref?.();
+    });
+  }
+
+  // Fire-and-forget form of close(). The old body (EOF + a bare 5s TERM
+  // fallback) is subsumed: same opening move, plus the KILL backstop a
+  // wedged child needs.
   stop() {
-    if (!this.proc || this.exited) return;
-    try {
-      this.proc.stdin.end(); // EOF ends agy cleanly when idle (VERIFIED LIVE)
-    } catch {}
-    setTimeout(() => this.kill('SIGTERM'), 5000).unref();
+    void this.close();
   }
 
   _onStdout(chunk) {
