@@ -22,9 +22,22 @@
 // whose death would mean "this backend kind is dead", so unlike codexBackend
 // this class never re-emits 'exit' at backend level.
 
+import { createHash } from 'node:crypto';
 import { Backend, makeSessionId, rawSessionId } from '../backend.js';
 import { AntigravityClient, AGY_SETTINGS_DEFAULTS, ensureAgySettings } from '../antigravityClient.js';
 import { ConversationWatcher, conversationDbPath } from '../conversationStore.js';
+import { readProcRssBytes } from '../agyProcesses.js';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// formatAge: a turn's running time for the cap refusal -- "3m12s", or
+// "45s" inside the first minute.
+function formatAge(ms) {
+  const total_s = Math.max(0, Math.round(ms / 1000));
+  const m = Math.floor(total_s / 60);
+  const s = total_s % 60;
+  return m > 0 ? `${m}m${s}s` : `${s}s`;
+}
 
 // THE SINGLE MODEL REF, per George (2026-09-24): the antigravity family
 // exposes exactly one model; reasoning effort is a KNOB on that ref, mapped
@@ -52,7 +65,7 @@ function statusOf(result) {
 }
 
 export class AntigravityBackend extends Backend {
-  constructor({ agyBin, agyHome, cwd, effort = 'medium', autoApprovePermissions = true, remoteControl = true, initTimeoutMs = 90_000, watchStartCursor = null }) {
+  constructor({ agyBin, agyHome, cwd, effort = 'medium', autoApprovePermissions = true, remoteControl = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null }) {
     super('antigravity');
     this.agyBin = agyBin;
     this.agyHome = agyHome;
@@ -69,13 +82,48 @@ export class AntigravityBackend extends Backend {
     // where its cursor starts. null (production) = tail -- history is never
     // replayed. The tests seed a store and start mid-way through it.
     this.watchStartCursor = watchStartCursor ?? null;
+    // --- the process GC (config in index.js: AGY_IDLE_CLOSE_MIN /
+    // AGY_MAX_PROCS; the ms/grace forms here are so tests can use real
+    // short timers instead of real minutes) ---
+    // C1: a live child idle at least this long is closed; 0 disables the
+    // reaper. The clock runs from the end of the last turn (the `result`
+    // event) or from the spawn -- a session mid-turn is NEVER reaped.
+    this.idleCloseMs = idleCloseMs;
+    // C3: live agy children per bridge; a new child at the cap evicts the
+    // least-recently-used idle child or, with every child mid-turn, is
+    // refused. 0/undefined = uncapped.
+    this.maxProcs = maxProcs;
+    // C1/C4 teardown escalation stages (client.close): stdin EOF, then
+    // SIGTERM after closeEofGraceMs, then SIGKILL after closeTermGraceMs.
+    // The defaults sum to the 15s shutdown bound.
+    this.closeEofGraceMs = closeEofGraceMs;
+    this.closeTermGraceMs = closeTermGraceMs;
+    // C4: the marker every agy child carries in its environment (see
+    // reapOrphanAgyChildren). Defaults to a hash of the agy HOME so a
+    // standalone backend still marks its children; the bridge passes a hash
+    // of its state dir so two bridges on one host never sweep each other's
+    // children.
+    this.bridgeMarker = bridgeMarker ?? `agyhome-${createHash('sha256').update(String(agyHome)).digest('hex').slice(0, 16)}`;
+    // (sessionId) => MCP conversation key, for reap logs and the cap
+    // refusal -- the keys a caller can actually session_close. Null-safe:
+    // the raw prefixed session id stands in when there is no topic.
+    this.sessionKeyOf = sessionKeyOf;
     // rawId (conversation uuid) -> session state:
     //   { client, effort, turnSeq, turn: {id, toolCallIds: Map} | null,
     //     ownTurnTexts: Set (our recent stdin texts -- the watcher's
-    //     late-poll guard), watcher: ConversationWatcher | null }
+    //     late-poll guard), watcher: ConversationWatcher | null,
+    //     idleSince (GC clock: spawn or last result),
+    //     turnStartedAt, creatorConn (C2), closeWhenIdle (C2 pending),
+    //     closing/closePromise/lastExitAt (teardown bookkeeping) }
+    // A GC-closed session KEEPS its entry (client.exited marks the death;
+    // ownTurnTexts is dropped): the effort and workspaceDir on it are what
+    // the next respawn restores -- without that, a reaped session would
+    // silently fall back to the bridge-default effort even though its topic
+    // stored gemini-3.8-flash:high.
     this._sessions = new Map();
     this._usage = { since: Date.now(), turns: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     this._lastQuotaError = null;
+    this._reapTimer = null; // armed with the first child, disarmed in stop()
   }
 
   async start() {
@@ -94,11 +142,144 @@ export class AntigravityBackend extends Backend {
     return this;
   }
 
+  // C4 (shutdown): every live child through the bounded escalation (stdin
+  // EOF, SIGTERM, SIGKILL -- client.close), then wait, bounded by the
+  // escalation's own total (default 10s + 5s = 15s). The race only bounds
+  // this await -- the KILL timers fire regardless -- so a wedged child
+  // cannot hang a redeploy past its bound.
   async stop() {
-    for (const [, s] of this._sessions) {
-      s.watcher?.stop();
-      s.client.stop();
+    this._disarmReaper();
+    const jobs = [];
+    for (const session of [...this._sessions.values()]) {
+      session.watcher?.stop();
+      if (this._isLive(session)) jobs.push(this._gcClose(session, null));
+      else if (session.closePromise) jobs.push(session.closePromise);
     }
+    await Promise.race([Promise.allSettled(jobs), sleep(this.closeEofGraceMs + this.closeTermGraceMs + 1_000)]);
+  }
+
+  // --- the process GC (C1 reaper, C2 creator tie, C3 cap) ---
+  //
+  // agy's stream-json mode has no multiplexing app-server, so every session
+  // IS a process: idle ones are 93-181 MB anon RSS each, and before the GC
+  // a finished conversation's child lived until the bridge died. Everything
+  // here closes children only -- the conversation survives on disk under the
+  // agy HOME, so the next sendMessage respawn-resumes with --conversation.
+
+  _isLive(session) {
+    return session.client && !session.client.exited && !session.closing;
+  }
+
+  // The MCP-facing name of a session, for logs and errors: the conversation
+  // key the caller can session_close, or the prefixed session id when there
+  // is no topic (backend-level use).
+  _keyOf(session) {
+    const sessionId = makeSessionId('antigravity', session.rawId ?? '');
+    return this.sessionKeyOf?.(sessionId) ?? sessionId;
+  }
+
+  // One GC close: bounded teardown of the child, registry entry RETAINED
+  // (minus the heavyweight bits) with effort/workspaceDir intact for the
+  // respawn, and the reap line on the log. reason is one of 'idle', 'cap',
+  // 'creator-gone' -- or null for shutdown, which is not a reap and logs
+  // nothing (every redeploy would otherwise).
+  _gcClose(session, reason) {
+    if (session.closing || !this._isLive(session)) return session.closePromise ?? Promise.resolve();
+    session.closing = true;
+    session.closeWhenIdle = null; // the close in progress supersedes any pending one
+    session.ownTurnTexts.clear();
+    session.watcher?.stop();
+    const idleMs = Date.now() - session.idleSince;
+    if (reason) this.emit('reap', `reap key=${this._keyOf(session)} idle=${Math.floor(idleMs / 60_000)}m reason=${reason}`);
+    session.closePromise = session.client
+      .close({ eofGraceMs: this.closeEofGraceMs, termGraceMs: this.closeTermGraceMs })
+      .then(() => {
+        session.lastExitAt = Date.now();
+      });
+    return session.closePromise;
+  }
+
+  _armReaper() {
+    if (this._reapTimer || !this.idleCloseMs || this.idleCloseMs <= 0) return;
+    const tick = Math.max(25, Math.min(this.idleCloseMs / 2, 30_000));
+    this._reapTimer = setInterval(() => this._reapTick(), tick);
+    this._reapTimer.unref?.();
+  }
+
+  _disarmReaper() {
+    if (this._reapTimer) {
+      clearInterval(this._reapTimer);
+      this._reapTimer = null;
+    }
+  }
+
+  // C1: close every live child whose idle clock has run out.
+  _reapTick() {
+    const now = Date.now();
+    for (const session of this._sessions.values()) {
+      // THE MID-TURN GUARD: a session with a turn in flight is never
+      // reaped, whatever the clock says. The child is the turn's transport;
+      // closing it kills the turn (the conversation would survive, the
+      // turn's answer does not).
+      if (session.turn || !this._isLive(session)) continue;
+      if (now - session.idleSince < this.idleCloseMs) continue;
+      this._gcClose(session, 'idle');
+    }
+  }
+
+  // C2, backend half: index.js records session_create's MCP connection id
+  // here. Telegram-created sessions never get one, so creatorDisconnected
+  // never touches them.
+  noteSessionCreator(sessionId, connId) {
+    const session = this._sessions.get(rawSessionId(sessionId));
+    if (session && connId != null) session.creatorConn = connId;
+  }
+
+  // C2: the MCP connection that created sessions went away. Its idle
+  // sessions close NOW; its busy ones are marked and close the moment
+  // their turn ends (_onResult). A session another connection picks up
+  // after its turn ends just respawn-resumes later -- the conversation was
+  // never lost.
+  creatorDisconnected(connId) {
+    for (const session of this._sessions.values()) {
+      if (session.creatorConn !== connId) continue;
+      session.creatorConn = null;
+      if (!this._isLive(session) || session.closing) continue;
+      if (session.turn) session.closeWhenIdle = 'creator-gone';
+      else this._gcClose(session, 'creator-gone');
+    }
+  }
+
+  // C3, the cap: called before every new child (_spawn). At the cap, the
+  // least-recently-used IDLE child is evicted first -- and awaited to a
+  // full exit, so the cap holds at the process level, not just in this
+  // registry (an idle child exits on stdin EOF in well under a second; the
+  // escalation's TERM/KILL stages bound the pathological case). With every
+  // live child mid-turn there is nothing evictable: refuse, naming the
+  // busy keys and their turn ages, so the caller can retry or
+  // session_close one.
+  async _admitNewChild() {
+    if (!this.maxProcs || this.maxProcs < 1) return;
+    for (;;) {
+      const live = [...this._sessions.values()].filter((s) => this._isLive(s));
+      if (live.length < this.maxProcs) return;
+      const idle = live.filter((s) => !s.turn);
+      if (!idle.length) {
+        const busy = live.map((s) => `${this._keyOf(s)} ${formatAge(Date.now() - (s.turnStartedAt ?? s.idleSince))}`).join(', ');
+        throw new Error(`antigravity: ${live.length} sessions busy (cap ${this.maxProcs}): ${busy}; retry or session_close one`);
+      }
+      idle.sort((a, b) => a.idleSince - b.idleSince);
+      await this._gcClose(idle[0], 'cap');
+    }
+  }
+
+  // C6: live child count and their summed RSS (VmRSS out of
+  // /proc/<pid>/status). Unreadable entries contribute 0, not a failure.
+  procSnapshot() {
+    const live = [...this._sessions.values()].filter((s) => this._isLive(s));
+    let totalRssBytes = 0;
+    for (const session of live) totalRssBytes += readProcRssBytes(session.client.proc?.pid) ?? 0;
+    return { live: live.length, totalRssBytes };
   }
 
   // --- session lifecycle ---
@@ -109,7 +290,7 @@ export class AntigravityBackend extends Backend {
   async createConversation({ workspaceDir, model } = {}) {
     const parsed = parseAgyModelRef(model ?? AGY_MODEL_REF);
     if (!parsed) throw this._badModelRefError(model);
-    const session = this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort });
+    const session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort });
     const init = await session.initPromise;
     return { sessionId: makeSessionId('antigravity', init.conversation_id), model: AGY_MODEL_REF };
   }
@@ -121,10 +302,10 @@ export class AntigravityBackend extends Backend {
   async resumeConversation(sessionId, { workspaceDir, model } = {}) {
     const rawId = rawSessionId(sessionId);
     const existing = this._sessions.get(rawId);
-    if (existing && !existing.client.exited) return { sessionId };
+    if (existing && this._isLive(existing)) return { sessionId };
     const parsed = parseAgyModelRef(model ?? AGY_MODEL_REF);
     if (!parsed) throw this._badModelRefError(model);
-    const session = this._spawn({
+    const session = await this._spawn({
       workspaceDir: workspaceDir ?? this.cwd,
       effort: parsed.effort ?? this.effort,
       conversationId: rawId,
@@ -145,6 +326,7 @@ export class AntigravityBackend extends Backend {
     const session = await this._runningSession(sessionId);
     const turnId = `${rawSessionId(sessionId)}:${++session.turnSeq}`;
     session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0 };
+    session.turnStartedAt = Date.now();
     // The watcher's late-poll guard needs our recent stdin texts: a poll
     // landing after this turn finished would otherwise read its user row as
     // dashboard-origin (no turn in flight any more). Capped -- it is a
@@ -169,13 +351,15 @@ export class AntigravityBackend extends Backend {
   // Stop the child but keep the conversation: agy's state is the SQLite db
   // under the HOME, so closing costs nothing upstream (an idle agy process
   // is the only thing being released). A later sendMessage respawn-resumes.
+  // Same bounded escalation as the GC closes, but not a reap: no log line
+  // (the caller asked for this one), and the registry entry is RETAINED so
+  // the session's effort/workspace survive for the respawn.
   async closeConversation(sessionId) {
     const rawId = rawSessionId(sessionId);
     const session = this._sessions.get(rawId);
     if (session) {
       session.watcher?.stop();
-      session.client.stop();
-      this._sessions.delete(rawId);
+      this._gcClose(session, null);
     }
   }
 
@@ -201,11 +385,13 @@ export class AntigravityBackend extends Backend {
     if (session && session.effort === parsed.effort) return;
     const workspaceDir = session?.client.cwd ?? this.cwd;
     if (session) {
-      session.watcher?.stop();
-      session.client.stop();
+      // Marked closing before the replacement spawns so the cap's live
+      // count never sees the dying child; the entry is deleted because the
+      // respawn below re-registers with the new effort.
+      this._gcClose(session, null);
       this._sessions.delete(rawId);
     }
-    const fresh = this._spawn({ workspaceDir, effort: parsed.effort, conversationId: rawId });
+    const fresh = await this._spawn({ workspaceDir, effort: parsed.effort, conversationId: rawId });
     // Eager, so a bad resume surfaces HERE (model_set's caller) rather than
     // as a surprise on the next turn.
     await fresh.initPromise;
@@ -252,7 +438,11 @@ export class AntigravityBackend extends Backend {
   // Spawn one agy process and wire its events into the shared vocabulary.
   // The returned session's initPromise resolves with the init event (or
   // rejects on spawn failure / non-zero exit before init / timeout).
-  _spawn({ workspaceDir, effort, conversationId = null }) {
+  // Async because of the cap (C3): a new child at the cap first evicts an
+  // idle one (awaited to a full exit -- never exceed the cap at the process
+  // level) or refuses.
+  async _spawn({ workspaceDir, effort, conversationId = null }) {
+    await this._admitNewChild();
     const client = new AntigravityClient({
       agyBin: this.agyBin,
       agyHome: this.agyHome,
@@ -261,8 +451,12 @@ export class AntigravityBackend extends Backend {
       effort,
       remoteControl: this.remoteControl,
       skipPermissions: this.autoApprovePermissions,
+      // C4: the bridge marker. The orphan sweep at boot identifies OUR
+      // bridge's leftover agy children by exactly this variable -- it is
+      // the only thing that distinguishes them from any other process.
+      env: { CAGE_AGY_BRIDGE: this.bridgeMarker },
     });
-    const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null };
+    const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null, idleSince: Date.now(), turnStartedAt: null, creatorConn: null, closeWhenIdle: null, closing: false, closePromise: null, lastExitAt: null };
     session.initPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`agy did not initialize within ${this.initTimeoutMs}ms (agyBin=${this.agyBin})`)), this.initTimeoutMs);
       const onInit = (msg) => {
@@ -279,6 +473,7 @@ export class AntigravityBackend extends Backend {
         // spawning a SECOND process for the same conversation.
         session.rawId = conversationId ?? msg.conversation_id;
         this._sessions.set(session.rawId, session);
+        this._armReaper();
         this._startWatcher(session);
         // Auto-mode sanity check (VERIFIED LIVE: skip-permissions shows up as
         // init.permission_mode "always-proceed"; headless sessions without
@@ -313,8 +508,8 @@ export class AntigravityBackend extends Backend {
   async _runningSession(sessionId) {
     const rawId = rawSessionId(sessionId);
     let session = this._sessions.get(rawId);
-    if (!session || session.client.exited) {
-      session = this._spawn({ workspaceDir: session?.workspaceDir ?? this.cwd, effort: session?.effort ?? this.effort, conversationId: rawId });
+    if (!session || !this._isLive(session)) {
+      session = await this._spawn({ workspaceDir: session?.workspaceDir ?? this.cwd, effort: session?.effort ?? this.effort, conversationId: rawId });
       await session.initPromise;
     }
     return session;
@@ -325,6 +520,8 @@ export class AntigravityBackend extends Backend {
     // the child's, so nothing can journal new dashboard turns while it is
     // down (a respawn starts a fresh watcher with a fresh tail cursor).
     session.watcher?.stop();
+    session.lastExitAt = Date.now();
+    session.closeWhenIdle = null; // the child is already gone; nothing left to close
     // A child exiting mid-turn (crash, OOM, SIGKILL) must end that turn with
     // a failed terminal -- index.js's watchdog is off by default, so without
     // this the topic would sit on its placeholder forever. The normal paths
@@ -450,6 +647,9 @@ export class AntigravityBackend extends Backend {
   _onResult(session, sessionId, result) {
     const turn = session.turn;
     session.turn = null;
+    // C1: the idle clock runs from the END of the last turn -- the result
+    // event -- not from the turn's start.
+    session.idleSince = Date.now();
     // VERIFIED LIVE (battery (a)): the final envelope carries the turn-total
     // usage block: {input_tokens, output_tokens, thinking_tokens,
     // cache_read_tokens, total_tokens}.
@@ -489,6 +689,11 @@ export class AntigravityBackend extends Backend {
       tokenCount: usage.totalTokens ?? undefined,
       toolCallCount: turn.toolCallCount,
     });
+    // C2: a creator-gone close parked on this BUSY session fires here, the
+    // moment the turn ends. Synchronous on purpose: no turn can start in
+    // between (a queued message_send resolves only after this unwind), so
+    // the close cannot land on a turn that is already the next caller's.
+    if (session.closeWhenIdle && this._isLive(session)) this._gcClose(session, session.closeWhenIdle);
   }
 
   // --- local usage accounting for usage_get ---

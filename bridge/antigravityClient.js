@@ -217,9 +217,9 @@ export class AntigravityClient extends EventEmitter {
       termTimer = setTimeout(() => {
         this.kill('SIGTERM');
         killTimer = setTimeout(() => this.kill('SIGKILL'), termGraceMs);
+        killTimer.unref?.();
       }, eofGraceMs);
       termTimer.unref?.();
-      killTimer.unref?.();
     });
   }
 

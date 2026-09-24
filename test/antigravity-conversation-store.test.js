@@ -351,9 +351,10 @@ test('backend wiring: a seeded dashboard turn flows out as session/event dashboa
     watchStartCursor: -1, // test seam: re-read the seeded rows
   });
   // A registered session whose child is never spawned (the fixture store
-  // stands in for agy's journalling).
+  // stands in for agy's journalling). The fake client speaks the one
+  // teardown method the backend uses since the GC (client.close).
   const session = {
-    client: { stop() {}, exited: false },
+    client: { close() { return Promise.resolve(); }, exited: false },
     effort: 'medium',
     turnSeq: 0,
     turn: null,
@@ -362,6 +363,13 @@ test('backend wiring: a seeded dashboard turn flows out as session/event dashboa
     initPromise: null,
     ownTurnTexts: new Set(),
     watcher: null,
+    idleSince: Date.now(),
+    turnStartedAt: null,
+    creatorConn: null,
+    closeWhenIdle: null,
+    closing: false,
+    closePromise: null,
+    lastExitAt: null,
   };
   backend._sessions.set('fixture-conversation', session);
   backend._startWatcher(session);
