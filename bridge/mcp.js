@@ -47,6 +47,10 @@ export function createMcpGateway({
   // validateMcpModel enforces the same list -- schema and enforcement are
   // fed from one source so they cannot drift.
   codexMcpModels = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'],
+  // The antigravity family's refs over MCP (the bridge passes its own list,
+  // derived from parseAgyModelRef): one model plus its effort variants --
+  // effort is the only switch that backend has.
+  agyMcpModels = ['gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high'],
 }) {
   // Two listeners, one JSON-RPC core:
   // - unixSocket: a per-fleet unix domain socket speaking LINE-delimited
@@ -171,15 +175,15 @@ export function createMcpGateway({
           },
           backend: {
             type: 'string',
-            enum: ['zcode', 'codex', 'mock'],
+            enum: ['zcode', 'codex', 'antigravity', 'mock'],
             description:
-              "Which backend runs this session. Defaults to the bridge's own default backend (normally 'zcode'). 'codex' requires the bridge to have CODEX_HOME configured. 'mock' needs no configuration at all -- an in-process, zero-credential, zero-subprocess echo backend for exercising this MCP machinery without spending real API/credit usage; its reply is always a synthetic '[mock echo] <prompt>' echo, never a real model.",
+              "Which backend runs this session. Defaults to the bridge's own default backend (normally 'zcode'). 'codex' requires the bridge to have CODEX_HOME configured. 'antigravity' (Google Antigravity CLI) requires AGY_HOME; every session it starts carries --remote-control, so the same conversation is visible and drivable in the antigravity.google dashboard. 'mock' needs no configuration at all -- an in-process, zero-credential, zero-subprocess echo backend for exercising this MCP machinery without spending real API/credit usage; its reply is always a synthetic '[mock echo] <prompt>' echo, never a real model.",
           },
           model: {
             type: 'string',
-            enum: codexMcpModels,
+            enum: [...codexMcpModels, ...agyMcpModels],
             description:
-              "Codex only (ignored/rejected for zcode, which has no MCP-switchable model at all). Picks which of this bridge's configured Codex MCP models the session runs -- exactly the enum advertised here; anything else is refused. The default when omitted is the bridge's CODEX_DEFAULT_MODEL. Codex's own server-side default (gpt-6-astra, its newest and most expensive model) is deliberately NOT offered: MCP is not a channel for reaching it.",
+              "Codex only (except where noted): picks which of this bridge's configured Codex MCP models the session runs -- exactly the enum advertised here; anything else is refused. The default when omitted is the bridge's CODEX_DEFAULT_MODEL. Codex's own server-side default (gpt-6-astra, its newest and most expensive model) is deliberately NOT offered: MCP is not a channel for reaching it. For backend 'antigravity' the enum's gemini-3.8-flash entries apply instead: the bare ref keeps the bridge's AGY_EFFORT default (medium), the :low/:medium/:high suffixes pick reasoning effort -- that backend has exactly one model and effort is its only switch.",
           },
         },
         required: ['name'],
@@ -235,7 +239,7 @@ export function createMcpGateway({
     {
       name: 'model_get',
       description:
-        "Return the backend and model a session runs, and whether model_set can change it (true for codex, always false for zcode and mock -- both are single-model/no-switching backends, for different reasons: zcode's own MCP contract never offered a switch, mock has only ever had the one synthetic model). The backend itself is still only chosen at session_create time. Omit `key` to get the bridge's own defaults instead of a specific session's.",
+        "Return the backend and model a session runs, and whether model_set can change it (true for codex -- three tiers -- and antigravity -- one model, effort-switchable; always false for zcode and mock, both single-model/no-switching backends, for different reasons: zcode's own MCP contract never offered a switch, mock has only ever had the one synthetic model). The backend itself is still only chosen at session_create time. Omit `key` to get the bridge's own defaults instead of a specific session's.",
       inputSchema: {
         type: 'object',
         properties: { key: { type: 'string', description: 'Conversation key from session_create. Omit for the bridge-wide default backend/model.' } },
@@ -244,18 +248,18 @@ export function createMcpGateway({
     {
       name: 'usage_get',
       description:
-        'Return THIS BRIDGE\'s own backend quota — READ-ONLY, as { level, windows: [{window, used, cap, remaining, percentage, resetsAt}], cachedAt, stale? }. On a zcode-default bridge that is the account\'s Z.ai coding-plan usage (absolute credits per window: used, cap, remaining all populated). On a codex-default bridge it is the codex account\'s plan rate limits (plan name plus primary/secondary windows); codex reports only a used percentage and a reset time, so there used/cap/remaining are null rather than invented — treat them as "percentage of quota used", not as missing data. Lets a supervisor model track spend across the sessions it delegates without going through Telegram\'s /usage command. An explicit ask refreshes the shared cache once it is older than ~30 seconds (codex: every ask — its RPC is local), so two asks a minute apart show movement; the status line separately keeps a 5-minute cache. When a refresh fails but a cached figure exists, the cached figure is returned WITH stale: {ageMs, reason} — check it and treat the numbers as aged; with nothing cached the call is an error.',
+        'Return THIS BRIDGE\'s own backend quota — READ-ONLY, as { level, windows: [{window, used, cap, remaining, percentage, resetsAt}], cachedAt, stale? }. On a zcode-default bridge that is the account\'s Z.ai coding-plan usage (absolute credits per window: used, cap, remaining all populated). On a codex-default bridge it is the codex account\'s plan rate limits (plan name plus primary/secondary windows); codex reports only a used percentage and a reset time, so there used/cap/remaining are null rather than invented — treat them as "percentage of quota used", not as missing data. On an antigravity-default bridge there is NO remaining-quota number at all headless (agy\'s /usage is TUI-only): the answer is local token accounting — one window whose used is total tokens summed from every turn envelope since bridge start (cap/remaining/percentage all null, never invented), plus a quotaError field when a RESOURCE_EXHAUSTED-family error has been seen. Lets a supervisor model track spend across the sessions it delegates without going through Telegram\'s /usage command. An explicit ask refreshes the shared cache once it is older than ~30 seconds (codex: every ask — its RPC is local; antigravity: local arithmetic, always current), so two asks a minute apart show movement; the status line separately keeps a 5-minute cache. When a refresh fails but a cached figure exists, the cached figure is returned WITH stale: {ageMs, reason} — check it and treat the numbers as aged; with nothing cached the call is an error.',
       inputSchema: { type: 'object', properties: {} },
     },
     {
       name: 'model_set',
       description:
-        "Switch a session's model. Codex only, and only among this bridge's configured Codex MCP models -- the same list session_create's model argument offers (exactly the enum advertised here). zcode and mock sessions, and anything outside the list, all refuse with a clear error, not a silent no-op.",
+        "Switch a session's model. Codex accepts only this bridge's configured Codex MCP models -- the same list session_create's model argument offers (exactly the enum advertised here). Antigravity accepts its one model or an effort variant (gemini-3.8-flash:low|medium|high) -- effort applies from the session's next turn (it is a spawn-time flag; the session resumes with the new effort). zcode and mock sessions, and anything outside the list, all refuse with a clear error, not a silent no-op.",
       inputSchema: {
         type: 'object',
         properties: {
           key: { type: 'string', description: 'Conversation key from session_create.' },
-          model: { type: 'string', enum: codexMcpModels },
+          model: { type: 'string', enum: [...codexMcpModels, ...agyMcpModels] },
         },
         required: ['key', 'model'],
       },

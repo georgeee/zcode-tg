@@ -2,7 +2,8 @@
 
 A Telegram bridge for coding agents: one Telegram forum topic == one agent
 session. Started as zcode-only (Z.ai's GLM coding agent); now runs zcode,
-Codex (OpenAI's CLI, signed in with a ChatGPT plan), or Mock (a zero-
+Codex (OpenAI's CLI, signed in with a ChatGPT plan), Antigravity (Google's
+`agy` CLI on an AI Pro plan, MCP-only by design), or Mock (a zero-
 credential, zero-subprocess echo backend for testing) per topic, behind a
 shared backend abstraction (`bridge/backend.js`). Read `README.md` first —
 architecture, setup, safety model, the MCP gateway section (including "The
@@ -47,6 +48,26 @@ regardless of which one a topic runs on.
   `/backend`/`/model` Telegram commands) can be exercised for real with zero
   credentials, zero external processes, and zero API cost — see README's
   "The mock backend".
+- `bridge/backends/antigravityBackend.js` + `bridge/antigravityClient.js`:
+  Google's Antigravity CLI (`agy`) in headless **stream-json** mode — NDJSON
+  over stdio, but NOT multiplexing: **one `agy` process per conversation**
+  (the backend is a registry of children, not one long-lived subprocess),
+  user turns on stdin, `init`/`step_update`/`result` events on stdout,
+  resume = respawn with `--conversation`, cancel = SIGTERM (the conversation
+  survives). Every session starts with `--remote-control` (owner decision
+  2026-09-24: the same conversation is visible/drivable in the
+  antigravity.google dashboard — agy's own session-scoped feature, dies with
+  the process, NOT the Claude `remote-control --session-id` capacity trap
+  the workspace AGENTS.md warns about) and `--dangerously-skip-permissions`
+  (auto mode; settings seeded `always-proceed`). Protocol facts carry
+  evidence tiers like codex's (VERIFIED LIVE against agy 1.2.9 / FROM DOCS /
+  INFERRED) — agy is unfree and closed, so the transcripts and drivers under
+  the research workspace are the source of record; `test/fixtures/fake-agy.mjs`
+  pins the protocol for tests. `HOME` (not a bespoke env var) is the
+  credential relocation: the OAuth token lives under
+  `$AGY_HOME/.gemini/antigravity-cli/`. This is also the one backend that
+  works MCP-only: no `TELEGRAM_*` needed when an MCP listener is configured
+  (a stub Telegram stands in; the getUpdates loop never starts).
 
 ## THE EAGER/LAZY BACKEND SPLIT IS BY `cfg.defaultBackend`, NOT BY NAME
 
@@ -127,10 +148,23 @@ including Astra) unless the deployment sets `CODEX_DISALLOW_ASTRA`. **Mock
 sits with zcode**: exactly one model (`mock-1`), `model_set` refused
 outright — not zcode's policy reused by default, but the same conclusion
 for a different reason (a single-model backend has nothing to switch to or
-from; see `mockBackend.js`'s "Model-switching policy" comment). If you add
-a FOURTH backend, decide its MCP model policy deliberately and write down
-why here and in `README.md`'s MCP section — don't default it to "whatever
-the nearest existing backend does" without thinking about it.
+from; see `mockBackend.js`'s "Model-switching policy" comment).
+
+**Antigravity is the FOURTH backend, and its policy is its own deliberate
+shape (2026-09-24, owner decision):** exactly ONE model
+(`gemini-3.8-flash` — the family's entitlement is bigger, but the owner
+pinned the bridge to this one ref), and the ONLY switch is reasoning
+effort. MCP callers express it as an effort-suffixed ref —
+`gemini-3.8-flash:low|medium|high` — accepted by both `session_create`'s
+`model` argument and `model_set` (`model_get` reports `switchable: true`);
+the bare ref keeps the session's current effort; anything else is refused
+with a clear error. Effort is a spawn-time flag on `agy`, so a switch stops
+the session's process and the next turn resumes the SAME conversation with
+the new `--effort` — that is why the suffix form exists rather than a
+second model ref, and why the backend never passes agy an effort-suffixed
+SLUG (agy hard-errors on slug-suffix + `--effort` together, verified live).
+Telegram's `/model` lists only the bare ref — a human gets the effort
+default (`AGY_EFFORT`, medium) and the MCP allowlist does the rest.
 
 ## The workspace is (or mirrors) the agent's own working directory
 

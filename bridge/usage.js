@@ -145,12 +145,19 @@ export function renderUsage(snapshot, { label = 'Z.ai usage', now = Date.now() }
   const head = `📊 <b>${label}</b>${snapshot.level ? ` · plan <i>${esc(snapshot.level)}</i>` : ''}`;
   const blocks = (Array.isArray(snapshot.windows) ? snapshot.windows : []).map((w) => {
     const pct = Number.isFinite(w.percentage) ? Math.round(w.percentage) : 0;
-    // Absolute credits are a z.ai capability, not a default: printed only
-    // when BOTH endpoints are real numbers, so a codex window (used/cap
-    // null) falls to the percentage alone rather than to invented zeros.
+    // Three window shapes, in priority order (a window matches exactly one):
+    // absolute credits are a z.ai capability (used+cap both real numbers);
+    // a percentage-led window is codex's (used/cap null -- "the nulls are
+    // the interface"); and a LOCAL COUNT window (antigravity, 2026-09-24)
+    // has only a used figure with no upstream quota number behind it -- it
+    // renders as a plain token count, never as a fabricated "0% used".
     const measure = Number.isFinite(w.used) && Number.isFinite(w.cap)
       ? `${grouped(w.used)} / ${grouped(w.cap)} cr (${pct}%)`
-      : `${pct}% used`;
+      : Number.isFinite(w.percentage)
+        ? `${pct}% used`
+        : Number.isFinite(w.used)
+          ? `${grouped(w.used)} tok (local count)`
+          : 'no data';
     const remaining = Number.isFinite(w.remaining) ? `${grouped(w.remaining)} cr left · ` : '';
     const resetsAtMs = typeof w.resetsAt === 'number' ? w.resetsAt : Date.parse(w.resetsAt);
     const reset = Number.isFinite(resetsAtMs)

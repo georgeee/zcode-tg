@@ -449,6 +449,91 @@ value can no longer break the default (the 2026-09-10 cage-pod failure:
 not a forum"). With nothing eligible the tool fails with a line per rejected
 candidate saying why; an explicit `chat_id` always wins.
 
+### The antigravity backend: Google's Antigravity CLI (`agy`), MCP-only by design
+
+The fourth backend runs **Google's Antigravity CLI** (`agy`, the gemini-cli
+successor on a Google AI Pro subscription) in its headless **stream-json**
+mode, exactly one model — `gemini-3.8-flash`, per owner decision (2026-09-24)
+— with reasoning effort as the only knob (`--effort low|medium|high`, default
+`medium`). Where codex multiplexes every thread over one `codex app-server`
+process, agy's protocol has no multiplexing: this backend keeps **one `agy`
+process per conversation**, writing user turns to its stdin and reading
+`init` / `step_update` / `result` NDJSON events from its stdout. Resume is a
+respawn with `--conversation <id>` (conversations persist as SQLite under
+the agy HOME, so history survives both process and bridge restarts); cancel
+is SIGTERM (agy answers with a structured interrupted result, and the
+conversation survives).
+
+Two properties are deliberate and owner-mandated:
+
+- **Auto mode, twice over.** Every session spawns with
+  `--dangerously-skip-permissions` AND the account settings get
+  `toolPermission: "always-proceed"` (plus telemetry/tips/survey off,
+  terminal color scheme — seeded as a MERGE into
+  `$AGY_HOME/.gemini/antigravity-cli/settings.json` on first start, never
+  clobbering agy's own keys). The real safety boundary is not agy's
+  permission prompts but the same executor-shim arrangement the other
+  backends sit behind. There is no approval relay on this surface: with
+  `AUTO_APPROVE_PERMISSIONS=false` the flag is withheld, but the backend is
+  not otherwise usable that way yet (a mid-turn prompt would just stall the
+  turn inside agy).
+- **`--remote-control` on every session.** Each session registers itself
+  with the antigravity.google Remote Control dashboard, so the same
+  conversation is visible and drivable from the owner's phone. This is
+  agy's own session-scoped feature — the tunnel lives and dies with the
+  session process, no OS service is installed, and it has nothing to do
+  with the Claude `remote-control --session-id` capacity trap described in
+  the workspace AGENTS.md.
+
+**Telegram is not needed.** A deployment can run this backend MCP-only: set
+`MCP_UNIX_SOCKET` (or `MCP_HTTP_PORT`) and the antigravity config below but
+no `TELEGRAM_*` at all, and the bridge boots with a stub Telegram client —
+`session_create` / `message_send` / `replies_get` / `usage_get` /
+`model_get` / `model_set` all work; every Telegram call is a no-op. A
+missing bot token WITHOUT any MCP listener still refuses to boot with the
+usual config-file pointer. The Telegram path is unchanged when configured.
+
+**Model policy over MCP** (written up with the others in CLAUDE.md):
+`model_get` reports `switchable: true`, and `model_set` / `session_create`'s
+`model` argument accept the bare ref (keeps the current effort) or an
+effort variant — `gemini-3.8-flash:low|medium|high`. Effort is a spawn-time
+flag, so a switch stops the session's process and the next turn resumes the
+SAME conversation with the new `--effort`; anything else is refused with a
+clear error, never silently ignored. `listModels()` offers exactly the one
+ref.
+
+**`usage_get` on an antigravity-default bridge is local accounting only.**
+There is no remaining-quota number headless (agy's `/usage` with its
+progress bars is TUI-only): the answer is the token total summed from every
+turn envelope since bridge start (plus input/output split and turn count),
+and a `quotaError` field when a RESOURCE_EXHAUSTED-family error has been
+seen. The window carries `cap`/`remaining`/`percentage` as null — never an
+invented figure.
+
+Configuration (off unless `AGY_HOME` is set, same lazily-started pattern as
+codex):
+
+- `AGY_HOME` — the agy credential HOME (the `CODEX_HOME` analogue): holds
+  `.gemini/antigravity-cli/antigravity-oauth-token` (0600, the Linux
+  keyring-fallback file). One login per bridge model account, done out of
+  band with `agy`'s paste-code flow; never a path under the workspace, and
+  never anything the executor account can read. Required — the backend
+  refuses to construct without it.
+- `AGY_BIN` — the `agy` binary (default `agy` on PATH; the nixpkgs package
+  is `antigravity-cli`, unfree). Note `agy install` (shell-profile
+  mutation) and `agy update` (self-update outside nix) must never be run.
+- `AGY_EFFORT` — the default effort for new sessions: `low`, `medium`
+  (default) or `high`.
+
+Known scope limits (intentional): no per-tool hard kill (`/stop` SIGTERMs
+the session process; agy auto-backgrounds long shell commands internally
+and they are not addressable from the stream); the model's `ask_question`
+tool has no Telegram relay on this surface and blocks the turn inside agy
+until its own timeout; first runs are slow (5–15 s cold skill unpack per
+HOME); and the nix-built binary is unfree and closed-source — protocol
+drift shows up as a broken backend, which is what the fake-`agy` test
+fixture pins.
+
 ## Commands & turn lifecycle from Telegram
 
 The bridge intercepts its own commands before anything reaches the model

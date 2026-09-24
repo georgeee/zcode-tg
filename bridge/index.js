@@ -61,6 +61,7 @@ import { loadEnv, resolveEnvPath } from './env.js';
 import { existsSync } from 'node:fs';
 import { ZcodeBackend } from './backends/zcodeBackend.js';
 import { CodexBackend } from './backends/codexBackend.js';
+import { AntigravityBackend, AGY_MODEL_REF, parseAgyModelRef } from './backends/antigravityBackend.js';
 import { MockBackend, MOCK_MODEL_REF } from './backends/mockBackend.js';
 import { makeSessionId, backendNameOf, rawSessionId } from './backend.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
@@ -81,9 +82,24 @@ import { mergeModelLists, resolveModelRef } from './modelref.js';
 loadEnv(resolveEnvPath({ override: process.env.ZCODE_TG_ENV || process.env.ZCODE_MOBILE_ENV }));
 
 const cfg = {
-  telegramToken: need('TELEGRAM_BOT_TOKEN'),
-  chatId: Number(need('TELEGRAM_CHAT_ID')),
-  allowedUserId: Number(need('TELEGRAM_ALLOWED_USER_ID')),
+  // MCP-ONLY MODE (2026-09-24, with the antigravity backend). A deployment
+  // that configures an MCP listener (MCP_UNIX_SOCKET / MCP_HTTP_PORT) but no
+  // Telegram bot runs the whole bridge with a stub Telegram client: MCP
+  // session_create/message_send/replies_get/usage_get work unchanged, every
+  // Telegram call becomes a benign no-op, and the getUpdates loop never
+  // starts. This exists for the antigravity backend, whose owner-facing
+  // surfaces are the antigravity.google dashboard (via --remote-control) and
+  // MCP -- not a Telegram group. A missing bot token WITHOUT any MCP
+  // listener keeps the old hard failure with the config-file pointer (the
+  // guarded need() call just below the cfg block).
+  mcpOnly: !process.env.TELEGRAM_BOT_TOKEN && !!(process.env.MCP_UNIX_SOCKET?.trim() || process.env.MCP_HTTP_PORT?.trim()),
+  telegramToken: process.env.TELEGRAM_BOT_TOKEN || '',
+  // In MCP-only mode these two have nothing real to point at: chatId gets a
+  // syntactically-valid sentinel supergroup id (topics created against the
+  // stub Telegram are as synthetic as the chat), allowedUserId 0 trusts
+  // nobody -- which cannot matter, since no Telegram update is ever read.
+  chatId: Number(process.env.TELEGRAM_CHAT_ID) || -100,
+  allowedUserId: Number(process.env.TELEGRAM_ALLOWED_USER_ID) || 0,
   nodeBin: process.env.ZCODE_NODE_BIN || process.execPath,
   zcodeBin: need('ZCODE_BIN'),
   workspaceDir: need('ZCODE_WORKSPACE_DIR'),
@@ -113,6 +129,17 @@ const cfg = {
   // like via Telegram, same as always. Codex-specific: zcode has no
   // per-model cost tier this drastic to guard against.
   codexDisallowAstra: /^(1|true|yes)$/i.test(process.env.CODEX_DISALLOW_ASTRA || ''),
+  // The antigravity backend (Google Antigravity CLI, `agy`): opt-in and
+  // lazily started exactly like codex -- a deployment that never sets
+  // AGY_HOME pays nothing for it. agyBin may be a bare 'agy' on PATH or the
+  // nix store path; agyHome is the credential HOME (the CODEX_HOME analogue:
+  // it holds .gemini/antigravity-cli/antigravity-oauth-token, 0600, one
+  // login per bridge model account -- never a path under the workspace);
+  // agyEffort is the reasoning-effort default for new sessions
+  // (low|medium|high, per George's single-model decision 2026-09-24).
+  agyBin: process.env.AGY_BIN || 'agy',
+  agyHome: process.env.AGY_HOME || '',
+  agyEffort: process.env.AGY_EFFORT || 'medium',
   // Which backend a brand-new topic/session runs on absent an explicit
   // choice (a stored per-topic 'backend', or an MCP session_create
   // 'backend' argument). Left at 'zcode' so the live deployment's behavior
@@ -222,7 +249,7 @@ const BOT_COMMANDS = [
   { command: 'clearqueue', description: 'Drop queued messages in this topic' },
   { command: 'model', description: 'List / switch this topic’s model' },
   { command: 'mode', description: 'List / switch this topic’s mode' },
-  { command: 'backend', description: 'List / switch this topic’s backend (zcode/codex/mock)' },
+  { command: 'backend', description: 'List / switch this topic’s backend (zcode/codex/antigravity/mock)' },
   { command: 'file', description: 'Send a workspace file into this topic' },
   { command: 'help', description: 'Bridge commands' },
 ];
@@ -252,8 +279,45 @@ function need(key) {
   return v;
 }
 
+// A deployment with no Telegram bot AND no MCP listener has nothing to
+// serve: keep the old hard failure (with the config-file pointer) rather
+// than boot a bridge that answers to no one. Every other no-token shape is
+// MCP-only mode, handled by the stub below.
+if (!process.env.TELEGRAM_BOT_TOKEN && !cfg.mcpOnly) need('TELEGRAM_BOT_TOKEN');
+
+// THE MCP-ONLY TELEGRAM STAND-IN. Same method surface as TelegramClient
+// (everything index.js calls), returning benign shapes instead of touching
+// the network: getChat claims a forum so session_create's default-target
+// pick succeeds, createForumTopic hands out synthetic thread ids, sends
+// return synthetic message ids. One quiet log line at construction -- the
+// stub itself stays silent, mirrors and replies are deliberately no-ops.
+function makeNullTelegram() {
+  let nextMessageId = 1;
+  let nextThreadId = 9000;
+  console.log('[bridge] MCP-only mode: no TELEGRAM_BOT_TOKEN -- Telegram calls are no-ops, MCP serves everything');
+  const forumChat = (chatId) => ({ id: Number(chatId), type: 'supergroup', is_forum: true, title: 'mcp-only' });
+  return {
+    getUpdates: async () => [],
+    sendMessage: async () => ({ message_id: nextMessageId++ }),
+    editMessageText: async () => ({ message_id: nextMessageId++ }),
+    createForumTopic: async (p) => ({ message_thread_id: nextThreadId++, chat_id: p.chatId, name: p.name }),
+    closeForumTopic: async () => ({}),
+    getMe: async () => ({ id: 0, is_bot: true, username: 'mcp-only' }),
+    getChat: async ({ chatId }) => forumChat(chatId),
+    getChatMember: async () => ({ status: 'administrator' }),
+    leaveChat: async () => ({}),
+    pinChatMessage: async () => ({}),
+    deleteMessage: async () => ({}),
+    setMyCommands: async () => ({}),
+    sendDocument: async () => ({ message_id: nextMessageId++ }),
+    getFile: async () => ({ file_path: '' }),
+    downloadFile: async () => Buffer.alloc(0),
+    answerCallbackQuery: async () => ({}),
+  };
+}
+
 const store = new Store(cfg.storePath);
-const tg = new TelegramClient({ token: cfg.telegramToken });
+const tg = cfg.mcpOnly ? makeNullTelegram() : new TelegramClient({ token: cfg.telegramToken });
 
 // --- backend registry ---
 // One long-lived instance per backend KIND (not per session/topic) --
@@ -323,6 +387,10 @@ const BACKEND_FACTORIES = {
     if (!cfg.codexHome) throw new Error("the 'codex' backend needs CODEX_HOME set (see README)");
     return new CodexBackend({ codexBin: cfg.codexBin, codexHome: cfg.codexHome, cwd: cfg.workspaceDir, autoApprovePermissions: cfg.autoApprovePermissions });
   },
+  antigravity: () => {
+    if (!cfg.agyHome) throw new Error("the 'antigravity' backend needs AGY_HOME set (see README)");
+    return new AntigravityBackend({ agyBin: cfg.agyBin, agyHome: cfg.agyHome, cwd: cfg.workspaceDir, effort: cfg.agyEffort, autoApprovePermissions: cfg.autoApprovePermissions });
+  },
   // No config to check -- that's the whole point (see mockBackend.js's
   // module comment). Eligible as DEFAULT_BACKEND=mock too, for a deployment
   // that wants zero external dependencies at all (e.g. this bridge's own
@@ -359,6 +427,7 @@ for (const name of modelBackends) {
 function defaultModelFor(backendName) {
   if (backendName === 'codex') return cfg.codexDefaultModel || undefined;
   if (backendName === 'mock') return MOCK_MODEL_REF;
+  if (backendName === 'antigravity') return AGY_MODEL_REF; // the one model; effort comes from AGY_EFFORT
   return cfg.defaultModel;
 }
 
@@ -1548,6 +1617,42 @@ async function codexUsageGetForMcp() {
   return snap;
 }
 
+// --- the antigravity side of usage_get ---
+//
+// NO REMAINING-QUOTA NUMBER EXISTS HEADLESS (verified live, battery (e) of
+// the antigravity research pass): agy's /usage with its progress bars is
+// TUI-only, and quota state is refreshed server-side without a numeric
+// surface. So the antigravity answer is LOCAL ACCOUNTING -- the sum of the
+// usage block every result envelope carries (turn totals, measured exact)
+// since this backend was constructed -- plus the last quota
+// (RESOURCE_EXHAUSTED-family) error if one has been seen. Deliberately NOT
+// mapped onto the windows shape's used/cap/remaining percentages: a
+// percentage here would be invented, and usage_get's whole contract is that
+// a number reads as a measurement. The renderer shows the token count as a
+// plain local figure and the tool description says what is missing.
+function antigravityUsageGetForMcp() {
+  const u = getBackend('antigravity').usageSnapshot();
+  const snap = {
+    level: 'google-ai-pro (local accounting; no headless quota number exists)',
+    windows: [
+      {
+        window: 'Tokens since bridge start (local count)',
+        used: u.totalTokens,
+        cap: null,
+        remaining: null,
+        percentage: null,
+        resetsAt: null,
+        inputTokens: u.inputTokens,
+        outputTokens: u.outputTokens,
+        turns: u.turns,
+      },
+    ],
+    cachedAt: new Date().toISOString(),
+  };
+  if (u.lastQuotaError) snap.quotaError = u.lastQuotaError;
+  return snap;
+}
+
 // usageGetForMcp is the usage_get tool's handler.
 //
 // ROUTING, owner decision 2026-09-22: it reports the quota of THIS BRIDGE's
@@ -1571,6 +1676,7 @@ async function codexUsageGetForMcp() {
 // made, is a real answer rather than a degradation.
 async function usageGetForMcp() {
   if (cfg.defaultBackend === 'codex') return codexUsageGetForMcp();
+  if (cfg.defaultBackend === 'antigravity') return antigravityUsageGetForMcp();
   if (cfg.defaultBackend !== 'zcode') {
     throw new Error(
       `usage_get reports this bridge's own backend's quota, and the default backend here is '${cfg.defaultBackend}', ` +
@@ -1902,6 +2008,12 @@ const codexMcpModelsFromEnv = (process.env.CODEX_MCP_MODELS || '')
   .filter(Boolean);
 const CODEX_MCP_MODELS = codexMcpModelsFromEnv.length ? codexMcpModelsFromEnv : ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'];
 
+// The antigravity MCP refs, derived from the backend's own constant so the
+// schema, validateMcpModel, and parseAgyModelRef cannot drift apart. No env
+// knob: there is exactly one model per George's decision, and the effort
+// suffixes are the whole surface.
+const AGY_MCP_MODELS = [AGY_MODEL_REF, `${AGY_MODEL_REF}:low`, `${AGY_MODEL_REF}:medium`, `${AGY_MODEL_REF}:high`];
+
 // validateMcpModel enforces the MCP model policy for both session_create and
 // model_set, in one place, so the two can't drift: zcode and mock both
 // refuse a model argument outright (zcode's own MCP contract has never
@@ -1909,8 +2021,24 @@ const CODEX_MCP_MODELS = codexMcpModelsFromEnv.length ? codexMcpModelsFromEnv : 
 // see mockBackend.js's "Model-switching policy" comment), Codex accepts
 // only CODEX_MCP_MODELS, omitted means "use the backend's own default"
 // (Terra, for Codex -- see cfg.codexDefaultModel).
+//
+// ANTIGRAVITY (fourth backend, policy decided 2026-09-24 per George's
+// single-model decision, written up in CLAUDE.md's "Model policy" section):
+// exactly one model (gemini-3.8-flash) whose reasoning effort is the only
+// switch. MCP callers express it as an effort-suffixed ref --
+// gemini-3.8-flash:low|medium|high (default medium via AGY_EFFORT) -- or the
+// bare ref, which keeps the session's current effort. This is the form
+// parseAgyModelRef accepts; the backend maps it to agy's `--effort` flag at
+// spawn/resume time (never an effort-suffixed slug: agy hard-errors on that
+// combination). Anything else is refused with a clear error, never ignored.
 function validateMcpModel(backend, model) {
   if (model == null) return undefined;
+  if (backend === 'antigravity') {
+    if (!parseAgyModelRef(model)) {
+      throw new Error(`model "${model}" is not offered for the antigravity backend; choose ${AGY_MODEL_REF} or an effort variant (${AGY_MODEL_REF}:low, ${AGY_MODEL_REF}:medium, ${AGY_MODEL_REF}:high)`);
+    }
+    return model;
+  }
   if (backend !== 'codex') {
     throw new Error(`model may only be chosen for the codex backend over MCP (got backend=${backend}); ${backend} has no MCP-switchable model`);
   }
@@ -2129,7 +2257,7 @@ async function handleUsageCommand(threadId) {
   // be (which read the z.ai key unconditionally and crashed a codex-default
   // bridge with ENOENT on its isolated $HOME; reported 2026-09-22). Failure
   // sentences are usage_get's, byte for byte -- one wording, both surfaces.
-  const label = cfg.defaultBackend === 'codex' ? 'codex usage' : 'Z.ai usage';
+  const label = cfg.defaultBackend === 'codex' ? 'codex usage' : cfg.defaultBackend === 'antigravity' ? 'antigravity usage (local token count)' : 'Z.ai usage';
   const text = await usageTelegramText(usageGetForMcp, { label });
   await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text, parseMode: 'HTML' }).catch((e) => console.error('[bridge] failed to post usage:', e.message));
 }
@@ -2143,7 +2271,7 @@ function helpText() {
     '/clearqueue — drop queued messages',
     '/model [name] — list / switch this topic’s model',
     '/mode [name] — list / switch this topic’s mode',
-    '/backend [name] — list / switch this topic’s backend (zcode/codex/mock)',
+    '/backend [name] — list / switch this topic’s backend (zcode/codex/antigravity/mock)',
     '/file <path> — send a workspace file here',
     '',
     'Anything else is sent to the model. Replies stream into the ⌛ placeholder message. Messages sent while a turn is running are queued and run in order; reply to any message to quote it to the model. Send a file as a document and the agent reads it (saved to inbox/, your caption = instruction).',
@@ -2835,6 +2963,7 @@ async function main() {
       unixSocket: cfg.mcpUnixSocket,
       host: process.env.MCP_BIND || '127.0.0.1',
       codexMcpModels: CODEX_MCP_MODELS, // the schemas advertise exactly what validateMcpModel enforces
+      agyMcpModels: AGY_MCP_MODELS, // ditto for the antigravity family
       log: (m) => console.log(`[bridge] ${m}`),
     });
     mcp.wire({
@@ -2946,7 +3075,9 @@ async function main() {
         if (key && !entry) throw new Error(`unknown session: ${key}`);
         const backend = entry?.backend || cfg.defaultBackend;
         const model = entry?.model || defaultModelFor(backend);
-        return { backend, model, switchable: backend === 'codex' };
+        // switchable: codex (three tiers) and antigravity (one model, the
+        // effort knob) both accept model_set; zcode and mock refuse it.
+        return { backend, model, switchable: backend === 'codex' || backend === 'antigravity' };
       },
       // Mirrors the Telegram /model command's own switch path (store the new
       // model, invalidate any per-workspace cache, push it to the live
@@ -3013,6 +3144,13 @@ async function main() {
   }
 
   let offset = store.getOffset();
+  // MCP-only mode never polls: there is no bot token to poll with, and the
+  // stub getUpdates would just return [] forever. The MCP listener(s) keep
+  // the process alive; main() returning here is the normal end state.
+  if (cfg.mcpOnly) {
+    console.log('[bridge] MCP-only mode: serving MCP exclusively (no Telegram polling)');
+    return;
+  }
   for (;;) {
     let updates;
     try {

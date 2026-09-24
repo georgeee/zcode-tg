@@ -52,6 +52,7 @@ const REPO = path.dirname(path.dirname(new URL(import.meta.url).pathname));
 const FIXTURES = path.join(REPO, 'test', 'fixtures');
 const ZCODE_FIXTURE = path.join(FIXTURES, 'fake-zcode-app-server.mjs');
 const CODEX_FIXTURE = path.join(FIXTURES, 'fake-codex-app-server.mjs');
+const AGY_FIXTURE = path.join(FIXTURES, 'fake-agy.mjs');
 const TMP = '/tmp/zbridge-e2e-backend-lifecycle';
 rmSync(TMP, { recursive: true, force: true });
 mkdirSync(TMP, { recursive: true });
@@ -368,8 +369,11 @@ async function scenario4() {
     check('the bridge process is still alive with DEFAULT_BACKEND=mock', b.proc.exitCode === null, `exitCode=${b.proc.exitCode}\n${b.log.slice(-2000)}`);
     await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, 'mcp unix socket bind');
     check('the MCP unix socket file exists', existsSync(sock), b.log.slice(-2000));
+    // Eight tools: session_create, session_close, message_send, replies_get,
+    // progress_get, model_get, usage_get, model_set (this count had drifted --
+    // the e2e still said "seven" after progress_get joined the list).
     const lines = await unixJsonRpc(sock, [{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }]);
-    check('tools/list over the unix socket advertises seven tools', lines[0]?.result?.tools?.length === 7, JSON.stringify(lines[0]).slice(0, 300));
+    check('tools/list over the unix socket advertises the eight tools', lines[0]?.result?.tools?.length === 8, JSON.stringify(lines[0]).slice(0, 300));
     check('zcode was NEVER spawned for a mock-default bridge (no start-marker)', !existsSync(zcodeMarker), b.log.slice(-2000));
   } finally {
     b.proc.kill('SIGKILL');
@@ -607,6 +611,8 @@ async function scenario8() {
       ZCODE_WORKSPACE_DIR: TMP,
       CODEX_HOME: TMP,
       CODEX_BIN: CODEX_FIXTURE,
+      AGY_BIN: AGY_FIXTURE, // antigravity is in the default /model span -- it must construct cleanly
+      AGY_HOME: path.join(TMP, 's8-agy-home'),
       FIXTURE_ZCODE_MARKER: zcodeMarker,
       FIXTURE_ZCODE_LOG: zcodeLog,
       FIXTURE_CODEX_LOG: codexLog,
@@ -753,13 +759,13 @@ async function scenario9() {
     const sc = tools.find((t) => t.name === 'session_create');
     const ms = tools.find((t) => t.name === 'model_set');
     check(
-      'tools/list: session_create\u2019s model enum is exactly the configured list',
-      JSON.stringify(sc?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra']),
+      'tools/list: session_create\u2019s model enum is the configured codex list plus the antigravity family',
+      JSON.stringify(sc?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high']),
       JSON.stringify(sc?.inputSchema?.properties?.model),
     );
     check(
-      'tools/list: model_set\u2019s model enum is exactly the configured list',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra']),
+      'tools/list: model_set\u2019s model enum is the configured codex list plus the antigravity family',
+      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {
@@ -788,8 +794,8 @@ async function scenario9() {
     const lines = await unixJsonRpc(sockB, [{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }]);
     const ms = (lines[0]?.result?.tools ?? []).find((t) => t.name === 'model_set');
     check(
-      'with CODEX_MCP_MODELS unset the enum is today\u2019s three tiers',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol']),
+      'with CODEX_MCP_MODELS unset the enum is today\u2019s three tiers plus the antigravity family',
+      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {
@@ -820,6 +826,8 @@ async function scenario10() {
         ZCODE_WORKSPACE_DIR: TMP,
         CODEX_HOME: TMP,
         CODEX_BIN: CODEX_FIXTURE,
+        AGY_BIN: AGY_FIXTURE, // antigravity is in the default /model span -- it must construct cleanly
+        AGY_HOME: path.join(TMP, 's10a-agy-home'),
         FIXTURE_ZCODE_MARKER: zcodeMarker,
         STORE_PATH: path.join(TMP, 's10a-store.json'),
         MCP_HTTP_PORT: '0',
@@ -960,12 +968,154 @@ async function scenario10() {
   }
 }
 
+// --- scenario 11: the antigravity backend. (a) MCP-ONLY BOOT: no
+// TELEGRAM_* at all -- the bridge serves MCP exclusively off a stub Telegram
+// (the antigravity deployment shape: the owner's surfaces are the
+// antigravity.google dashboard via --remote-control and this MCP). (b) a
+// full session_create -> message_send -> reply round trip against the fake
+// agy, asserting the spawn contract (argv + HOME) through the REAL bridge.
+// (c) the effort-knob model policy over MCP. (d) quota error mapping and the
+// local-accounting usage_get. (e) resume across a BRIDGE RESTART (store ->
+// resumeConversation -> --conversation). (f) the Telegram path still works
+// with antigravity as the default backend. ---
+async function scenario11() {
+  console.log('\n--- scenario 11: antigravity — MCP-only boot, full turn, effort knob, usage, restart-resume, TG path ---');
+  const sock = path.join(TMP, 's11-state', 'agy-tg', 'mcp.sock');
+  const agyHome = path.join(TMP, 's11-agy-home');
+  const agyState = path.join(TMP, 's11-agy-state');
+  const marker = path.join(TMP, 's11-agy-marker.json');
+  const markerLog = path.join(TMP, 's11-agy-spawns.jsonl');
+  const storePath = path.join(TMP, 's11-store.json');
+  const baseEnv = {
+    // NO TELEGRAM_BOT_TOKEN, NO TELEGRAM_CHAT_ID, NO TELEGRAM_ALLOWED_USER_ID.
+    DEFAULT_BACKEND: 'antigravity',
+    ZCODE_NODE_BIN: NODE, // cfg requires it; zcode itself is never spawned
+    ZCODE_BIN: ZCODE_FIXTURE,
+    ZCODE_WORKSPACE_DIR: TMP,
+    AGY_BIN: AGY_FIXTURE,
+    AGY_HOME: agyHome,
+    AGY_EFFORT: 'medium',
+    FIXTURE_AGY_STATE: agyState,
+    FIXTURE_AGY_MARKER: marker,
+    FIXTURE_AGY_MARKER_LOG: markerLog,
+    STORE_PATH: storePath,
+    MCP_UNIX_SOCKET: sock,
+  };
+
+  let b = startBridge(baseEnv, 's11a');
+  let call;
+  try {
+    await waitFor(() => b.log.includes('MCP-only mode'), 15000, 'MCP-only mode notice');
+    check('(a) the bridge boots alive with NO Telegram config (MCP-only mode)', b.proc.exitCode === null, `exitCode=${b.proc.exitCode}\n${b.log.slice(-2000)}`);
+    await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, '(a) mcp unix socket bind');
+    const lines = await unixJsonRpc(sock, [{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }]);
+    const sc = (lines[0]?.result?.tools ?? []).find((t) => t.name === 'session_create');
+    check('(a) session_create advertises the antigravity backend', sc?.inputSchema?.properties?.backend?.enum?.includes('antigravity'), JSON.stringify(sc?.inputSchema?.properties?.backend));
+    const seeded = JSON.parse(readFileSync(path.join(agyHome, '.gemini', 'antigravity-cli', 'settings.json'), 'utf8'));
+    check('(a) the agy HOME was seeded with always-proceed + headless hygiene', seeded.toolPermission === 'always-proceed' && seeded.enableTelemetry === false, JSON.stringify(seeded));
+
+    call = (id, name, args) =>
+      unixJsonRpc(sock, [{ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }]).then((ls) => ls[0]);
+    const created = await call(2, 'session_create', { name: 'agy-mcp' });
+    const createdOk = created?.result?.isError === false;
+    check('(b) session_create on the antigravity backend completes', createdOk, JSON.stringify(created).slice(0, 400));
+    const key = createdOk ? JSON.parse(created.result.content[0].text).key : null;
+    check('(b) the session reports model gemini-3.8-flash', createdOk && JSON.parse(created.result.content[0].text).model === 'gemini-3.8-flash', created.result?.content?.[0]?.text);
+
+    const sent = await call(3, 'message_send', { key, text: 'hello antigravity' });
+    const reply = sent?.result?.isError === false ? JSON.parse(sent.result.content[0].text).reply : null;
+    check('(b) message_send returns the turn reply', reply === 'FAKE-REPLY: hello antigravity', JSON.stringify(sent).slice(0, 400));
+    const spawn1 = JSON.parse(readFileSync(markerLog, 'utf8').trim().split('\n').at(-1));
+    check('(b) the spawn contract: --remote-control AND --dangerously-skip-permissions on argv', spawn1.argv.includes('--remote-control') && spawn1.argv.includes('--dangerously-skip-permissions'), JSON.stringify(spawn1.argv));
+    check('(b) the spawn contract: the child ran with HOME=AGY_HOME', spawn1.home === agyHome, spawn1.home);
+    check('(b) the spawn contract: bare slug + effort, no effort-suffixed slug', spawn1.argv[spawn1.argv.indexOf('--model') + 1] === 'gemini-3.8-flash' && spawn1.argv[spawn1.argv.indexOf('--effort') + 1] === 'medium', JSON.stringify(spawn1.argv));
+
+    const mg = await call(4, 'model_get', { key });
+    const got = mg?.result?.isError === false ? JSON.parse(mg.result.content[0].text) : null;
+    check('(c) model_get: antigravity is switchable (the effort knob)', got?.switchable === true && got?.backend === 'antigravity', JSON.stringify(got));
+    const refused = await call(5, 'model_set', { key, model: 'gpt-5.6-terra' });
+    check('(c) model_set to a codex ref is REFUSED with the effort-variant hint', refused?.result?.isError === true && /effort variant/.test(refused.result.content?.[0]?.text || ''), JSON.stringify(refused).slice(0, 300));
+    const high = await call(6, 'model_set', { key, model: 'gemini-3.8-flash:high' });
+    check('(c) model_set to :high is accepted', high?.result?.isError === false && JSON.parse(high.result.content[0].text).model === 'gemini-3.8-flash:high', JSON.stringify(high).slice(0, 300));
+    await call(7, 'message_send', { key, text: 'after the effort switch' });
+    const spawn2 = JSON.parse(readFileSync(markerLog, 'utf8').trim().split('\n').at(-1));
+    check('(c) the next turn respawned with --effort high on the SAME conversation', spawn2.argv[spawn2.argv.indexOf('--effort') + 1] === 'high' && spawn2.argv.includes('--conversation'), JSON.stringify(spawn2.argv));
+
+    const quota = await call(8, 'message_send', { key, text: 'AGY-QUOTA' });
+    const quotaReply = quota?.result?.isError === false ? JSON.parse(quota.result.content[0].text).reply : null;
+    check('(d) a quota-exhausted turn reaches the caller as a failed turn with the error', /Turn failed/.test(quotaReply || '') && /quota/.test(quotaReply || ''), quotaReply);
+    const usage = await call(9, 'usage_get', {});
+    const usageSnap = usage?.result?.isError === false ? JSON.parse(usage.result.content[0].text) : null;
+    const w0 = usageSnap?.windows?.[0];
+    check('(d) usage_get reports the local-count window (no invented cap/remaining/percentage)', w0?.window === 'Tokens since bridge start (local count)' && w0?.cap === null && w0?.remaining === null && w0?.percentage === null, JSON.stringify(usageSnap).slice(0, 300));
+    check('(d) usage_get: the turn envelopes are summed locally', w0?.used === 24886 * 2, JSON.stringify(usageSnap).slice(0, 300));
+    check('(d) usage_get: the quota error is surfaced', /quota/.test(usageSnap?.quotaError?.error || ''), JSON.stringify(usageSnap?.quotaError));
+
+    check('(e) pre-restart: the conversation key is in the store', existsSync(storePath));
+  } finally {
+    // SIGKILL: the coldest possible restart. The agy children die with it
+    // (their stdin hits EOF when the bridge's fds close).
+    b.proc.kill('SIGKILL');
+    await sleep(300);
+  }
+
+  // (e) restart on the SAME store + agy HOME + fixture state: the persisted
+  // session must resume (--conversation) with history intact.
+  b = startBridge(baseEnv, 's11b');
+  try {
+    await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, '(e) socket rebind after restart');
+    const call2 = (id, name, args) =>
+      unixJsonRpc(sock, [{ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }]).then((ls) => ls[0]);
+    // The key lives in the store (chat -100 sentinel + the stub topic id) --
+    // read it back out rather than guessing the synthetic thread number.
+    const key2 = waitFor(() => {
+      const doc = JSON.parse(readFileSync(storePath, 'utf8'));
+      const entry = Object.entries(doc.topics ?? {}).find(([, t]) => t.backend === 'antigravity' && t.name === 'agy-mcp');
+      return entry ? entry[0] : null;
+    }, 10000, '(e) the stored topic key');
+    const restored = await call2(10, 'message_send', { key: await key2, text: 'RESUME-CHECK: what did we talk about?' });
+    const reply2 = restored?.result?.isError === false ? JSON.parse(restored.result.content[0].text).reply : null;
+    check('(e) after a bridge restart the SAME conversation answers with its history', reply2 === 'FIRST-WAS: hello antigravity', JSON.stringify(restored).slice(0, 400));
+    const spawns = readFileSync(markerLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    const resumeSpawn = spawns.at(-1);
+    check('(e) the restart resumed via --conversation (no fresh conversation)', resumeSpawn.argv.includes('--conversation'), JSON.stringify(resumeSpawn.argv));
+  } finally {
+    b.proc.kill('SIGKILL');
+    await sleep(300);
+  }
+
+  // (f) the Telegram path: antigravity as default backend, fake Telegram
+  // configured -- a topic message must produce a delivered reply.
+  const { srv, port, calls, pushUpdate } = await startFakeTelegram();
+  const b3 = startBridge(
+    {
+      ...baseEnv,
+      TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+      TELEGRAM_BOT_TOKEN: 'fake',
+      TELEGRAM_CHAT_ID: '-100111',
+      TELEGRAM_ALLOWED_USER_ID: '1',
+      STORE_PATH: path.join(TMP, 's11f-store.json'),
+    },
+    's11f',
+  );
+  try {
+    await waitFor(() => b3.log.includes('starting.'), 15000, '(f) bridge boot');
+    check('(f) the bridge boots alive with Telegram configured (not MCP-only)', b3.proc.exitCode === null, `exitCode=${b3.proc.exitCode}\n${b3.log.slice(-1500)}`);
+    pushUpdate(tgMessage(940, 'hello over telegram'));
+    const delivered = await waitFor(() => calls.edit.find((m) => /FAKE-REPLY: hello over telegram/.test(m.text || '')), 20000, '(f) the delivered reply');
+    check('(f) the antigravity turn was delivered into the topic', !!delivered, JSON.stringify(calls.edit.at(-1)));
+  } finally {
+    b3.proc.kill('SIGKILL');
+    srv.close();
+  }
+}
+
 // EACH SCENARIO REPORTS ITS OWN FAILURE, so one scenario's throw (which is
 // how a bridge that dies at boot usually surfaces -- a waitFor timeout)
 // doesn't silently skip the scenarios after it: on the :546 boot-crash
 // this file exists to catch, EVERY non-zcode-default scenario is red, and
 // the run must say so rather than stop at the first.
-for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10]) {
+for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11]) {
     try {
       await s();
     } catch (e) {
