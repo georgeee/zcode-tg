@@ -158,6 +158,37 @@ export function createMcpGateway({
     handlers = impl;
   }
 
+  // --- connection identity (the agy GC's creator tie) ---
+  //
+  // Each client connection gets a small id that travels with every
+  // tools/call from it: session_create records it as the session's creator,
+  // and when the connection closes the bridge closes the sessions it
+  // created (idle immediately, busy after their turn). In production each
+  // Claude client is its own `cage mcp-pipe` unix connection; the HTTP
+  // transport maps the same idea onto its TCP socket -- keep-alive reuse
+  // shares one id, which is the point: the id dies when the socket does.
+  let nextConnId = 1;
+  const httpConnIds = new WeakMap(); // TCP socket -> conn id
+  const closedConns = new Set(); // a close notification fires at most once
+  function fireConnectionClosed(id) {
+    if (closedConns.has(id)) return;
+    closedConns.add(id);
+    try {
+      Promise.resolve(handlers?.connectionClosed?.(id)).catch((e) => log(`mcp gateway: connectionClosed handler failed: ${e.message}`));
+    } catch (e) {
+      log(`mcp gateway: connectionClosed handler failed: ${e.message}`);
+    }
+  }
+  function connIdForSocket(socket) {
+    let id = httpConnIds.get(socket);
+    if (id == null) {
+      id = nextConnId++;
+      httpConnIds.set(socket, id);
+      socket.once('close', () => fireConnectionClosed(id));
+    }
+    return id;
+  }
+
   function json(res, code, body) {
     res.writeHead(code, { 'content-type': 'application/json' });
     res.end(JSON.stringify(body));
@@ -307,7 +338,7 @@ export function createMcpGateway({
     return value;
   }
 
-  async function callTool(name, args) {
+  async function callTool(name, args, connId) {
     if (!handlers) throw new Error('mcp gateway not wired to the bridge');
     switch (name) {
       case 'session_create':
@@ -316,6 +347,7 @@ export function createMcpGateway({
           args.chat_id != null ? Number(args.chat_id) : undefined,
           args.backend ? String(args.backend) : undefined,
           args.model ? String(args.model) : undefined,
+          connId,
         );
       case 'session_close':
         return handlers.sessionClose(requiredString('session_close', 'key', args.key));
@@ -336,7 +368,7 @@ export function createMcpGateway({
     }
   }
 
-  async function dispatchRpc(body) {
+  async function dispatchRpc(body, connId) {
     if (body.method === 'initialize') {
       return {
         protocolVersion: PROTOCOL_VERSION,
@@ -353,7 +385,7 @@ export function createMcpGateway({
     if (body.method === 'tools/call') {
       const { name, arguments: args = {} } = body.params ?? {};
       try {
-        const result = await callTool(name, args);
+        const result = await callTool(name, args, connId);
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }], isError: false };
       } catch (e) {
         return { content: [{ type: 'text', text: e.message }], isError: true };
@@ -366,6 +398,7 @@ export function createMcpGateway({
   }
 
   const server = createServer((req, res) => {
+    const connId = connIdForSocket(req.socket);
     if (req.url.split('?')[0] !== '/mcp') {
       res.writeHead(404, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'not found -- POST JSON-RPC to /mcp' }));
@@ -408,7 +441,7 @@ export function createMcpGateway({
       const out = [];
       for (const b of bodies) {
         // eslint-disable-next-line no-await-in-loop
-        const r = await dispatchRpc(b);
+        const r = await dispatchRpc(b, connId);
         if (r !== undefined) out.push({ jsonrpc: '2.0', id: b.id ?? null, ...(r.error ? { error: r.error } : { result: r.result ?? r }) });
       }
       if (!out.length) {
@@ -448,6 +481,7 @@ export function createMcpGateway({
   if (unixSocket) {
     unixSrv = createNetServer((conn) => {
       unixConns.add(conn);
+      const connId = nextConnId++;
       let buf = '';
       const decoder = new StringDecoder('utf8'); // chunk-safe: a multibyte char split across reads survives
       conn.on('data', (chunk) => {
@@ -464,7 +498,7 @@ export function createMcpGateway({
             conn.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }) + '\n');
             continue;
           }
-          dispatchRpc(body)
+          dispatchRpc(body, connId)
             .then((res) => {
               if (res !== undefined) conn.write(JSON.stringify({ jsonrpc: '2.0', id: body.id ?? null, ...(res.error ? { error: res.error } : { result: res.result ?? res }) }) + '\n');
             })
@@ -474,7 +508,10 @@ export function createMcpGateway({
         }
       });
       conn.on('error', () => {});
-      conn.on('close', () => unixConns.delete(conn));
+      conn.on('close', () => {
+        unixConns.delete(conn);
+        fireConnectionClosed(connId);
+      });
     });
     // The parent directory is OURS to create (agent-cage creates nothing);
     // a missing parent is the production case, not an edge.
