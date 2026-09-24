@@ -52,7 +52,7 @@
 // phase). Run this as a long-lived process (see README.md for the systemd
 // unit); it does not daemonize itself.
 
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { createMcpGateway, raceReply, repliesForTopic } from './mcp.js';
 import { pickForumChat } from './chatpick.js';
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
@@ -62,6 +62,7 @@ import { existsSync } from 'node:fs';
 import { ZcodeBackend } from './backends/zcodeBackend.js';
 import { CodexBackend } from './backends/codexBackend.js';
 import { AntigravityBackend, AGY_MODEL_REF, parseAgyModelRef } from './backends/antigravityBackend.js';
+import { reapOrphanAgyChildren } from './agyProcesses.js';
 import { MockBackend, MOCK_MODEL_REF } from './backends/mockBackend.js';
 import { makeSessionId, backendNameOf, rawSessionId } from './backend.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
@@ -80,6 +81,16 @@ import { mergeModelLists, resolveModelRef } from './modelref.js';
 // workspace instead -- see resolveEnvPath (env.js) for the search order and
 // compatibility fallbacks.
 loadEnv(resolveEnvPath({ override: process.env.ZCODE_TG_ENV || process.env.ZCODE_MOBILE_ENV }));
+
+// Numeric env with a fallback, and WITHOUT Number()'s traps: '' -> fallback,
+// garbage -> fallback, and a real 0 survives (AGY_IDLE_CLOSE_MIN=0 must stay
+// 0 -- it means "disable the reaper" -- where `|| fallback` would erase it).
+function numberEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || String(raw).trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 const cfg = {
   // MCP-ONLY MODE (2026-09-24, with the antigravity backend). A deployment
@@ -140,6 +151,20 @@ const cfg = {
   agyBin: process.env.AGY_BIN || 'agy',
   agyHome: process.env.AGY_HOME || '',
   agyEffort: process.env.AGY_EFFORT || 'medium',
+  // THE AGY PROCESS GC (2026-09-24). agy's stream-json mode runs one
+  // process per conversation with no multiplexing, and an idle child costs
+  // 93-181 MB anon RSS -- before the GC, children of finished sessions were
+  // never reaped and lived until the bridge died.
+  //   AGY_IDLE_CLOSE_MIN -- close a session's child after this many idle
+  //     minutes (clock: end of the last turn, or the spawn; a session
+  //     mid-turn is never reaped). Default 20; 0 disables.
+  //   AGY_MAX_PROCS -- live agy children per bridge. A new child at the cap
+  //     evicts the least-recently-used IDLE child; if all are mid-turn the
+  //     request is refused with the busy keys listed. Default 4.
+  // Closing a child never loses a conversation: agy persists it under
+  // AGY_HOME, and the next message respawn-resumes with --conversation.
+  agyIdleCloseMin: numberEnv('AGY_IDLE_CLOSE_MIN', 20),
+  agyMaxProcs: numberEnv('AGY_MAX_PROCS', 4),
   // Which backend a brand-new topic/session runs on absent an explicit
   // choice (a stored per-topic 'backend', or an MCP session_create
   // 'backend' argument). Left at 'zcode' so the live deployment's behavior
@@ -389,7 +414,24 @@ const BACKEND_FACTORIES = {
   },
   antigravity: () => {
     if (!cfg.agyHome) throw new Error("the 'antigravity' backend needs AGY_HOME set (see README)");
-    return new AntigravityBackend({ agyBin: cfg.agyBin, agyHome: cfg.agyHome, cwd: cfg.workspaceDir, effort: cfg.agyEffort, autoApprovePermissions: cfg.autoApprovePermissions });
+    return new AntigravityBackend({
+      agyBin: cfg.agyBin,
+      agyHome: cfg.agyHome,
+      cwd: cfg.workspaceDir,
+      effort: cfg.agyEffort,
+      autoApprovePermissions: cfg.autoApprovePermissions,
+      // The GC knobs (see cfg above): minutes -> ms, 0 meaning disabled
+      // survives the translation.
+      idleCloseMs: cfg.agyIdleCloseMin > 0 ? cfg.agyIdleCloseMin * 60_000 : 0,
+      maxProcs: cfg.agyMaxProcs,
+      // C4: the marker every agy child carries and the boot sweep matches.
+      // Hash of the state path, so two bridges on one host never sweep each
+      // other's children.
+      bridgeMarker: agyBridgeMarker(),
+      // Reap logs and the cap refusal speak MCP keys -- the strings a
+      // caller can actually session_close -- not bare session ids.
+      sessionKeyOf: mcpKeyForSession,
+    });
   },
   // No config to check -- that's the whole point (see mockBackend.js's
   // module comment). Eligible as DEFAULT_BACKEND=mock too, for a deployment
@@ -431,9 +473,32 @@ function defaultModelFor(backendName) {
   return cfg.defaultModel;
 }
 
+// C4: the identity every agy child of THIS bridge carries in its
+// environment (CAGE_AGY_BRIDGE) and the boot-time orphan sweep matches. The
+// state path is what already distinguishes this deployment from any other
+// bridge on the host (two bridges, two stores, two markers -- neither's
+// sweep can kill the other's children).
+function agyBridgeMarker() {
+  return createHash('sha256').update('zcode-tg agy bridge\n').update(cfg.storePath).digest('hex').slice(0, 16);
+}
+
+// The MCP conversation key for a session id -- the string an MCP caller can
+// actually pass to session_close -- or null when the session has no topic.
+// Feeds the GC's reap logs and the cap refusal, which must speak keys, not
+// bare session ids.
+function mcpKeyForSession(sessionId) {
+  const topic = sessionToTopic.get(sessionId);
+  if (!topic) return null;
+  const entry = store.getTopic(topic.threadId);
+  return entry ? keyFor(entry.chatId, entry.threadId) : null;
+}
+
 function wireBackend(backend) {
   backend.on('event', onBackendEvent);
   backend.on('warn', (m) => console.error(`[bridge] [${backend.name}]`, m));
+  // The GC's reap lines ('reap key=... idle=...m reason=...'): operational
+  // information, the answer to "where did that session's process go".
+  backend.on('reap', (line) => console.log(`[bridge] [${backend.name}] ${line}`));
   backend.on('stderr', (text) => process.stderr.write(`[${backend.name} stderr] ${text}`));
   backend.on('parseError', ({ line, error }) => console.error(`[bridge] unparseable line from ${backend.name}:`, error.message, line.slice(0, 200)));
   backend.onPermissionRequest(onPermissionRequest);
@@ -621,7 +686,16 @@ async function shutdown(signal) {
   );
   await sleep(100); // let those rejections reach the socket before it closes
 
-  for (const backend of Object.values(backends)) backend.stop();
+  // C4: the backends' stop() is the bounded child escalation (stdin EOF,
+  // SIGTERM, SIGKILL -- the antigravity backend's is <=15s total). Await it
+  // under a race so one wedged backend cannot hang the redeploy past its
+  // bound -- and so an agy child cannot outlive us holding its memory and
+  // its credential HOME. (The orphan sweep at the NEXT boot is the backstop
+  // for a SIGKILLed bridge; a normal exit should leave nothing to sweep.)
+  await Promise.race([
+    Promise.allSettled(Object.values(backends).map((b) => b.stop?.())),
+    sleep(16_000),
+  ]);
   process.exit(0);
 }
 
@@ -1669,6 +1743,10 @@ function antigravityUsageGetForMcp() {
     cachedAt: new Date().toISOString(),
   };
   if (u.lastQuotaError) snap.quotaError = u.lastQuotaError;
+  // C6: the live-process picture (children hold 93-181 MB each; the cap and
+  // the reaper manage it -- this says what they are managing right now).
+  const procs = getBackend('antigravity').procSnapshot();
+  snap.agyProcs = { live: procs.live, totalRssBytes: procs.totalRssBytes };
   return snap;
 }
 
@@ -1716,10 +1794,22 @@ async function usageGetForMcp() {
 // Owner-specified format (2026-09-01): one compact line -- one-word state,
 // "N queued" / "no queued", and usage as percentages only. Model and mode
 // are deliberately not here; /model and /mode each confirm their own effect.
+// C6: the agy segment of the pinned topic status -- live children and
+// their combined RSS, since idle agy processes are this bridge's only
+// unbounded memory consumer. Nothing when the antigravity backend is not
+// live or has no children (never constructs one just to report on it).
+function agyProcStatusText() {
+  const snapshot = backends.antigravity?.procSnapshot?.();
+  if (!snapshot?.live) return null;
+  return `${snapshot.live} agy · ${Math.round(snapshot.totalRssBytes / (1024 * 1024))} MB`;
+}
+
 function topicStatusText(threadId, state) {
   const parts = [state === 'busy' ? 'busy' : 'idle', `${store.getQueue(threadId).length || 'no'} queued`];
   const usage = statusUsageText();
   if (usage) parts.push(usage);
+  const agy = agyProcStatusText();
+  if (agy) parts.push(agy);
   return `📌 ${parts.join(' · ')}`;
 }
 
@@ -2970,6 +3060,19 @@ async function handleCallbackQuery(cq) {
 async function main() {
   console.log(`[bridge] starting. chat=${cfg.chatId} workspace=${cfg.workspaceDir} model=${cfg.defaultModel}`);
 
+  // C4, boot half: an agy child that outlived the bridge -- a SIGKILLed or
+  // crashed predecessor -- still holds its memory and its credential HOME,
+  // and nothing is its parent any more. Every child we spawn carries our
+  // bridge marker; sweep our own uid's processes for that marker on
+  // processes whose parent is not us, before anything else can spawn more.
+  // Fire-and-forget: the sweep's own TERM/KILL escalation is bounded and
+  // must not delay boot.
+  if (cfg.agyHome) {
+    reapOrphanAgyChildren({ marker: agyBridgeMarker(), log: (m) => console.error(`[bridge] [antigravity] ${m}`) }).catch((e) =>
+      console.error(`[bridge] [antigravity] orphan sweep failed: ${e.message}`),
+    );
+  }
+
   // THE MCP GATEWAY: lets a second model running on the same host (inside
   // the same agent) drive these conversations over loopback, with every
   // prompt and reply mirrored into the Telegram chat from the bot's
@@ -2986,7 +3089,11 @@ async function main() {
       log: (m) => console.log(`[bridge] ${m}`),
     });
     mcp.wire({
-      sessionCreate: async (name, chatIdNum, backendName, modelArg) => {
+      // sessionCreate's 5th argument is the calling MCP connection's id
+      // (the creator tie, C2): the antigravity GC closes a vanished
+      // connection's sessions. Other backends have nothing to GC (one
+      // long-lived multiplexing process) and ignore the id.
+      sessionCreate: async (name, chatIdNum, backendName, modelArg, connId) => {
         const backend = backendName || cfg.defaultBackend;
         if (!KNOWN_BACKENDS.includes(backend)) throw new Error(`unknown backend: ${backend} (known: ${KNOWN_BACKENDS.join(', ')})`);
         getBackend(backend); // fail early (e.g. Codex misconfigured) before creating a Telegram topic for it
@@ -3020,6 +3127,12 @@ async function main() {
         store.setTopic(key, { chatId, threadId, name, backend, model, mode: cfg.defaultSessionMode });
         await getOrCreateSession(key);
         const entry = store.getTopic(key);
+        // C2: record WHICH connection created this session, so its
+        // disappearance closes the session (idle now, busy after its turn).
+        // Telegram-created sessions get no creator and are never touched.
+        if (backend === 'antigravity' && connId != null && entry?.sessionId) {
+          getBackend('antigravity').noteSessionCreator(entry.sessionId, connId);
+        }
         return { key, chat_id: chatId, thread_id: threadId, model: entry.model, backend, auto_picked: autoPicked };
       },
       sessionClose: async (key) => {
@@ -3120,6 +3233,14 @@ async function main() {
         return { backend, model, switchable: true };
       },
       usageGet: () => usageGetForMcp(),
+      // C2: an MCP connection went away. Handed to the antigravity backend
+      // ONLY if one is already live -- constructing and starting a backend
+      // (credential checks, settings seeding) because a dying socket once
+      // created a session on it would be the tail wagging the dog; if the
+      // backend was never touched, it has no children to close either.
+      connectionClosed: (connId) => {
+        backends.antigravity?.creatorDisconnected(connId);
+      },
     });
     // A failed listener (socket bind, chmod) must be LOUD: a silently dead
     // MCP endpoint inside a healthy-looking bridge is exactly how this went
