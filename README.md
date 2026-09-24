@@ -525,6 +525,43 @@ codex):
 - `AGY_EFFORT` — the default effort for new sessions: `low`, `medium`
   (default) or `high`.
 
+Process GC (2026-09-24). agy's stream-json mode has no multiplexing: every
+session IS a process, an idle one costs 93–181 MB of anonymous RSS, and
+before the GC the children of finished sessions were never reaped. Now:
+
+- `AGY_IDLE_CLOSE_MIN` — close a session's process after this many idle
+  minutes (default 20; `0` disables). The idle clock runs from the end of
+  the last turn (the `result` event) or from the spawn; a session with a
+  turn in flight is **never** reaped. Closing a process never loses a
+  conversation: agy persists it under `AGY_HOME`, and the next message
+  respawn-resumes with `--conversation` (the session's stored effort comes
+  back with it). Every reap is logged:
+  `reap key=<key> idle=<m>m reason=idle`.
+- `AGY_MAX_PROCS` — live agy processes per bridge (default 4). A new
+  process at the cap first evicts the least-recently-used **idle** child
+  (`reason=cap` in the log) and waits for it to exit — the cap holds at the
+  process level, not just in the bridge's registry. With every live child
+  mid-turn there is nothing evictable and the request is refused with an
+  actionable error listing the busy keys and their turn ages:
+  `antigravity: 4 sessions busy (cap 4): <key> 3m12s, ...; retry or
+  session_close one`.
+- **MCP creator tie** — the MCP connection that created a session
+  (`session_create`) is recorded; when that connection closes, its idle
+  sessions close immediately and its busy ones right after their turn ends
+  (`reason=creator-gone`). Sessions created from Telegram are unaffected,
+  and a session picked up later by another connection just respawn-resumes
+  — the conversation was never lost.
+- **Shutdown & orphans** — on bridge stop every child gets stdin EOF, then
+  `SIGTERM`, then `SIGKILL`, all inside 15 s. Every child also carries a
+  `CAGE_AGY_BRIDGE` marker in its environment (a hash of the bridge's state
+  path); at boot the bridge sweeps its own uid's `/proc` for
+  marker-carrying processes whose parent is not itself — the leftovers of a
+  SIGKILLed or crashed predecessor — and TERM/KILLs them. The sweep skips
+  unreadable entries, so `hidepid`/`ProtectProc` mounts are safe.
+- **Visibility** — the pinned per-topic status line shows
+  `<n> agy · <rss> MB` while children are live, and the antigravity
+  `usage_get` answer carries an `agyProcs` block (`live`, `totalRssBytes`).
+
 Known scope limits (intentional): no per-tool hard kill (`/stop` SIGTERMs
 the session process; agy auto-backgrounds long shell commands internally
 and they are not addressable from the stream); the model's `ask_question`
