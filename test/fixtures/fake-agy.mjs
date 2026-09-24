@@ -27,8 +27,16 @@
 //                            carry memory across processes)
 //   FIXTURE_AGY_INIT_DELAY_MS  delay before the init event (init-timeout tests)
 //   FIXTURE_AGY_SLOW_MS        how long the AGY-SLOW trigger stalls (cancel tests)
+//   FIXTURE_AGY_STUBBORN       set: ignore stdin EOF and SIGTERM -- only
+//                              SIGKILL ends the process (GC escalation tests)
 import { appendFileSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+
+const STUBBORN = !!process.env.FIXTURE_AGY_STUBBORN;
+// Ignoring EOF is not enough: with stdin gone and no other pending work the
+// process would still exit naturally (code 0). A stubborn session holds the
+// event loop, so only SIGKILL ends it -- that is the point of the knob.
+if (STUBBORN) setInterval(() => {}, 10_000);
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(name);
@@ -145,12 +153,16 @@ process.stdin.on('data', (chunk) => {
     }
   }
 });
-process.stdin.on('end', () => process.exit(0));
+process.stdin.on('end', () => {
+  if (STUBBORN) return; // the whole point: EOF alone does not end this one
+  process.exit(0);
+});
 
 // VERIFIED LIVE (battery (f)): SIGTERM mid-turn -> structured interrupted
 // result, exit 1, conversation survives (history is on disk, so a respawn
 // with --conversation continues it).
 process.on('SIGTERM', () => {
+  if (STUBBORN) return; // survives TERM too -- the GC's KILL stage is next
   if (currentTurn) {
     emit({ event: 'result', result: { conversation_id: conversationId, status: 'ERROR', response: '', error: 'interrupted', duration_seconds: 0.1, num_turns: turnSeq, usage: USAGE(0) } });
   }
