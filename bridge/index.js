@@ -1021,6 +1021,25 @@ function onBackendEvent(msg) {
 
   if (msg.method === 'session/event') {
     const payload = msg.params.payload;
+    // DASHBOARD-ORIGIN TURNS (antigravity): turns typed in the
+    // antigravity.google dashboard run inside agy itself -- no sendMessage
+    // of ours started them -- and reach this bridge only through the
+    // backend's conversation-store watcher, which emits them here. The MCP
+    // reply log is their one consumer surface: each is noted with its role
+    // and origin so replies_get returns {role, origin, text} entries and an
+    // MCP caller sees the whole conversation, not just the turns it drove.
+    // noteReply itself refuses to let a role:'user' entry satisfy a parked
+    // message_send (a dashboard turn is INPUT, not the reply to ours).
+    if (payload?.kind === 'dashboard_message' && payload.origin === 'dashboard' && typeof payload.text === 'string' && payload.text.trim()) {
+      const topic = sessionToTopic.get(sessionId);
+      if (topic && mcp) {
+        mcp.noteReply(topic.threadId, payload.text, {
+          role: payload.role === 'assistant' ? 'assistant' : 'user',
+          origin: 'dashboard',
+        });
+      }
+      return;
+    }
     if (!turn) {
       // Background-task lifecycle snapshots carry {taskId, status} with no
       // `kind` discriminator, and keep arriving after the turn that started

@@ -63,20 +63,31 @@ export function createMcpGateway({
   if (port == null && !unixSocket) throw new Error('mcp gateway needs a port or a unixSocket');
 
   // Per-conversation state: the reply log (for replies_get) and the waiters
-  // that message_send parked until the agent's final reply lands.
-  const replyLog = new Map(); // key -> [{ seq, text, at }]
+  // that message_send parked until the agent's final reply lands. Entries
+  // are { seq, text, at } plus, for dashboard-origin turns (see index.js's
+  // dashboard_message handler), the { role, origin } meta -- additive fields
+  // replies_get passes through verbatim.
+  const replyLog = new Map(); // key -> [{ seq, text, at, role?, origin? }]
   const waiters = new Map(); // key -> [{ resolve }]
   let replySeq = 0;
 
-  function noteReply(key, text) {
+  // meta, when given, rides on the entry through replies_get verbatim. A
+  // meta.role of 'user' marks the text as INPUT (a dashboard turn George
+  // typed): it must not satisfy a parked message_send, because the parked
+  // caller would read another human's input as the reply to its own prompt.
+  // Every legacy two-arg call keeps waking waiters exactly as before.
+  function noteReply(key, text, meta = null) {
     if (!text || !String(text).trim()) return;
     const entry = { seq: ++replySeq, text: String(text), at: new Date().toISOString() };
+    if (meta) Object.assign(entry, meta);
     const log = replyLog.get(key) ?? [];
     log.push(entry);
     while (log.length > REPLY_LOG_LIMIT) log.shift();
     replyLog.set(key, log);
-    for (const w of waiters.get(key) ?? []) w.resolve(entry);
-    waiters.delete(key);
+    if (!meta || meta.role !== 'user') {
+      for (const w of waiters.get(key) ?? []) w.resolve(entry);
+      waiters.delete(key);
+    }
   }
 
   function waitReply(key) {

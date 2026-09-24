@@ -24,6 +24,7 @@
 
 import { Backend, makeSessionId, rawSessionId } from '../backend.js';
 import { AntigravityClient, AGY_SETTINGS_DEFAULTS, ensureAgySettings } from '../antigravityClient.js';
+import { ConversationWatcher, conversationDbPath } from '../conversationStore.js';
 
 // THE SINGLE MODEL REF, per George (2026-09-24): the antigravity family
 // exposes exactly one model; reasoning effort is a KNOB on that ref, mapped
@@ -51,7 +52,7 @@ function statusOf(result) {
 }
 
 export class AntigravityBackend extends Backend {
-  constructor({ agyBin, agyHome, cwd, effort = 'medium', autoApprovePermissions = true, remoteControl = true, initTimeoutMs = 90_000 }) {
+  constructor({ agyBin, agyHome, cwd, effort = 'medium', autoApprovePermissions = true, remoteControl = true, initTimeoutMs = 90_000, watchStartCursor = null }) {
     super('antigravity');
     this.agyBin = agyBin;
     this.agyHome = agyHome;
@@ -64,8 +65,14 @@ export class AntigravityBackend extends Backend {
     // process (design doc §13). Not Claude's remote-control trap.
     this.remoteControl = remoteControl;
     this.initTimeoutMs = initTimeoutMs; // cold first runs unpack skills (5-15s measured; 90s is generous)
+    // Test seam for the conversation-store watcher (see _startWatcher):
+    // where its cursor starts. null (production) = tail -- history is never
+    // replayed. The tests seed a store and start mid-way through it.
+    this.watchStartCursor = watchStartCursor ?? null;
     // rawId (conversation uuid) -> session state:
-    //   { client, effort, turnSeq, turn: {id, toolCallIds: Map} | null }
+    //   { client, effort, turnSeq, turn: {id, toolCallIds: Map} | null,
+    //     ownTurnTexts: Set (our recent stdin texts -- the watcher's
+    //     late-poll guard), watcher: ConversationWatcher | null }
     this._sessions = new Map();
     this._usage = { since: Date.now(), turns: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
     this._lastQuotaError = null;
@@ -88,7 +95,10 @@ export class AntigravityBackend extends Backend {
   }
 
   async stop() {
-    for (const [, s] of this._sessions) s.client.stop();
+    for (const [, s] of this._sessions) {
+      s.watcher?.stop();
+      s.client.stop();
+    }
   }
 
   // --- session lifecycle ---
@@ -135,6 +145,12 @@ export class AntigravityBackend extends Backend {
     const session = await this._runningSession(sessionId);
     const turnId = `${rawSessionId(sessionId)}:${++session.turnSeq}`;
     session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0 };
+    // The watcher's late-poll guard needs our recent stdin texts: a poll
+    // landing after this turn finished would otherwise read its user row as
+    // dashboard-origin (no turn in flight any more). Capped -- it is a
+    // membership set, not a transcript.
+    session.ownTurnTexts.add(text);
+    if (session.ownTurnTexts.size > 16) session.ownTurnTexts.delete(session.ownTurnTexts.values().next().value);
     // turn.started FIRST: index.js correlates a turn's events on the turnId
     // learned from this event, and adopts backend-initiated turns from it.
     this._emitTelemetry(makeSessionId('antigravity', rawSessionId(sessionId)), turnId, 'turn.started');
@@ -157,6 +173,7 @@ export class AntigravityBackend extends Backend {
     const rawId = rawSessionId(sessionId);
     const session = this._sessions.get(rawId);
     if (session) {
+      session.watcher?.stop();
       session.client.stop();
       this._sessions.delete(rawId);
     }
@@ -184,6 +201,7 @@ export class AntigravityBackend extends Backend {
     if (session && session.effort === parsed.effort) return;
     const workspaceDir = session?.client.cwd ?? this.cwd;
     if (session) {
+      session.watcher?.stop();
       session.client.stop();
       this._sessions.delete(rawId);
     }
@@ -244,7 +262,7 @@ export class AntigravityBackend extends Backend {
       remoteControl: this.remoteControl,
       skipPermissions: this.autoApprovePermissions,
     });
-    const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null };
+    const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null };
     session.initPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`agy did not initialize within ${this.initTimeoutMs}ms (agyBin=${this.agyBin})`)), this.initTimeoutMs);
       const onInit = (msg) => {
@@ -261,6 +279,7 @@ export class AntigravityBackend extends Backend {
         // spawning a SECOND process for the same conversation.
         session.rawId = conversationId ?? msg.conversation_id;
         this._sessions.set(session.rawId, session);
+        this._startWatcher(session);
         // Auto-mode sanity check (VERIFIED LIVE: skip-permissions shows up as
         // init.permission_mode "always-proceed"; headless sessions without
         // the flag show "request-review"). A mismatch is a loud warn, not an
@@ -302,6 +321,10 @@ export class AntigravityBackend extends Backend {
   }
 
   _onChildExit(session, info) {
+    // The watcher dies with the child too: the --remote-control tunnel is
+    // the child's, so nothing can journal new dashboard turns while it is
+    // down (a respawn starts a fresh watcher with a fresh tail cursor).
+    session.watcher?.stop();
     // A child exiting mid-turn (crash, OOM, SIGKILL) must end that turn with
     // a failed terminal -- index.js's watchdog is off by default, so without
     // this the topic would sit on its placeholder forever. The normal paths
@@ -327,6 +350,47 @@ export class AntigravityBackend extends Backend {
       this._lastQuotaError = { at: new Date().toISOString(), status: err.status ?? null, error: err.short_error };
       this.emit('warn', `agy quota error: ${err.short_error}`);
     }
+  }
+
+  // --- dashboard turns (conversation-store watcher) ---
+
+  // Tails the session's conversation .db for turns typed in the
+  // antigravity.google dashboard. MEASURED (conversation-db-notes.md): those
+  // turns and their replies never appear on agy's stream-json stdout -- they
+  // are journalled only in the SQLite store, and --remote-control sessions
+  // run them while this bridge sits idle. Emitted as session/event payloads
+  // of kind 'dashboard_message' ({role, origin:'dashboard', text}) which
+  // index.js notes into the MCP reply log -- the session's reply stream.
+  _startWatcher(session) {
+    if (session.watcher) return;
+    const watcher = new ConversationWatcher({
+      dbPath: conversationDbPath(this.agyHome, session.rawId),
+      turnInFlight: () => session.turn != null,
+      ownTurnUserTexts: () => session.ownTurnTexts,
+      startCursor: this.watchStartCursor,
+    });
+    watcher.on('dashboard_turn', (turn) => this._emitDashboardTurn(session, turn));
+    // Degradations are warnings, never errors: a session that cannot be
+    // watched still turns fine over stdin -- the watcher is an ear, not a
+    // limb.
+    watcher.on('stalled', (m) => this.emit('warn', `conversation store watcher: ${m}`));
+    watcher.on('unavailable', (m) => this.emit('warn', `conversation store watcher: ${m}`));
+    session.watcher = watcher;
+    watcher.start();
+  }
+
+  _emitDashboardTurn(session, turn) {
+    const sessionId = makeSessionId('antigravity', session.rawId ?? '');
+    // turnId is informational (index.js correlates only turns it started);
+    // `dashboard:<idx>` names the store row it came from.
+    this.emit('event', {
+      method: 'session/event',
+      params: {
+        sessionId,
+        turnId: `dashboard:${turn.idx}`,
+        payload: { kind: 'dashboard_message', role: turn.role, origin: 'dashboard', text: turn.text, at: turn.at },
+      },
+    });
   }
 
   // --- event translation: agy's init/step_update/result -> the shared
