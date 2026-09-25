@@ -1758,7 +1758,10 @@ async function handleModelCommand(threadId, arg) {
   // it was found in, and the old session id is dropped -- a resolved model is
   // never applied to the topic's current backend by default (that guess is
   // the recorded live bug this command's resolver exists to make impossible).
-  store.setTopic(threadId, { ...entry, backend: resolvedBackend, sessionId: undefined, model: ref });
+  // The switch promises "a fresh session on your next message", which is
+  // exactly the way out of a closed topic -- so it also un-closes (ported
+  // from ztg-status b0ef7a8; the closed mark belonged to the old session).
+  store.setTopic(threadId, { ...entry, backend: resolvedBackend, sessionId: undefined, model: ref, closed: false });
   await updateTopicStatus(threadId, 'idle').catch(() => {});
   await tg.sendMessage({
     chatId: chatOf(threadId),
@@ -1902,7 +1905,10 @@ async function handleBackendCommand(threadId, arg) {
     subscribedSessions.delete(entry.sessionId);
     sessionToTopic.delete(entry.sessionId);
   }
-  store.setTopic(threadId, { ...entry, backend: arg, sessionId: undefined, model: undefined });
+  // Same un-close rule as the cross-backend /model switch above: the fresh
+  // session this promises is the way out of a closed topic (ztg-status
+  // b0ef7a8), and messageSend refuses a key still marked closed.
+  store.setTopic(threadId, { ...entry, backend: arg, sessionId: undefined, model: undefined, closed: false });
   await tg.sendMessage({
     chatId: chatOf(threadId),
     messageThreadId: threadOf(threadId),
@@ -2054,6 +2060,67 @@ async function interruptTurn(sessionId, { killEverything }) {
   for (const taskId of sessionBackgroundTasks.get(sessionId) ?? []) {
     backend.cancelBackgroundTask(sessionId, taskId).catch(() => {});
   }
+}
+
+// Release a topic's session PROCESS: the half every close path shares --
+// MCP session_close, and the relay-synthesized forum_topic_deleted. Ported
+// 2026-09-25 from the antigravity fix (ztg-status b0ef7a8), where session_close
+// only closed the Telegram topic and marked the store entry: the conversation's
+// process outlived the close, a mid-turn close cancelled nothing (its parked
+// caller sat out the full wait), and the relay-topic-delete handler below
+// duplicated this shape by hand -- minus the release, so a closed topic's
+// session stayed subscribed and closeable only by accident. Order matters:
+//   1. A BUSY session's turn is cancelled first (interruptTurn: the same
+//      hard-stop core /stop uses, so the cancel is the verdict on every
+//      backend). Unlike /stop, the bookkeeping is unwound HERE rather than
+//      left to the turn's terminal: the maps this function drops are what the
+//      terminal's delivery routes through, and mock's cancel emits no
+//      terminal at all -- in both cases busy/turn state would leak.
+//   2. closeConversation -- the backend's own release (zcode: session/close
+//      on the runtime; codex: deliberate no-op; mock: clears any still-
+//      pending streaming timers, same rule as its cancel()).
+//   3. The bridge-side maps are dropped so nothing routes to the released
+//      session id again. The store entry keeps its sessionId: zcode sessions
+//      resume, so a closed topic's next message starts a fresh conversation
+//      (getOrCreateSession's closed-entry path) instead of touching this one.
+// Errors on one path never stop the others: a close must close.
+async function releaseSessionForKey(key, { killEverything = true, strandWhy = 'this conversation was closed, so its running turn was CANCELLED -- no reply is coming; create a new session and send again' } = {}) {
+  const sessionId = store.getTopic(key)?.sessionId;
+  if (!sessionId) return;
+  const wasBusy = busySessions.has(sessionId);
+  if (wasBusy) {
+    console.log(`[bridge] topic ${key}: releasing busy session ${sessionId} -- interrupting in-flight turn`);
+    await interruptTurn(sessionId, { killEverything });
+    busySessions.delete(sessionId);
+    const turn = activeTurns.get(sessionId);
+    activeTurns.delete(sessionId);
+    turn?.streamer?.stop();
+    turn?.progress?.stop();
+  }
+  await backendForSession(sessionId).closeConversation(sessionId).catch((e) => console.error(`[bridge] topic ${key}: closing session ${sessionId}: ${e.message}`));
+  subscribedSessions.delete(sessionId);
+  sessionToTopic.delete(sessionId);
+  // A caller parked on message_send(wait) gets an explicit reason instead of
+  // the turn's terminal (the maps above are gone, so finalizeTurn can no
+  // longer noteReply) -- or, in the race where the reply landed first,
+  // nothing: already-resolved waiters have nothing to fail.
+  if (wasBusy) {
+    stranded(key, strandWhy);
+  }
+}
+
+// The terminal form of a close, shared by MCP session_close (and any future
+// Telegram-surface close that is not the relay's /close -- that verb is the
+// RELAY's, which tears the topic down upstream and tells this bridge via the
+// forum_topic_deleted handler): release the process (above) and mark the key
+// closed. In MCP-only mode there is no topic to close -- the session itself
+// is the whole lifecycle, and marking it closed is what replies_get and
+// message_send key off.
+async function closeSessionForKey(key) {
+  const t = store.getTopic(key) ?? {};
+  await releaseSessionForKey(key);
+  if (telegramEnabled()) await tg.closeForumTopic({ chatId: chatOf(key), messageThreadId: Number(t.threadId) }).catch(() => {});
+  store.setTopic(key, { closed: true });
 }
 
 // --- Telegram message handling ---
@@ -2298,12 +2365,19 @@ function handleMyChatMember(m) {
 // is wrong, and closing a session is the one act we do not take on a
 // maybe-hostile maybe-nothing.
 //
-// What it does is the MCP session_close path MINUS the Telegram half:
+// What it does is the MCP session_close path MINUS the Telegram half, through
+// the shared releaseSessionForKey (ported from ztg-status b0ef7a8):
 //   - any in-flight turn for the topic is stopped cleanly (the turn's
 //     session is cancelled; background tasks keep running so their
 //     completion notifications still land -- the circuit-breaker rule,
 //     since killing them would orphan exactly the work the model was
-//     waiting on);
+//     waiting on; hence killEverything: false, where session_close's
+//     terminal close is the hard-stop form);
+//   - the session's process is released -- the backend's closeConversation
+//     runs and the bridge maps are dropped, so a closed topic's session is
+//     genuinely gone, not merely unmarked (the release this handler predated:
+//     it used to interrupt the turn and stop there, leaving the session
+//     subscribed and never closed on the backend);
 //   - queued messages are dropped and their parked MCP callers told why;
 //   - the store entry is marked closed, which messageSend then refuses;
 //   - and closeForumTopic is NOT called: the topic is no longer ours (it is
@@ -2334,21 +2408,13 @@ async function handleRelayTopicDeleted(message) {
   // Stop the in-flight turn FIRST, so its streamer/progress views cannot
   // fire another edit into a topic that is leaving, and so the turn's own
   // terminal (if the cancel races one) finalizes into a topic entry that is
-  // already closed rather than re-busying it.
-  const sessionId = entry.sessionId;
-  if (sessionId && activeTurns.has(sessionId)) {
-    const turn = activeTurns.get(sessionId);
-    console.log(`[bridge] forum_topic_deleted: interrupting in-flight turn on session ${sessionId}`);
-    await interruptTurn(sessionId, { killEverything: false });
-    busySessions.delete(sessionId);
-    activeTurns.delete(sessionId);
-    turn.streamer?.stop();
-    turn.progress?.stop();
-    // The session is finished; drop the mapping so a straggler turn.started
-    // on it can never be adopted into a ghost turn for a topic we no longer
-    // serve (adoptUnclaimedTurn keys off this map).
-    sessionToTopic.delete(sessionId);
-  }
+  // already closed rather than re-busying it -- then closeConversation and
+  // the map drops, so the session's process is genuinely released (see
+  // releaseSessionForKey; the relay shape keeps its gentler interrupt).
+  await releaseSessionForKey(threadId, {
+    killEverything: false,
+    strandWhy: 'the topic was deleted or re-bound to another agent while a turn was running, so the turn was CANCELLED -- no reply is coming',
+  });
   // Queued prompts would otherwise drain straight into a fresh session after
   // a re-bind -- a message the user sent to the OLD conversation must not run
   // on a new one. Parked MCP waiters are told why their reply never comes.
@@ -3020,12 +3086,14 @@ async function main() {
         return { key, chat_id: chatId, thread_id: threadId, model: entry.model, backend, auto_picked: autoPicked };
       },
       sessionClose: async (key) => {
-        const t = store.getTopic(key) ?? {};
-        // MCP-only: there is no topic to close -- the session itself is the
-        // whole lifecycle, and marking it closed is what replies_get and
-        // message_send key off.
-        if (telegramEnabled()) await tg.closeForumTopic({ chatId: chatOf(key), messageThreadId: Number(t.threadId) }).catch(() => {});
-        store.setTopic(key, { closed: true });
+        // The point is the PROCESS (ported from ztg-status b0ef7a8): release
+        // the session -- cancel a mid-turn turn (the cancel is the verdict;
+        // its parked caller is failed with that reason, not left to time
+        // out), run the backend's closeConversation, free the bridge maps --
+        // without which the session outlived the close on every backend.
+        // Closing the Telegram topic and marking the key closed are the
+        // visible half.
+        await closeSessionForKey(key);
         return { ok: true };
       },
       messageSend: async (key, text, wait) => {

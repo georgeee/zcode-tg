@@ -39,11 +39,23 @@
 //     bridge (never listed, constructed, or resolved to), mock-default
 //     bridges see themselves, a named list is honored wholesale, unknown
 //     names refuse to boot.
+// 11. (scenario11, above) mock-default streaming: MOCK_STREAM_CHUNKS drives
+//     the real preview machinery with no zcode anything.
+// 12. CLOSE-AS-RELEASE (ported 2026-09-25 from ztg-status b0ef7a8): MCP
+//     session_close on a BUSY session cancels the turn -- the parked
+//     message_send(wait) caller is failed with the cancel verdict instead of
+//     sitting out its wait -- then runs the backend's release: session/stop
+//     then session/close on the runtime, carrying the raw id, read off the
+//     fixture's request log. This branch has no antigravity cap to wedge,
+//     so "the slot freed" is asserted in its honest local form: the release
+//     is surgical -- a new session_create SUCCEEDS on the same runtime right
+//     after -- and the closed key stays closed (message_send and progress_get
+//     both refuse it). MCP-only boot: no Telegram at all.
 //
 // Drive: node test/e2e-backend-lifecycle.mjs
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 
@@ -1026,12 +1038,108 @@ async function scenario11() {
   }
 }
 
+// --- scenario 12: session_close RELEASES the session (ported 2026-09-25
+// from ztg-status b0ef7a8, reshaped for this branch). There the measured
+// finding was a cap wedge: session_close only closed the Telegram topic, so
+// busy antigravity children kept their AGY_MAX_PROCS slots and a new create
+// was refused forever, naming closed keys. This branch has no antigravity
+// backend -- no cap -- but the same close-shaped hole: session_close marked
+// the store entry and never touched the session, so a mid-turn close
+// cancelled nothing (its parked message_send(wait) caller sat out the full
+// wait) and the runtime never heard of the close at all. Here: MCP-only
+// boot, zcode fixture, one 30s scripted turn, session_close mid-turn -- the
+// parked caller must be failed with the cancel verdict, the request log must
+// show session/stop then session/close carrying the raw id, a new
+// session_create must succeed on the same runtime, and the closed key must
+// stay closed. ---
+async function scenario12() {
+  console.log('\n--- scenario 12: session_close on a BUSY session cancels the turn and releases the session ---');
+  const sock = path.join(TMP, 's12', 'mcp.sock');
+  const reqLog = path.join(TMP, 's12-zcode-requests.jsonl');
+  const turnScript = path.join(TMP, 's12-turn-script.json');
+  // The turn outlives the scenario: only the close can end it.
+  writeFileSync(turnScript, JSON.stringify({ deltas: ['close', '-as', '-release'], deltaDelayMs: 150, terminalDelayMs: 30000 }));
+  const b = startBridge(
+    {
+      TELEGRAM_BOT_TOKEN: '', // MCP-only: no Telegram transport, so the close has no topic half -- the release IS the whole close
+      DEFAULT_BACKEND: 'zcode',
+      ZCODE_NODE_BIN: NODE,
+      ZCODE_BIN: ZCODE_FIXTURE,
+      ZCODE_WORKSPACE_DIR: TMP,
+      FIXTURE_ZCODE_LOG: reqLog,
+      FIXTURE_ZCODE_TURN_SCRIPT: turnScript,
+      STORE_PATH: path.join(TMP, 's12-store.json'),
+      MCP_UNIX_SOCKET: sock,
+    },
+    's12',
+  );
+  try {
+    await waitFor(() => b.log.includes('MCP-only'), 15000, 'MCP-only boot notice');
+    await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, 'mcp unix socket bind');
+    let id = 100;
+    const call = (name, args) => unixJsonRpc(sock, [{ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } }]).then((ls) => ls[0]);
+
+    const created = await call('session_create', { name: 's12-busy' });
+    const createdOk = created?.result?.isError === false;
+    check('(a) session_create completes', createdOk, JSON.stringify(created).slice(0, 400));
+    const key = createdOk ? JSON.parse(created.result.content[0].text).key : null;
+
+    // The BUSY half: a wait:true send parks an MCP caller for the turn's
+    // reply; the scripted turn runs 30s, so only the close can end either.
+    const parked = unixJsonRpc(sock, [{ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name: 'message_send', arguments: { key, text: 'a turn only the close can end', wait: true } } }]);
+    await waitFor(() => existsSync(reqLog) && readFileSync(reqLog, 'utf8').includes('session/send'), 15000, 'the turn to be dispatched to the runtime');
+    const progress = await call('progress_get', { key });
+    const progressText = progress?.result?.isError === false ? JSON.parse(progress.result.content[0].text) : {};
+    check('(a) the turn is BUSY mid-flight', progressText.active === true, JSON.stringify(progress).slice(0, 300));
+
+    // THE FIX over MCP: session_close cancels the mid-turn turn (the parked
+    // caller gets the verdict, not a timeout) and releases the session.
+    const closed = await call('session_close', { key });
+    check('(b) session_close answers ok', closed?.result?.isError === false, JSON.stringify(closed).slice(0, 300));
+    const parkedResp = (await Promise.race([parked, sleep(20_000).then(() => null)]))?.[0];
+    const parkedText = parkedResp?.result?.content?.[0]?.text || '';
+    check(
+      '(b) the parked message_send(wait) caller was failed with the cancel verdict',
+      parkedResp && parkedResp.result?.isError === true && /CANCELLED|closed/i.test(parkedText),
+      parkedResp ? JSON.stringify(parkedResp).slice(0, 300) : 'the caller was still parked 20s after the close',
+    );
+
+    // The release, on the fixture's request log: session/stop (the cancel)
+    // then session/close, carrying the raw session id.
+    const reqs = () => (existsSync(reqLog) ? readFileSync(reqLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+    const logReqs = await waitFor(() => (reqs().some((r) => r.method === 'session/close') ? reqs() : null), 10_000, 'the session/close request to reach the runtime');
+    const stopIdx = logReqs.findIndex((r) => r.method === 'session/stop');
+    const closeIdx = logReqs.findIndex((r) => r.method === 'session/close');
+    check('(b) the release cancelled the turn then closed the session, in that order', stopIdx >= 0 && closeIdx > stopIdx, `requests: ${JSON.stringify(logReqs.map((r) => r.method))}`);
+    check('(b) the close carries the raw session id', logReqs[closeIdx]?.params?.sessionId === 'fake-z-1', JSON.stringify(logReqs[closeIdx]));
+
+    // The release is surgical: the same runtime serves a brand-new session
+    // right after (the upstream scenario asserted this as "the cap was
+    // freed"; here there is no cap, so it asserts the runtime was not
+    // merely killed to free the session).
+    const second = await call('session_create', { name: 's12-after-close' });
+    check('(c) after session_close a new session_create SUCCEEDS on the same runtime', second?.result?.isError === false, JSON.stringify(second).slice(0, 400));
+
+    // The closed key stays terminal: no prompt or progress peek can
+    // resurrect it. (This branch's getOrCreateSession deliberately answers
+    // a closed topic's TELEGRAM prompt with a fresh conversation -- the MCP
+    // surface refuses.)
+    const after = await call('message_send', { key, text: 'anyone there?', wait: false });
+    check('(c) message_send to the closed key is refused', after?.result?.isError === true && /is closed/.test(after.result.content?.[0]?.text || ''), JSON.stringify(after).slice(0, 300));
+    const prog = await call('progress_get', { key });
+    check('(c) progress_get on the closed key refuses', prog?.result?.isError === true && /is closed/.test(prog.result.content?.[0]?.text || ''), JSON.stringify(prog).slice(0, 300));
+  } finally {
+    b.proc.kill('SIGKILL');
+    await sleep(300);
+  }
+}
+
 // EACH SCENARIO REPORTS ITS OWN FAILURE, so one scenario's throw (which is
 // how a bridge that dies at boot usually surfaces -- a waitFor timeout)
 // doesn't silently skip the scenarios after it: on the :546 boot-crash
 // this file exists to catch, EVERY non-zcode-default scenario is red, and
 // the run must say so rather than stop at the first.
-for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11]) {
+for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11, scenario12]) {
     try {
       await s();
     } catch (e) {
