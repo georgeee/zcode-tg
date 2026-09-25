@@ -72,6 +72,7 @@ import { readZaiApiKey, readZaiProvider, fetchUsage, usageSnapshotOrThrow, codex
 import { runtimePreferences } from './runtimePrefs.js';
 import { mergeModelLists, resolveModelRef } from './modelref.js';
 import { parseCommandText, commandIsOurs, proxiedBackendSwitchRefusal } from './commands.js';
+import { createTopicStatusTracker } from './topicStatus.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
 // a session running in this same directory could read that file as part of
@@ -1407,7 +1408,19 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
 //     bottom of the chat; that's the failure mode this reshape fixed).
 //   - message older than Telegram's 48h bot-edit window -> replaced (old
 //     deleted, new posted + pinned + id re-stored) so exactly one exists.
-const topicStatus = new Map(); // threadId -> { messageId, pinned, gone }
+// The machine itself (map, send/edit/pin, recreate, and the per-topic
+// serialization that keeps racing callers -- topic creation, the turn's
+// busy/idle, the queue refresh -- from posting a second pinned line) lives
+// in bridge/topicStatus.js; this side only decides WHAT the line says and
+// WHEN to refresh it.
+const topicStatus = createTopicStatusTracker({
+  tg,
+  // Dereferenced at call time: chatOf/threadOf are defined further down,
+  // and these only run once the bridge is up and handling updates.
+  chatOf: (key) => chatOf(key),
+  threadOf: (key) => threadOf(key),
+  persist: (key, messageId) => store.setTopic(key, { statusMessageId: messageId }),
+});
 
 // The quota endpoint's last-known response, shared by the status line's
 // percentages AND the MCP usage_get tool a supervisor model may poll before
@@ -1555,22 +1568,6 @@ function topicStatusText(threadId, state) {
   });
 }
 
-async function tryPinTopicStatus(threadId, st) {
-  if (!st?.messageId || st.pinned) return;
-  try {
-    await tg.pinChatMessage({ chatId: chatOf(threadId), messageId: st.messageId });
-    st.pinned = true;
-  } catch (e) {
-    // Usually "not enough rights" -- the bot needs admin can_pin_messages.
-    // Warn once, keep retrying on later state changes (pinChatMessage on an
-    // already-pinned message is idempotent once it succeeds).
-    if (!tryPinTopicStatus.warned) {
-      tryPinTopicStatus.warned = true;
-      console.error(`[bridge] pinChatMessage failed (${e.message}); will keep retrying -- grant the bot admin pin rights to pin the per-topic status`);
-    }
-  }
-}
-
 // Queue-depth changes are status changes too (owner-observed gap
 // 2026-09-01: queueing a message never touched the 📌 line, so `queued: N`
 // stayed stale from the last turn boundary -- and with the idle-write skip
@@ -1581,6 +1578,11 @@ function refreshTopicStatusForQueue(threadId) {
   updateTopicStatus(threadId, sid && busySessions.has(sid) ? 'busy' : 'idle').catch(() => {});
 }
 
+// Thin wrapper: the existence check and the usage-cache warm happen at
+// REQUEST time, once per requested update, as before -- the send/edit/pin
+// itself runs on the tracker's per-topic chain, so concurrent callers queue
+// instead of each posting their own status message (the why is in
+// bridge/topicStatus.js).
 async function updateTopicStatus(threadId, state) {
   // MCP-only: the pinned status line and its pin machinery are chat
   // furniture -- every caller's write is skipped here, at the one place all
@@ -1589,59 +1591,15 @@ async function updateTopicStatus(threadId, state) {
   const entry = store.getTopic(threadId);
   if (!entry) return; // topic never used (no store entry) -- nothing to report
   refreshUsagePercentages(); // fire-and-forget; this write uses the last cache
-  const text = topicStatusText(threadId, state);
-  let st = topicStatus.get(threadId);
-  if (st?.gone) return;
-  if (st?.messageId) {
-    let keep = true;
-    try {
-      await tg.editMessageText({ chatId: chatOf(threadId), messageId: st.messageId, text });
-    } catch (e) {
-      const m = e.message || '';
-      if (/message to edit not found|MESSAGE_ID_INVALID/i.test(m)) {
-        st.gone = true; // deleted (most likely deliberately) -- let it go
-        return;
-      }
-      if (/message is not modified/i.test(m)) {
-        // Two consecutive writes with identical content (e.g. /model then
-        // /mode while idle). Not an error -- but treating it as one (the old
-        // behavior) logged noise on every no-op write AND skipped the pin
-        // retry below. Fall through to tryPinTopicStatus like a success.
-      } else if (/can't be edited|too old/i.test(m)) {
-        // Aged past the 48h edit window: replace, keeping exactly one.
-        await tg.deleteMessage({ chatId: chatOf(threadId), messageId: st.messageId }).catch(() => {});
-        topicStatus.delete(threadId);
-        st = undefined;
-        keep = false;
-      } else {
-        console.error('[bridge] failed to update topic status:', m);
-        return;
-      }
-    }
-    if (keep && st) {
-      await tryPinTopicStatus(threadId, st);
-      return;
-    }
-  }
-  st = { messageId: null, pinned: false, gone: false };
-  topicStatus.set(threadId, st);
-  try {
-    const msg = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text });
-    st.messageId = msg.message_id;
-    store.setTopic(threadId, { statusMessageId: msg.message_id });
-    await tryPinTopicStatus(threadId, st);
-  } catch (e) {
-    topicStatus.delete(threadId);
-    console.error('[bridge] failed to post topic status:', e.message);
-  }
+  return topicStatus.update(threadId, () => topicStatusText(threadId, state));
 }
 
-// Re-adopt status message ids persisted by a previous process (the map above
-// is in-memory) so a restart keeps editing the same message instead of
+// Re-adopt status message ids persisted by a previous process (the tracker's
+// map is in-memory) so a restart keeps editing the same message instead of
 // posting a second one.
 function restoreTopicStatuses() {
   for (const [threadId, entry] of Object.entries(store.data.topics)) {
-    if (entry.statusMessageId) topicStatus.set(threadId, { messageId: entry.statusMessageId, pinned: false, gone: false });
+    if (entry.statusMessageId) topicStatus.adopt(threadId, entry.statusMessageId);
   }
 }
 
