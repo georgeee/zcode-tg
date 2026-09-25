@@ -152,6 +152,12 @@ const cfg = {
   agyBin: process.env.AGY_BIN || 'agy',
   agyHome: process.env.AGY_HOME || '',
   agyEffort: process.env.AGY_EFFORT || 'medium',
+  // agy's PRIVATE working directory -- never the workspace, which the
+  // executor writes and agy would read project config from (see
+  // antigravityClient.js). Made 0700 at spawn; empty = the default,
+  // <AGY_HOME's parent>/.local/state/agent-cage/agy-bridge/cwd
+  // (defaultAgyBridgeCwd).
+  agyBridgeCwd: process.env.AGY_BRIDGE_CWD || '',
   // THE AGY PROCESS GC (2026-09-24). agy's stream-json mode runs one
   // process per conversation with no multiplexing, and an idle child costs
   // 93-181 MB anon RSS -- before the GC, children of finished sessions were
@@ -419,6 +425,7 @@ const BACKEND_FACTORIES = {
       agyBin: cfg.agyBin,
       agyHome: cfg.agyHome,
       cwd: cfg.workspaceDir,
+      privateCwd: cfg.agyBridgeCwd || null,
       effort: cfg.agyEffort,
       autoApprovePermissions: cfg.autoApprovePermissions,
       // The GC knobs (see cfg above): minutes -> ms, 0 meaning disabled

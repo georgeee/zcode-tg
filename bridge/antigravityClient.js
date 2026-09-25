@@ -47,8 +47,103 @@
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { StringDecoder } from 'node:string_decoder';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+
+// --- agy's PRIVATE working directory ---
+//
+// agy never runs with the workspace as its cwd. The workspace is the one
+// directory the EXECUTOR writes, and agy -- running as the agent, the account
+// that holds the credential -- treats project configuration it finds in an
+// attached directory as its own: measured on 1.2.9 with --add-dir, it reads
+// .agents/ (.agent/, _agents/, _agent/) mcp_config.json, hooks.json and
+// plugins, GEMINI.md, AGENTS.md and .gemini/config.json there, and execs
+// the MCP servers listed directly as the agent. Print/stream-json mode with
+// cwd = workspace and no --add-dir opened nothing in cwd, but whether a
+// dashboard-driven turn on a --remote-control instance (every bridge
+// session is one) treats its cwd as a project is UNMEASURED. So the cwd is
+// a directory of the agent's own: 0700, outside the workspace, and checked
+// for exactly those names before every turn and every spawn (the backend's
+// pre-turn gate).
+//
+// The model still works in the workspace: its tool commands go through the
+// executor shim, whose frame carries CAGE_WORKSPACE (set per spawn below);
+// the broker cannot enter this 0700 agent directory and falls back to that
+// workspace. The model is told where its workspace is on the first turn
+// each child receives (workspaceNote), because agy's own idea of "where am
+// I" is now this private directory.
+
+// The project-config names agy reads from a directory it treats as a
+// project (measured, agy 1.2.9). Any of them present in the private cwd is
+// a gate violation -- whatever its content: none of them has an inert form
+// worth parsing for.
+export const AGY_PROJECT_CONFIG_NAMES = ['.agents', '.agent', '_agents', '_agent', 'GEMINI.md', 'AGENTS.md', path.join('.gemini', 'config.json')];
+
+// The default private cwd, beside the agy HOME: <AGY_HOME's parent>/.local/
+// state/agent-cage/agy-bridge/cwd. agent-cage puts AGY_HOME at <home>/.agy,
+// so this is <home>/.local/state/agent-cage/agy-bridge/cwd -- the bridge
+// twin of the remote-control daemon's agy-remote/cwd. AGY_BRIDGE_CWD
+// overrides it (agent-cage renders it explicitly).
+export function defaultAgyBridgeCwd(agyHome) {
+  return path.join(path.dirname(path.resolve(agyHome)), '.local', 'state', 'agent-cage', 'agy-bridge', 'cwd');
+}
+
+// Makes the private cwd if it is missing (0700) and proves it is private:
+// a real directory (not a symlink), owned by this process's uid, with no
+// group or other permission bits -- the executor must neither write it nor
+// enter it (an enterable cwd would also stop the broker's workspace
+// fallback). Throws, with the reason, when any of that fails: the caller
+// refuses to spawn.
+export function ensurePrivateCwd(dir) {
+  const refuse = (why) => new Error(`antigravity: refusing to start agy: its private working directory ${dir || '(unset)'} ${why}`);
+  if (!dir || !path.isAbsolute(dir)) throw refuse('is not an absolute path (AGY_BRIDGE_CWD)');
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    throw refuse(`could not be made: ${err.message}`);
+  }
+  let st;
+  try {
+    st = lstatSync(dir);
+  } catch (err) {
+    throw refuse(`cannot be inspected: ${err.message}`);
+  }
+  if (!st.isDirectory()) throw refuse('is not a directory (a symlink or a file stands there)');
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) throw refuse(`is owned by uid ${st.uid}, not this account (${process.getuid()})`);
+  if (st.mode & 0o077) throw refuse(`is mode 0${(st.mode & 0o777).toString(8)}; it must be 0700`);
+  return dir;
+}
+
+// The first project-config path present in dir, or null. lstat, so a
+// dangling symlink counts as present. Anything but "provably absent"
+// (ENOENT, or ENOTDIR under a .gemini that is a file) is a violation.
+export function projectConfigIn(dir) {
+  if (!dir) return null;
+  for (const name of AGY_PROJECT_CONFIG_NAMES) {
+    const p = path.join(dir, name);
+    try {
+      lstatSync(p);
+      return p;
+    } catch (err) {
+      if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') return p;
+    }
+  }
+  return null;
+}
+
+// The workspace note, prepended to the first user turn each agy child
+// receives: agy's working directory is the private one above, so without it
+// the model's idea of its workspace would be an empty directory the
+// executor cannot see. Once per child, not once per conversation: a
+// respawn-resumed conversation may predate the private cwd, and agy
+// describes the cwd afresh to each process.
+export function workspaceNote(workspaceDir, cwd) {
+  return (
+    `[bridge] Your workspace is ${workspaceDir}. Shell commands already run there. ` +
+    `Your process's own working directory (${cwd}) is a private, empty directory and not the workspace: ` +
+    `read and write files under ${workspaceDir}, by absolute path.\n\n`
+  );
+}
 
 // Owner-mandated headless settings for every agy HOME this backend manages
 // (owner decisions 2026-09-24, design doc §5/§13): auto mode (matching the
@@ -102,11 +197,12 @@ export function ensureAgySettings(agyHome, defaults = AGY_SETTINGS_DEFAULTS) {
 export const AGY_DELIVERY_FAILED = 'agy exited before the message could be delivered — retry';
 
 export class AntigravityClient extends EventEmitter {
-  constructor({ agyBin, agyHome, cwd, model, effort, remoteControl = true, skipPermissions = true, env = {} }) {
+  constructor({ agyBin, agyHome, cwd, workspaceDir = null, model, effort, remoteControl = true, skipPermissions = true, env = {} }) {
     super();
     this.agyBin = agyBin; // 'agy' (resolved on PATH) or an absolute path
     this.agyHome = agyHome; // HOME for the child -- holds the OAuth token file
-    this.cwd = cwd; // the workspace the session runs in
+    this.cwd = cwd; // agy's PRIVATE working directory -- never the workspace (see AGY_PROJECT_CONFIG_NAMES's block)
+    this.workspaceDir = workspaceDir; // the workspace the model works in -- CAGE_WORKSPACE for the executor shim
     this.model = model; // the BARE slug (e.g. 'gemini-3.8-flash'); effort travels separately
     this.effort = effort; // 'low' | 'medium' | 'high' -- always paired with the bare slug
     this.remoteControl = remoteControl;
@@ -129,14 +225,20 @@ export class AntigravityClient extends EventEmitter {
   // The exact argv, factored out so tests (and reviewers) can pin it without
   // spawning anything. Order follows the working research drivers verbatim.
   //
-  // SECURITY INVARIANT: never `--add-dir` (nor any other flag attaching the
-  // workspace as a project). Measured on agy 1.2.9 under strace: with the
-  // workspace attached, agy reads .agents/ (.agent/, _agents/, _agent/)
-  // mcp_config.json, hooks.json, plugins -- and execs the MCP servers listed
-  // there DIRECTLY, as this (the agent) account, bypassing the executor
-  // shim. The workspace is executor-writable, so attaching it hands the
-  // executor code execution as the account that holds the credential. With
-  // cwd = workspace and no --add-dir, agy opens nothing in cwd.
+  // SECURITY INVARIANT: the workspace is never agy's project -- neither
+  // attached (`--add-dir`, or any other flag naming it) nor its cwd.
+  // Measured on agy 1.2.9 under strace: with the workspace attached, agy
+  // reads .agents/ (.agent/, _agents/, _agent/) mcp_config.json, hooks.json,
+  // plugins, GEMINI.md, AGENTS.md and .gemini/config.json -- and execs the
+  // MCP servers listed there DIRECTLY, as this (the agent) account,
+  // bypassing the executor shim. The workspace is executor-writable, so
+  // attaching it hands the executor code execution as the account that
+  // holds the credential. With cwd = workspace and no --add-dir, print mode
+  // opened nothing in cwd -- but a --remote-control session's
+  // dashboard-driven turns are unmeasured, so the cwd is agy's own private
+  // 0700 directory (this.cwd; ensurePrivateCwd/projectConfigIn above, and
+  // the backend's pre-turn gate) and the workspace reaches the model only
+  // as CAGE_WORKSPACE and the workspace note.
   buildArgv(conversationId) {
     // FROM DOCS: stream-json input REQUIRES stream-json output (agy refuses
     // the combination otherwise -- --input-format's help text says so).
@@ -160,6 +262,11 @@ export class AntigravityClient extends EventEmitter {
       env: {
         ...process.env,
         ...this.env,
+        // Where the model's commands land: the executor shim sends this in
+        // every frame, and the broker -- unable to enter the private cwd --
+        // falls back to it. The SESSION's workspace, spelled per spawn, not
+        // whatever the bridge process happened to inherit.
+        ...(this.workspaceDir ? { CAGE_WORKSPACE: this.workspaceDir } : {}),
         // The credential (OAuth token file) lives under this HOME -- read by
         // the agy subprocess itself at its point of use, never by this
         // process. Never logged.

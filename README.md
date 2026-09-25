@@ -502,6 +502,22 @@ with a review-before-continuing message plus a loud warn and a
 `quarantine path=… key=…` log line. Every session of the same AGY_HOME
 shares the file, and each of their turns runs the same check.
 
+**agy's private working directory.** agy never runs with the workspace as
+its cwd: the workspace is the directory the executor writes, and agy reads
+project config (`.agents/`, `.agent/`, `_agents/`, `_agent/`, `GEMINI.md`,
+`AGENTS.md`, `.gemini/config.json`) from a project directory and execs the
+MCP servers it names as the agent account. Every agy child runs in
+`AGY_BRIDGE_CWD` instead — default
+`<AGY_HOME's parent>/.local/state/agent-cage/agy-bridge/cwd` — made 0700 at
+spawn; a directory that cannot be made, is not a real directory, is not
+this account's, or carries any group/other bit refuses the spawn. The
+pre-turn gate above checks it too: any of those names in it is quarantined
+the same way. The model still works in the workspace: each child gets
+`CAGE_WORKSPACE=<session workspace>`, which the executor shim sends and the
+broker falls back to (it cannot enter the private directory), and the
+first turn each child receives starts with a one-line `[bridge] Your
+workspace is …` note. `--add-dir` is never passed.
+
 **Telegram is not needed.** A deployment can run this backend MCP-only: set
 `MCP_UNIX_SOCKET` (or `MCP_HTTP_PORT`) and the antigravity config below but
 no `TELEGRAM_*` at all, and the bridge boots with a stub Telegram client —
@@ -541,6 +557,8 @@ codex):
   mutation) and `agy update` (self-update outside nix) must never be run.
 - `AGY_EFFORT` — the default effort for new sessions: `low`, `medium`
   (default) or `high`.
+- `AGY_BRIDGE_CWD` — agy's private working directory (see above); default
+  `<AGY_HOME's parent>/.local/state/agent-cage/agy-bridge/cwd`.
 
 Process GC (2026-09-24). agy's stream-json mode has no multiplexing: every
 session IS a process, an idle one costs 93–181 MB of anonymous RSS, and

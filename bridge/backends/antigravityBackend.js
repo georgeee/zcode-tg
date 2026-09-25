@@ -26,7 +26,15 @@ import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, renameSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { Backend, makeSessionId, rawSessionId } from '../backend.js';
-import { AntigravityClient, AGY_SETTINGS_DEFAULTS, ensureAgySettings } from '../antigravityClient.js';
+import {
+  AntigravityClient,
+  AGY_SETTINGS_DEFAULTS,
+  defaultAgyBridgeCwd,
+  ensureAgySettings,
+  ensurePrivateCwd,
+  projectConfigIn,
+  workspaceNote,
+} from '../antigravityClient.js';
 import { ConversationWatcher, conversationDbPath } from '../conversationStore.js';
 import { readProcRssBytes } from '../agyProcesses.js';
 
@@ -85,6 +93,15 @@ function statusOf(result) {
 // review-before-continuing message. Every session of this AGY_HOME shares
 // the file, so each of their turns runs the check (see sendMessage and
 // _spawn).
+//
+// THE SECOND HALF: agy's PRIVATE cwd (privateCwd, AGY_BRIDGE_CWD). agy never
+// runs in the workspace (antigravityClient.js's block at
+// AGY_PROJECT_CONFIG_NAMES), but its own cwd is agent-writable -- the model's
+// file tool can reach it -- and agy reads project config from a project
+// directory. So the same gate requires that cwd to hold none of
+// AGY_PROJECT_CONFIG_NAMES (.agents, .agent, _agents, _agent, GEMINI.md,
+// AGENTS.md, .gemini/config.json), with the same quarantine, stop and
+// failed turn on a violation.
 
 // Does this file content declare MCP servers or plugins? Only provably
 // inert shapes pass: an object whose server/plugin keys are absent, null,
@@ -108,11 +125,14 @@ function declaresServersOrPlugins(text) {
 }
 
 export class AntigravityBackend extends Backend {
-  constructor({ agyBin, agyHome, cwd, effort = 'medium', autoApprovePermissions = true, remoteControl = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null }) {
+  constructor({ agyBin, agyHome, cwd, privateCwd = null, effort = 'medium', autoApprovePermissions = true, remoteControl = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null }) {
     super('antigravity');
     this.agyBin = agyBin;
     this.agyHome = agyHome;
     this.cwd = cwd; // default workspace; createConversation may pass its own
+    // agy's OWN working directory (never the workspace): made 0700 at each
+    // spawn, and checked by the pre-turn gate. AGY_BRIDGE_CWD in index.js.
+    this.privateCwd = privateCwd || defaultAgyBridgeCwd(agyHome);
     this.effort = effort;
     this.autoApprovePermissions = autoApprovePermissions;
     // Owner decision (2026-09-24): every session starts with --remote-control
@@ -382,8 +402,8 @@ export class AntigravityBackend extends Backend {
 
   // --- the pre-turn integrity gate (see the block comment at statusOf) ---
 
-  // Null when the AGY_HOME config is provably inert; the violation to
-  // quarantine otherwise. Runs before every turn delivery and before every
+  // Null when the AGY_HOME config is provably inert and the private cwd
+  // holds no project config; the violation to quarantine otherwise. Runs before every turn delivery and before every
   // spawn/respawn. Every session of this AGY_HOME shares these files, so
   // each of their turns re-checks -- whoever turns first while the file is
   // dirty gets refused and quarantines it; the rest find it gone.
@@ -407,6 +427,9 @@ export class AntigravityBackend extends Backend {
       dirtyDir = true; // unreadable: not provably empty
     }
     if (dirtyDir) return { path: pluginsDir };
+    // The private cwd: any project-config name at all is a violation.
+    const project = projectConfigIn(this.privateCwd);
+    if (project) return { path: project, inCwd: true };
     return null;
   }
 
@@ -420,9 +443,10 @@ export class AntigravityBackend extends Backend {
     let target = `${violation.path}.quarantined-${stamp}`;
     for (let n = 2; existsSync(target); n += 1) target = `${violation.path}.quarantined-${stamp}-${n}`; // same-second re-quarantine never overwrites forensics
     renameSync(violation.path, target);
-    const message =
-      `antigravity: agy's config at ${violation.path} defines MCP servers/plugins (agy would run them as the agent account); ` +
-      `quarantined as ${target}, session stopped. Something in this session wrote it — review before continuing.`;
+    const what = violation.inCwd
+      ? `${violation.path} is project config in agy's private working directory (agy could read it and run what it names as the agent account)`
+      : `agy's config at ${violation.path} defines MCP servers/plugins (agy would run them as the agent account)`;
+    const message = `antigravity: ${what}; quarantined as ${target}, session stopped. Something in this session wrote it — review before continuing.`;
     this.emit('warn', message);
     this.emit('reap', `quarantine path=${violation.path} key=${key}`);
     return message;
@@ -454,20 +478,25 @@ export class AntigravityBackend extends Backend {
       return;
     }
     const session = await this._runningSession(sessionId);
+    // The first turn this CHILD receives carries the workspace note: agy's
+    // cwd is its private directory, so the note is how the model learns
+    // where its workspace is (antigravityClient.js, workspaceNote).
+    const delivered = session.turnSeq === 0 ? workspaceNote(session.workspaceDir, session.client.cwd) + text : text;
     const turnId = `${rawSessionId(sessionId)}:${++session.turnSeq}`;
     session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0 };
     session.turnStartedAt = Date.now();
     // The watcher's late-poll guard needs our recent stdin texts: a poll
     // landing after this turn finished would otherwise read its user row as
     // dashboard-origin (no turn in flight any more). Capped -- it is a
-    // membership set, not a transcript.
-    session.ownTurnTexts.add(text);
+    // membership set, not a transcript. The DELIVERED text: that is what
+    // agy journals.
+    session.ownTurnTexts.add(delivered);
     if (session.ownTurnTexts.size > 16) session.ownTurnTexts.delete(session.ownTurnTexts.values().next().value);
     // turn.started FIRST: index.js correlates a turn's events on the turnId
     // learned from this event, and adopts backend-initiated turns from it.
     this._emitTelemetry(makeSessionId('antigravity', rawSessionId(sessionId)), turnId, 'turn.started');
     try {
-      await session.client.sendUserTurn(text);
+      await session.client.sendUserTurn(delivered);
     } catch (err) {
       // The child died between the respawn check in _runningSession and the
       // write (crash, or a SIGTERM-cancel exit racing the next turn): the
@@ -476,7 +505,7 @@ export class AntigravityBackend extends Backend {
       // placeholder forever -- with the client's retryable delivery message.
       // The conversation survives; the next send respawn-resumes.
       session.turn = null;
-      session.ownTurnTexts.delete(text);
+      session.ownTurnTexts.delete(delivered);
       this._emitTelemetry(makeSessionId('antigravity', rawSessionId(sessionId)), turnId, 'turn.terminal', {
         status: 'failed',
         errorCode: err.message,
@@ -542,7 +571,7 @@ export class AntigravityBackend extends Backend {
     const rawId = rawSessionId(sessionId);
     const session = this._sessions.get(rawId);
     if (session && session.effort === parsed.effort) return;
-    const workspaceDir = session?.client.cwd ?? this.cwd;
+    const workspaceDir = session?.workspaceDir ?? this.cwd;
     if (session) {
       // Marked closing before the replacement spawns so the cap's live
       // count never sees the dying child; the entry is deleted because the
@@ -607,13 +636,19 @@ export class AntigravityBackend extends Backend {
     // message to createConversation / resumeConversation / setModel's
     // callers. The rename has already made the config clean, so a retry
     // after human review spawns normally.
+    //
+    // THE PRIVATE CWD first: made (0700) if missing, and proven private --
+    // an unmakeable, foreign-owned, symlinked or group/other-accessible one
+    // refuses the spawn outright. agy never falls back to the workspace.
+    ensurePrivateCwd(this.privateCwd);
     const violation = this._configViolation();
     if (violation) throw new Error(this._quarantine(violation, this._keyOf({ rawId: conversationId })));
     await this._admitNewChild();
     const client = new AntigravityClient({
       agyBin: this.agyBin,
       agyHome: this.agyHome,
-      cwd: workspaceDir,
+      cwd: this.privateCwd,
+      workspaceDir,
       model: AGY_MODEL_REF,
       effort,
       remoteControl: this.remoteControl,

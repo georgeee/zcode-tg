@@ -1035,6 +1035,8 @@ async function scenario11() {
     const spawn1 = JSON.parse(readFileSync(markerLog, 'utf8').trim().split('\n').at(-1));
     check('(b) the spawn contract: --remote-control AND --dangerously-skip-permissions on argv', spawn1.argv.includes('--remote-control') && spawn1.argv.includes('--dangerously-skip-permissions'), JSON.stringify(spawn1.argv));
     check('(b) the spawn contract: the child ran with HOME=AGY_HOME', spawn1.home === agyHome, spawn1.home);
+    // No AGY_BRIDGE_CWD here: the default beside the agy HOME, never the workspace (TMP).
+    check('(b) the spawn contract: agy ran in the default private cwd, not the workspace', spawn1.cwd === path.join(TMP, '.local', 'state', 'agent-cage', 'agy-bridge', 'cwd'), spawn1.cwd);
     check('(b) the spawn contract: bare slug + effort, no effort-suffixed slug', spawn1.argv[spawn1.argv.indexOf('--model') + 1] === 'gemini-3.8-flash' && spawn1.argv[spawn1.argv.indexOf('--effort') + 1] === 'medium', JSON.stringify(spawn1.argv));
 
     const mg = await call(4, 'model_get', { key });
@@ -1143,6 +1145,7 @@ async function scenario12() {
     AGY_IDLE_CLOSE_MIN: '0', // no reaper: only the close can release anything
     FIXTURE_AGY_SLOW_MS: '30000', // the turn outlives the scenario: only the close can end it
     FIXTURE_AGY_MARKER_LOG: markerLog,
+    AGY_BRIDGE_CWD: path.join(TMP, 's12-agy-private-cwd'), // the explicit form agent-cage renders
     STORE_PATH: path.join(TMP, 's12-store.json'),
     MCP_UNIX_SOCKET: sock,
   };
@@ -1160,7 +1163,9 @@ async function scenario12() {
     const busy = await call('message_send', { key, text: 'AGY-SLOW', wait: false });
     check('(a) the slow turn was accepted (queued:true)', busy?.result?.isError === false && JSON.parse(busy.result.content[0].text).queued === true, JSON.stringify(busy).slice(0, 300));
     await waitFor(() => existsSync(markerLog) && readFileSync(markerLog, 'utf8').trim().length > 0, 15000, 'the agy child to spawn');
-    const pid = JSON.parse(readFileSync(markerLog, 'utf8').trim().split('\n').at(-1)).pid;
+    const spawned = JSON.parse(readFileSync(markerLog, 'utf8').trim().split('\n').at(-1));
+    const pid = spawned.pid;
+    check('(a) agy ran in AGY_BRIDGE_CWD, not the workspace', spawned.cwd === baseEnv.AGY_BRIDGE_CWD, spawned.cwd);
     const pidAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
     check('(a) the child is alive mid-turn', pidAlive(), `pid ${pid}`);
 

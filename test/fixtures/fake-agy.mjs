@@ -20,7 +20,10 @@
 //                            written at startup -- the eager-start assertion
 //   FIXTURE_AGY_MARKER_LOG   JSONL, one line PER SPAWN -- argv assertions
 //                            across respawns (resume, effort changes)
-//   FIXTURE_AGY_LOG          JSONL, one line per received user turn
+//   FIXTURE_AGY_LOG          JSONL, one line per received user turn:
+//                            {text (the bridge's workspace note stripped),
+//                            delivered (verbatim), cwd, workspace
+//                            (CAGE_WORKSPACE)}
 //   FIXTURE_AGY_STATE        directory for per-conversation history (the
 //                            stand-in for agy's conversations/*.db -- this
 //                            is what makes --conversation resume actually
@@ -163,8 +166,14 @@ process.stdin.on('data', (chunk) => {
     let msg;
     try { msg = JSON.parse(line); } catch { continue; }
     if (msg.event === 'user' && msg.message?.content != null) {
-      if (process.env.FIXTURE_AGY_LOG) appendFileSync(process.env.FIXTURE_AGY_LOG, JSON.stringify({ at: Date.now(), conversation: conversationId, text: msg.message.content }) + '\n');
-      void runTurn(String(msg.message.content));
+      // The bridge's workspace note (antigravityClient.js workspaceNote)
+      // rides on the first turn each child receives. The fake answers the
+      // user's text: `text` is the turn without the note, `delivered` the
+      // exact content (tests assert the note from it).
+      const delivered = String(msg.message.content);
+      const text = delivered.replace(/^\[bridge\] Your workspace is [^\n]*\n\n/, '');
+      if (process.env.FIXTURE_AGY_LOG) appendFileSync(process.env.FIXTURE_AGY_LOG, JSON.stringify({ at: Date.now(), conversation: conversationId, text, delivered, cwd: process.cwd(), workspace: process.env.CAGE_WORKSPACE ?? null }) + '\n');
+      void runTurn(text);
     }
   }
 });

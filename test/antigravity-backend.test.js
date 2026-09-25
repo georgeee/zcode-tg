@@ -8,7 +8,7 @@
 // Run: node --test test/antigravity-backend.test.js
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -344,6 +344,145 @@ test('the integrity gate covers every session of the same AGY_HOME: the file is 
     await waitFor(() => session.client.exited, `the child of ${sessionId} to be stopped`);
   }
   await backend.stop();
+});
+
+// --- agy's private cwd: never the workspace ---
+
+test('the private cwd: agy runs in a 0700 agent directory, not the workspace; the workspace reaches it as CAGE_WORKSPACE and the first-turn note', async (t) => {
+  const dir = tmp('cwd');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const spawns = path.join(dir, 'spawns.jsonl');
+  const turnLog = path.join(dir, 'turns.jsonl');
+  process.env.FIXTURE_AGY_MARKER_LOG = spawns;
+  process.env.FIXTURE_AGY_LOG = turnLog;
+  t.after(() => { delete process.env.FIXTURE_AGY_MARKER_LOG; delete process.env.FIXTURE_AGY_LOG; });
+  const workspace = path.join(dir, 'workspace');
+  mkdirSync(workspace);
+  const privateCwd = path.join(dir, 'agent', 'agy-bridge', 'cwd'); // missing: the spawn makes it
+  const { backend, events } = makeBackend(dir, { cwd: workspace, privateCwd });
+  t.after(() => backend.stop());
+  const { sessionId } = await backend.createConversation({ workspaceDir: workspace });
+  const spawn = JSON.parse(readFileSync(spawns, 'utf8').trim().split('\n').at(-1));
+  assert.equal(spawn.cwd, privateCwd, 'the child ran in the private directory');
+  assert.notEqual(spawn.cwd, workspace);
+  assert.equal(statSync(privateCwd).mode & 0o777, 0o700, 'made 0700');
+  await runOneTurn(backend, events, sessionId, 'one');
+  await runOneTurn(backend, events, sessionId, 'two');
+  const [first, second] = readFileSync(turnLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(first.workspace, workspace, 'CAGE_WORKSPACE in the child is the session workspace (the broker fallback)');
+  assert.equal(first.cwd, privateCwd);
+  assert.ok(first.delivered.startsWith(`[bridge] Your workspace is ${workspace}.`), first.delivered);
+  assert.ok(first.delivered.endsWith('\n\none'));
+  assert.equal(second.delivered, 'two', 'the note rides on the first turn of each child only');
+  // setModel respawns: the workspace survives the respawn (not the child's cwd).
+  await backend.setModel(sessionId, 'gemini-3.8-flash:high');
+  await runOneTurn(backend, events, sessionId, 'three');
+  const third = readFileSync(turnLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).at(-1);
+  assert.equal(third.workspace, workspace);
+  assert.equal(third.cwd, privateCwd);
+  assert.ok(third.delivered.startsWith(`[bridge] Your workspace is ${workspace}.`), 'a respawned child is told again');
+  await backend.stop();
+});
+
+test('the private cwd in the pre-turn gate: a planted .agents/mcp_config.json refuses the next turn, is quarantined, the child stopped', async (t) => {
+  const dir = tmp('cwd-gate');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const turnLog = path.join(dir, 'turns.jsonl');
+  process.env.FIXTURE_AGY_LOG = turnLog;
+  t.after(() => { delete process.env.FIXTURE_AGY_LOG; });
+  const privateCwd = path.join(dir, 'private-cwd');
+  const { backend, events } = makeBackend(dir, { privateCwd });
+  t.after(() => backend.stop());
+  const warns = [];
+  backend.on('warn', (m) => warns.push(m));
+  const reapLines = [];
+  backend.on('reap', (line) => reapLines.push(line));
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  await runOneTurn(backend, events, sessionId, 'one');
+
+  // The model's in-process file tool (it runs as the agent) plants project
+  // config where agy would read it.
+  const agentsDir = path.join(privateCwd, '.agents');
+  mkdirSync(agentsDir);
+  writeFileSync(path.join(agentsDir, 'mcp_config.json'), JSON.stringify({ mcpServers: { evil: { command: 'sh' } } }));
+
+  const before = terminals(events).length;
+  await backend.sendMessage(sessionId, 'two'); // must NOT reach agy
+  const terminal = await waitFor(() => terminals(events).slice(before)[0], 'turn.terminal (refused)');
+  assert.equal(terminal.params.status, 'failed');
+  assert.match(terminal.params.errorCode, /\.agents is project config in agy's private working directory/);
+  assert.match(terminal.params.errorCode, /quarantined as .*\.agents\.quarantined-\d+/);
+  assert.match(terminal.params.errorCode, /review before continuing/);
+  assert.ok(!existsSync(agentsDir), 'the planted directory was renamed away');
+  assert.ok(readdirSync(privateCwd).some((n) => /^\.agents\.quarantined-\d+$/.test(n)), 'kept for forensics');
+  assert.ok(warns.some((w) => /private working directory/.test(w)));
+  assert.ok(reapLines.some((l) => /^quarantine path=.*\.agents key=antigravity:/.test(l)));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.doesNotMatch(readFileSync(turnLog, 'utf8'), /"text":"two"/);
+  const session = backend._sessions.get(sessionId.slice('antigravity:'.length));
+  await waitFor(() => session.client.exited, 'the session child to be stopped');
+  const next = await runOneTurn(backend, events, sessionId, 'three');
+  assert.equal(next.params.status, 'success');
+  await backend.stop();
+});
+
+test('the private cwd at spawn: every project-config name refuses a child, and is quarantined', async (t) => {
+  const dir = tmp('cwd-names');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const privateCwd = path.join(dir, 'private-cwd');
+  mkdirSync(privateCwd, { mode: 0o700 });
+  const { backend } = makeBackend(dir, { privateCwd });
+  t.after(() => backend.stop());
+  for (const name of ['.agents', '.agent', '_agents', '_agent', 'GEMINI.md', 'AGENTS.md', '.gemini/config.json']) {
+    mkdirSync(path.dirname(path.join(privateCwd, name)), { recursive: true });
+    writeFileSync(path.join(privateCwd, name), '{}'); // content is irrelevant: the name alone refuses
+    await assert.rejects(() => backend.createConversation({ workspaceDir: dir }), (err) => {
+      assert.match(err.message, /project config in agy's private working directory/, name);
+      assert.ok(err.message.includes(path.join(privateCwd, name)), `${name}: ${err.message}`);
+      return true;
+    });
+    assert.ok(!existsSync(path.join(privateCwd, name)), `${name} renamed away`);
+    assert.equal(backend.procSnapshot().live, 0, `${name}: no child was started`);
+  }
+  // Every name quarantined: the directory is clean again, creation works.
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  assert.match(sessionId, /^antigravity:/);
+  await backend.stop();
+});
+
+test('the private cwd at spawn: an unmakeable or non-private directory refuses to start agy', async (t) => {
+  const dir = tmp('cwd-refuse');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const spawns = path.join(dir, 'spawns.jsonl');
+  process.env.FIXTURE_AGY_MARKER_LOG = spawns;
+  t.after(() => { delete process.env.FIXTURE_AGY_MARKER_LOG; });
+  // Unmakeable: a regular file stands where a parent directory must go.
+  writeFileSync(path.join(dir, 'a-file'), '');
+  const cases = [
+    [path.join(dir, 'a-file', 'cwd'), /could not be made/],
+    ['relative/cwd', /not an absolute path/],
+  ];
+  // Group/other-accessible: the executor could enter (or write) it.
+  const open = path.join(dir, 'open');
+  mkdirSync(open);
+  chmodSync(open, 0o755);
+  cases.push([open, /is mode 0755; it must be 0700/]);
+  // A symlink, even to a private directory: lstat refuses it.
+  const real = path.join(dir, 'real');
+  mkdirSync(real, { mode: 0o700 });
+  symlinkSync(real, path.join(dir, 'link'));
+  cases.push([path.join(dir, 'link'), /is not a directory/]);
+  for (const [privateCwd, why] of cases) {
+    const { backend } = makeBackend(dir, { privateCwd });
+    await assert.rejects(() => backend.createConversation({ workspaceDir: dir }), (err) => {
+      assert.match(err.message, /refusing to start agy/);
+      assert.match(err.message, why);
+      return true;
+    });
+    assert.equal(backend.procSnapshot().live, 0);
+    await backend.stop();
+  }
+  assert.ok(!existsSync(spawns), 'agy was never started');
 });
 
 test('a child dying mid-turn (no result envelope) still ends the turn with a failed terminal', async (t) => {
