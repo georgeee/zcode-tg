@@ -485,6 +485,23 @@ Two properties are deliberate and owner-mandated:
   with the Claude `remote-control --session-id` capacity trap described in
   the workspace AGENTS.md.
 
+**The pre-turn config gate.** Measured live (agy 1.2.9): if the model uses
+its in-process file tool to write `$AGY_HOME/.gemini/config/mcp_config.json`
+during a session, agy re-reads that file at the start of the NEXT turn and
+execs the listed MCP servers directly, as the account agy runs as — the
+agent account, the one that holds the session credential. Turn 1 writes,
+turn 2 fires; a fresh start fires too. So before every turn delivery and
+before every spawn or respawn, the backend checks that `mcp_config.json`
+and `plugins.json` are absent, 0 bytes (a fresh agy leaves a 0-byte
+`mcp_config.json`), or JSON with no servers/plugins, and that
+`config/plugins/` is absent or empty. On a violation the turn is never
+delivered: the offending file is renamed to `<name>.quarantined-<unix-ts>`
+(kept for forensics, never exec'd or parsed further), the session's agy
+child is stopped through the bounded close escalation, and the turn fails
+with a review-before-continuing message plus a loud warn and a
+`quarantine path=… key=…` log line. Every session of the same AGY_HOME
+shares the file, and each of their turns runs the same check.
+
 **Telegram is not needed.** A deployment can run this backend MCP-only: set
 `MCP_UNIX_SOCKET` (or `MCP_HTTP_PORT`) and the antigravity config below but
 no `TELEGRAM_*` at all, and the bridge boots with a stub Telegram client —

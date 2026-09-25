@@ -23,6 +23,8 @@
 // this class never re-emits 'exit' at backend level.
 
 import { createHash } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync, renameSync, statSync } from 'node:fs';
+import path from 'node:path';
 import { Backend, makeSessionId, rawSessionId } from '../backend.js';
 import { AntigravityClient, AGY_SETTINGS_DEFAULTS, ensureAgySettings } from '../antigravityClient.js';
 import { ConversationWatcher, conversationDbPath } from '../conversationStore.js';
@@ -62,6 +64,47 @@ export function parseAgyModelRef(ref) {
 // Envelope statuses (VERIFIED LIVE): SUCCESS / ERROR / INTERRUPTED / TIMEOUT.
 function statusOf(result) {
   return result?.status === 'SUCCESS' ? 'success' : 'failed';
+}
+
+// --- the pre-turn integrity gate ---
+//
+// MEASURED LIVE (agy 1.2.9, owner decision 2026-09-25): if the model uses
+// its in-process file tool during a session to write
+// $AGY_HOME/.gemini/config/mcp_config.json, agy re-reads that file at the
+// START of the NEXT turn and EXECS the MCP servers it lists -- directly, as
+// the account agy runs as (the agent, the account that holds the session
+// credential), on EVERY following turn. Turn 1 writes, turn 2 fires; it
+// never fires within the same turn, and a fresh start fires too.
+// hooks.json is NOT an exec vector (named hooks only). So the config under
+// AGY_HOME must be PROVABLY INERT before anything can turn: mcp_config.json
+// and plugins.json absent, 0 bytes (a fresh agy leaves a 0-byte
+// mcp_config.json), or JSON carrying no servers/plugins; config/plugins/
+// absent or empty. A violation is quarantined (renamed aside for forensics,
+// never exec'd or parsed further), the session's child is stopped through
+// the bounded close escalation, and the turn fails with a loud
+// review-before-continuing message. Every session of this AGY_HOME shares
+// the file, so each of their turns runs the check (see sendMessage and
+// _spawn).
+
+// Does this file content declare MCP servers or plugins? Only provably
+// inert shapes pass: an object whose server/plugin keys are absent, null,
+// or empty ({} or {"mcpServers":{}} are the canonical clean forms). A
+// non-empty file that does not parse -- or is not an object -- is a
+// violation: it is not provably inert, and forensics keeps it either way.
+function declaresServersOrPlugins(text) {
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    return true;
+  }
+  if (typeof doc !== 'object' || doc === null || Array.isArray(doc)) return true;
+  return Object.entries(doc).some(([key, value]) => {
+    if (!/^(mcp[-_ ]?)?(servers?|plugins?)$/i.test(key)) return false;
+    if (value == null) return false;
+    if (Array.isArray(value)) return value.length > 0;
+    return typeof value !== 'object' || Object.keys(value).length > 0;
+  });
 }
 
 export class AntigravityBackend extends Backend {
@@ -337,10 +380,79 @@ export class AntigravityBackend extends Backend {
   // subscribe and receive everything).
   async subscribe() {}
 
+  // --- the pre-turn integrity gate (see the block comment at statusOf) ---
+
+  // Null when the AGY_HOME config is provably inert; the violation to
+  // quarantine otherwise. Runs before every turn delivery and before every
+  // spawn/respawn. Every session of this AGY_HOME shares these files, so
+  // each of their turns re-checks -- whoever turns first while the file is
+  // dirty gets refused and quarantines it; the rest find it gone.
+  _configViolation() {
+    const configDir = path.join(this.agyHome, '.gemini', 'config');
+    for (const name of ['mcp_config.json', 'plugins.json']) {
+      const file = path.join(configDir, name);
+      let dirty;
+      try {
+        dirty = existsSync(file) && statSync(file).size > 0 && declaresServersOrPlugins(readFileSync(file, 'utf8'));
+      } catch {
+        dirty = true; // unreadable: not provably inert
+      }
+      if (dirty) return { path: file };
+    }
+    const pluginsDir = path.join(configDir, 'plugins');
+    let dirtyDir;
+    try {
+      dirtyDir = existsSync(pluginsDir) && readdirSync(pluginsDir).length > 0;
+    } catch {
+      dirtyDir = true; // unreadable: not provably empty
+    }
+    if (dirtyDir) return { path: pluginsDir };
+    return null;
+  }
+
+  // THE QUARANTINE: the offending file/directory is renamed aside for
+  // forensics -- kept, never exec'd, never parsed further -- the loud warn
+  // goes out, the line lands on the reap log, and the human-facing message
+  // comes back for the failed turn. Stopping the session's child is the
+  // caller's move (the spawn path has no child to stop).
+  _quarantine(violation, key) {
+    const stamp = Math.floor(Date.now() / 1000);
+    let target = `${violation.path}.quarantined-${stamp}`;
+    for (let n = 2; existsSync(target); n += 1) target = `${violation.path}.quarantined-${stamp}-${n}`; // same-second re-quarantine never overwrites forensics
+    renameSync(violation.path, target);
+    const message =
+      `antigravity: agy's config at ${violation.path} defines MCP servers/plugins (agy would run them as the agent account); ` +
+      `quarantined as ${target}, session stopped. Something in this session wrote it — review before continuing.`;
+    this.emit('warn', message);
+    this.emit('reap', `quarantine path=${violation.path} key=${key}`);
+    return message;
+  }
+
   // Fire-and-forget per the Backend contract: writes ONE user turn object to
   // the session's stdin; the reply streams back as 'event' emissions ending
   // in v4/telemetry/event turn.terminal.
   async sendMessage(sessionId, text) {
+    const rawId = rawSessionId(sessionId);
+    // THE GATE, delivery half -- before the respawn decision (a dirty
+    // AGY_HOME gets no fresh child either; _spawn checks too) and before
+    // the write: agy re-reads the config at the start of the very turn we
+    // are about to deliver. The write that armed the trap happened during a
+    // PREVIOUS turn -- one the gate did not see; there is deliberately no
+    // in-delivery re-check (it never fires within the same turn, measured),
+    // and the quarantine below takes the file out of agy's reach before the
+    // turn after this one.
+    const violation = this._configViolation();
+    if (violation) {
+      const existing = this._sessions.get(rawId);
+      const message = this._quarantine(violation, this._keyOf(existing ?? { rawId }));
+      if (existing) this._gcClose(existing, null); // the bounded close escalation stops the session's child
+      // The turn is refused, never delivered: started for correlation, then
+      // the failed terminal -- index.js's event-driven path clears the turn.
+      const turnId = `${rawId}:${existing ? ++existing.turnSeq : 0}`;
+      this._emitTelemetry(makeSessionId('antigravity', rawId), turnId, 'turn.started');
+      this._emitTelemetry(makeSessionId('antigravity', rawId), turnId, 'turn.terminal', { status: 'failed', errorCode: message });
+      return;
+    }
     const session = await this._runningSession(sessionId);
     const turnId = `${rawSessionId(sessionId)}:${++session.turnSeq}`;
     session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0 };
@@ -482,6 +594,14 @@ export class AntigravityBackend extends Backend {
   // idle one (awaited to a full exit -- never exceed the cap at the process
   // level) or refuses.
   async _spawn({ workspaceDir, effort, conversationId = null }) {
+    // THE GATE, spawn half: a fresh or resumed child reads the config at its
+    // first turn -- never start one against a dirty AGY_HOME. Nothing to
+    // stop here (no child exists yet); the throw carries the quarantine
+    // message to createConversation / resumeConversation / setModel's
+    // callers. The rename has already made the config clean, so a retry
+    // after human review spawns normally.
+    const violation = this._configViolation();
+    if (violation) throw new Error(this._quarantine(violation, this._keyOf({ rawId: conversationId })));
     await this._admitNewChild();
     const client = new AntigravityClient({
       agyBin: this.agyBin,
