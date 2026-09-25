@@ -46,14 +46,33 @@
 //                                 entries this fixture's workspace/readState
 //                                 advertises (default two GLM models). Drives
 //                                 listModels() -- and so what /model shows.
+//   FIXTURE_ZCODE_CLOSE_STDIN     set to a PATH: fd 0 is closed at startup
+//                                 (the read end of the pipe the client
+//                                 writes to) and the process stays alive;
+//                                 the path is written AFTER the close so a
+//                                 test can wait for it. The client's next
+//                                 write then hits EPIPE against a live
+//                                 process -- the exact shape of a write
+//                                 racing a dead one (zcodeClient
+//                                 write-guard test).
 // With any of LOG/RP_REPLY set it answers the calls the bridge actually
 // issues (session/create, session/setModel, session/setMode, session/subscribe,
 // session/close, session/stop, session/send, workspace/readState) so a topic
 // can really be created on it, listed, and switched away from.
-import { writeFileSync, appendFileSync } from 'node:fs';
+import { writeFileSync, appendFileSync, closeSync } from 'node:fs';
 
 if (process.env.FIXTURE_ZCODE_MARKER) {
   writeFileSync(process.env.FIXTURE_ZCODE_MARKER, JSON.stringify({ pid: process.pid, at: Date.now(), argv: process.argv.slice(2) }));
+}
+
+// Measured: process.stdin.destroy() does NOT close the fd (without a read
+// the handle never opens and the parent's write just buffers) -- only
+// closing fd 0 itself does. The keepalive holds the event loop: a closed
+// stdin must not end this process.
+if (process.env.FIXTURE_ZCODE_CLOSE_STDIN) {
+  closeSync(0);
+  writeFileSync(process.env.FIXTURE_ZCODE_CLOSE_STDIN, JSON.stringify({ closedAt: Date.now() }));
+  setInterval(() => {}, 10_000);
 }
 
 const reply = (id, result) => process.stdout.write(JSON.stringify({ id, result }) + '\n');

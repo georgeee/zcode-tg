@@ -25,11 +25,28 @@
 //                        record the cross-backend switch test asserts on
 //                        (thread/start's params.model names the model the
 //                        new codex session actually opened with).
-import { writeFileSync, appendFileSync } from 'node:fs';
+// FIXTURE_CODEX_CLOSE_STDIN  set to a PATH: fd 0 is closed at startup (the
+//                        read end of the pipe the client writes to) and the
+//                        process stays alive; the path is written AFTER the
+//                        close so a test can wait for it. The client's next
+//                        write then hits EPIPE against a live process --
+//                        the exact shape of a write racing a dead one
+//                        (codexClient write-guard test).
+import { writeFileSync, appendFileSync, closeSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 
 if (process.env.FIXTURE_CODEX_MARKER) {
   writeFileSync(process.env.FIXTURE_CODEX_MARKER, JSON.stringify({ pid: process.pid, at: Date.now(), argv: process.argv.slice(2) }));
+}
+
+// Measured: process.stdin.destroy() does NOT close the fd (without a read
+// the handle never opens and the parent's write just buffers) -- only
+// closing fd 0 itself does. The keepalive holds the event loop: a closed
+// stdin must not end this process.
+if (process.env.FIXTURE_CODEX_CLOSE_STDIN) {
+  closeSync(0);
+  writeFileSync(process.env.FIXTURE_CODEX_CLOSE_STDIN, JSON.stringify({ closedAt: Date.now() }));
+  setInterval(() => {}, 10_000);
 }
 
 let nextThreadId = 1;

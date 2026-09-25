@@ -49,6 +49,11 @@ export class CodexClient extends EventEmitter {
     // Same "fail future calls fast, not just already-pending ones" guard as
     // zcodeClient.js's identical field -- see its constructor comment.
     this._deadError = null;
+    // Same stdin guard as zcodeClient.js's identical field: last error the
+    // child's stdin stream reported (EPIPE under a write that raced the
+    // process's death). Swallowed at the spawn-time listener in start();
+    // _write turns it into a rejection, never an uncaught exception.
+    this._stdinError = null;
   }
 
   start() {
@@ -66,6 +71,15 @@ export class CodexClient extends EventEmitter {
     });
     this.proc.stdout.on('data', (chunk) => this._onData(chunk));
     this.proc.stderr.on('data', (chunk) => this.emit('stderr', chunk.toString('utf8')));
+    // THE EPIPE SWALLOWER, same as zcodeClient.js's (and antigravityClient
+    // .js's measured crash): a write that races the process's death surfaces
+    // as an async 'error' on this stream, and with no listener Node turns
+    // that into an uncaughtException -- the whole bridge down, every session
+    // with it. Recorded instead; _write's write callback is what maps it to
+    // fast, clear call failures.
+    this.proc.stdin.on('error', (err) => {
+      this._stdinError = err;
+    });
     this.proc.on('exit', (code, signal) => {
       this.emit('exit', { code, signal });
       const err = new Error(`codex app-server exited (code=${code} signal=${signal}) before responding`);
@@ -108,6 +122,9 @@ export class CodexClient extends EventEmitter {
     // doesn't exit promptly on EOF, not a load-bearing part of the
     // documented protocol.
     if (this.proc && !this.proc.killed) {
+      // The try/catch covers the synchronous face; the spawn-time stdin
+      // 'error' listener covers the async one (EOF on a process that died
+      // first). Same shape as antigravityClient.js's close().
       try { this.proc.stdin.end(); } catch {}
       setTimeout(() => {
         if (this.proc && !this.proc.killed) this.proc.kill('SIGTERM');
@@ -138,20 +155,66 @@ export class CodexClient extends EventEmitter {
         reject(new Error(`codex call timed out: ${method} (${timeoutMs}ms)`));
       }, timeoutMs);
       this._pending.set(id, { resolve, reject, timer });
-      this._write({ jsonrpc: '2.0', id, method, params });
+      const refused = this._write({ jsonrpc: '2.0', id, method, params });
+      if (refused) {
+        // Never handed off (the write guard caught it): fail this call now
+        // with the clear reason, the same fast-failure contract as the
+        // _deadError guard above, extended to the write face.
+        this._pending.delete(id);
+        clearTimeout(timer);
+        reject(refused);
+      }
     });
   }
 
   // Client -> server notification (no id, no response expected) -- used for
   // 'initialized' after the initialize handshake.
   notify(method, params = {}) {
-    this._write({ jsonrpc: '2.0', method, params });
+    this._send({ jsonrpc: '2.0', method, params });
   }
 
+  // The guarded write, same contract as zcodeClient.js's: returns null when
+  // the payload was handed to the stream, or the Error why it was refused
+  // (call() rejects its promise with that; fire-and-forget callers go
+  // through _send, which logs it). An ASYNC refusal (the EPIPE of a write
+  // that raced the process's death) surfaces in the write callback and
+  // funnels through _onStdinFailure, which fails every pending call
+  // immediately. Either way a refused delivery is a rejection or a log
+  // line, never an uncaughtException -- an uncaught EPIPE here would take
+  // down the whole bridge.
   _write(obj) {
     // Opposite gotcha from zcodeClient.js: THIS protocol wants the
     // "jsonrpc" key -- every _write call site above includes it.
-    this.proc.stdin.write(JSON.stringify(obj) + '\n');
+    if (!this.proc || this._deadError) return this._deadError ?? new Error('codex app-server is not running');
+    if (this._stdinError) return new Error(`codex app-server's stdin is dead (${this._stdinError.message}) -- the process is gone or dying`);
+    try {
+      this.proc.stdin.write(JSON.stringify(obj) + '\n', (err) => {
+        if (err) this._onStdinFailure(err);
+      });
+    } catch (err) {
+      // Synchronous refusal (stream already ended): same contract.
+      return new Error(`codex app-server's stdin refused a write: ${err.message}`);
+    }
+    return null;
+  }
+
+  // Fire-and-forget write (notifications, server-request answers): a
+  // refused delivery is logged on stderr, never thrown -- there is no
+  // promise to reject and nothing to retry from here (the caller's next
+  // interaction sees the process's death on its own).
+  _send(obj) {
+    const refused = this._write(obj);
+    if (refused) this.emit('stderr', `write not delivered: ${refused.message}\n`);
+  }
+
+  // The async face of a refused write: the kernel refused it (EPIPE) or the
+  // stream was already destroyed -- the process is dead or dying and nothing
+  // pending will ever be answered. Fail every pending call NOW (the 'exit'
+  // event follows for the backend-level handling) and record the broken
+  // stdin so later calls fail fast. Never rethrown.
+  _onStdinFailure(err) {
+    if (!this._stdinError) this._stdinError = err;
+    this._rejectAllPending(new Error(`codex app-server's stdin refused a write (${err.message}) -- the process is dead or dying`));
   }
 
   _onData(chunk) {
@@ -206,14 +269,14 @@ export class CodexClient extends EventEmitter {
   async _onServerRequest(msg) {
     const handler = this._serverRequestHandlers.get(msg.method);
     if (!handler) {
-      this._write({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `bridge does not implement ${msg.method}` } });
+      this._send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: `bridge does not implement ${msg.method}` } });
       return;
     }
     try {
       const result = await handler(msg.params, msg);
-      this._write({ jsonrpc: '2.0', id: msg.id, result });
+      this._send({ jsonrpc: '2.0', id: msg.id, result });
     } catch (e) {
-      this._write({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: e.message || String(e) } });
+      this._send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: e.message || String(e) } });
     }
   }
 }
