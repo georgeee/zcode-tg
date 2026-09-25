@@ -506,10 +506,17 @@ export class AntigravityBackend extends Backend {
   // Same bounded escalation as the GC closes, but not a reap: no log line
   // (the caller asked for this one), and the registry entry is RETAINED so
   // the session's effort/workspace survive for the respawn.
+  //
+  // A MID-TURN close is also a cancel (session_close on a busy session): the
+  // verdict is recorded NOW -- a result envelope that races the teardown (a
+  // SUCCESS already in the pipe when the child died) reads as cancelled, the
+  // same rule as cancel() above, and cancelPending stays set so the next
+  // send respawn-resumes instead of writing into the dying child.
   async closeConversation(sessionId) {
     const rawId = rawSessionId(sessionId);
     const session = this._sessions.get(rawId);
     if (session) {
+      if (session.turn) session.cancelPending = true;
       session.watcher?.stop();
       this._gcClose(session, null);
     }

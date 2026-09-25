@@ -39,6 +39,13 @@
 //     bridge (never listed, constructed, or resolved to), mock-default
 //     bridges see themselves, a named list is honored wholesale, unknown
 //     names refuse to boot.
+// 11. (scenario11, above) the antigravity backend end to end.
+// 12. CLOSE-AS-RELEASE (2026-09-25): MCP session_close on a BUSY
+//     antigravity session cancels the turn and releases the child (the cap
+//     slot frees), so a new session_create succeeds -- measured live before
+//     the fix: all four session_closes answered OK, all four children
+//     outlived them, and a new create was refused forever, naming closed
+//     keys with advice ("session_close one") that could not work.
 //
 // Drive: node test/e2e-backend-lifecycle.mjs
 import { createServer } from 'node:http';
@@ -1110,12 +1117,90 @@ async function scenario11() {
   }
 }
 
+// --- scenario 12: session_close RELEASES the session's process. The
+// measured 2026-09-25 finding: session_close only closed the Telegram topic
+// and marked the store entry -- the antigravity child kept its cap slot for
+// as long as its turn ran (the mid-turn idle-reaper guard keeps the reaper
+// off too), and the cap refusal then named closed keys with advice that
+// could not work. Four hung turns wedged the backend until a bridge
+// restart. Here: cap 1, reaper off, one 30s turn, session_close mid-turn --
+// the child must die within the escalation bound and the next session_create
+// must SUCCEED (pre-fix it was refused forever). MCP-only boot, like 11a. ---
+async function scenario12() {
+  console.log('\n--- scenario 12: session_close on a BUSY session releases the child and frees the cap ---');
+  const sock = path.join(TMP, 's12-state', 'agy-tg', 'mcp.sock');
+  const agyHome = path.join(TMP, 's12-agy-home');
+  const markerLog = path.join(TMP, 's12-agy-spawns.jsonl');
+  const baseEnv = {
+    DEFAULT_BACKEND: 'antigravity',
+    ZCODE_NODE_BIN: NODE,
+    ZCODE_BIN: ZCODE_FIXTURE,
+    ZCODE_WORKSPACE_DIR: TMP,
+    AGY_BIN: AGY_FIXTURE,
+    AGY_HOME: agyHome,
+    AGY_EFFORT: 'medium',
+    AGY_MAX_PROCS: '1', // the tightest cap: the one busy session IS the wedge
+    AGY_IDLE_CLOSE_MIN: '0', // no reaper: only the close can release anything
+    FIXTURE_AGY_SLOW_MS: '30000', // the turn outlives the scenario: only the close can end it
+    FIXTURE_AGY_MARKER_LOG: markerLog,
+    STORE_PATH: path.join(TMP, 's12-store.json'),
+    MCP_UNIX_SOCKET: sock,
+  };
+  const b = startBridge(baseEnv, 's12');
+  try {
+    await waitFor(() => b.log.includes('MCP-only mode'), 15000, 'MCP-only mode notice');
+    await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, 'mcp unix socket bind');
+    let id = 100;
+    const call = (name, args) => unixJsonRpc(sock, [{ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } }]).then((ls) => ls[0]);
+
+    const created = await call('session_create', { name: 's12-busy' });
+    const createdOk = created?.result?.isError === false;
+    check('(a) session_create completes', createdOk, JSON.stringify(created).slice(0, 400));
+    const key = createdOk ? JSON.parse(created.result.content[0].text).key : null;
+    const busy = await call('message_send', { key, text: 'AGY-SLOW', wait: false });
+    check('(a) the slow turn was accepted (queued:true)', busy?.result?.isError === false && JSON.parse(busy.result.content[0].text).queued === true, JSON.stringify(busy).slice(0, 300));
+    await waitFor(() => existsSync(markerLog) && readFileSync(markerLog, 'utf8').trim().length > 0, 15000, 'the agy child to spawn');
+    const pid = JSON.parse(readFileSync(markerLog, 'utf8').trim().split('\n').at(-1)).pid;
+    const pidAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    check('(a) the child is alive mid-turn', pidAlive(), `pid ${pid}`);
+
+    // At cap 1 the next create is refused -- and names the busy key.
+    const refused = await call('session_create', { name: 's12-second' });
+    const refusalText = refused?.result?.content?.[0]?.text || '';
+    check('(a) a create at the cap is refused naming the busy session', refused?.result?.isError === true && /sessions busy \(cap 1\)/.test(refusalText) && refusalText.includes(key), refusalText.slice(0, 300));
+
+    // THE FIX over MCP: session_close cancels the mid-turn turn and releases
+    // the child (t0 AFTER the tool returns: the bound is the escalation's).
+    const t0 = Date.now();
+    const closed = await call('session_close', { key });
+    check('(b) session_close answers ok', closed?.result?.isError === false, JSON.stringify(closed).slice(0, 300));
+    const pidGone = () => { try { process.kill(pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; } };
+    await waitFor(pidGone, 25_000, 'the busy child to die after session_close');
+    const elapsed = Date.now() - t0;
+    check('(b) the child died within the escalation bound (10s EOF + 5s TERM + slack)', elapsed <= 20_000, `took ${elapsed}ms`);
+
+    // The regression itself: the freed cap admits a new session. Pre-fix
+    // this create was refused forever -- with a refusal naming the CLOSED
+    // key -- and only a bridge restart cleared it.
+    const second = await call('session_create', { name: 's12-after-close' });
+    const secondOk = second?.result?.isError === false;
+    check('(c) after session_close a new session_create SUCCEEDS (the cap was freed)', secondOk, JSON.stringify(second).slice(0, 400));
+
+    // The closed key stays terminal: no prompt can resurrect it.
+    const after = await call('message_send', { key, text: 'anyone there?', wait: false });
+    check('(c) message_send to the closed key is refused', after?.result?.isError === true && /closed/.test(after.result.content?.[0]?.text || ''), JSON.stringify(after).slice(0, 300));
+  } finally {
+    b.proc.kill('SIGKILL');
+    await sleep(300);
+  }
+}
+
 // EACH SCENARIO REPORTS ITS OWN FAILURE, so one scenario's throw (which is
 // how a bridge that dies at boot usually surfaces -- a waitFor timeout)
 // doesn't silently skip the scenarios after it: on the :546 boot-crash
 // this file exists to catch, EVERY non-zcode-default scenario is red, and
 // the run must say so rather than stop at the first.
-for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11]) {
+for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11, scenario12]) {
     try {
       await s();
     } catch (e) {

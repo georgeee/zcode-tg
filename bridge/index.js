@@ -1999,7 +1999,9 @@ async function handleModelCommand(threadId, arg) {
   // it was found in, and the old session id is dropped -- a resolved model is
   // never applied to the topic's current backend by default (that guess is
   // the recorded live bug this command's resolver exists to make impossible).
-  store.setTopic(threadId, { ...entry, backend: resolvedBackend, sessionId: undefined, model: ref });
+  // The switch promises "a fresh session on your next message", which is
+  // exactly the way out of a closed topic -- so it also un-closes.
+  store.setTopic(threadId, { ...entry, backend: resolvedBackend, sessionId: undefined, model: ref, closed: false });
   await updateTopicStatus(threadId, 'idle').catch(() => {});
   await tg.sendMessage({
     chatId: chatOf(threadId),
@@ -2152,12 +2154,25 @@ async function handleBackendCommand(threadId, arg) {
     subscribedSessions.delete(entry.sessionId);
     sessionToTopic.delete(entry.sessionId);
   }
-  store.setTopic(threadId, { ...entry, backend: arg, sessionId: undefined, model: undefined });
+  store.setTopic(threadId, { ...entry, backend: arg, sessionId: undefined, model: undefined, closed: false });
   await tg.sendMessage({
     chatId: chatOf(threadId),
     messageThreadId: threadOf(threadId),
     text: `✅ This topic now runs on '${arg}' — a fresh session starts on your next message (history does not carry over).`,
   });
+}
+
+// --- /close: the Telegram face of session_close ---
+// Same terminal semantics over both surfaces: the session's process is
+// released (a mid-turn turn is cancelled -- the cancel is the verdict), the
+// Telegram topic itself is closed, and the key is marked closed so no later
+// prompt can spawn a fresh session into it. Unlike a UI close (which only
+// freezes the topic and is handled as forum_topic_closed below), this is
+// final; a reopened forum topic still refuses prompts.
+async function handleCloseCommand(threadId) {
+  const had = !!store.getTopic(threadId)?.sessionId;
+  await closeSessionForKey(threadId);
+  await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: had ? '🔒 Session closed and its process released. This topic is closed for good — send /backend or open a new topic to start fresh.' : '🔒 This topic is closed for good — send /backend or open a new topic to start fresh.' });
 }
 
 // --- /file: send a workspace file into the topic as a document ---
@@ -2306,6 +2321,61 @@ async function interruptTurn(sessionId, { killEverything }) {
   }
 }
 
+// Release a topic's session PROCESS: the half every close path shares --
+// MCP session_close, Telegram /close, a forum_topic_closed/deleted service
+// message. Measured 2026-09-25: session_close only closed the Telegram
+// topic and marked the store entry, so an antigravity child (one
+// AGY_MAX_PROCS slot) outlived the close for as long as its turn ran, and
+// the cap refusal then named closed keys with advice ("session_close one")
+// that could not work -- four hung turns wedged the backend until a bridge
+// restart. Order matters:
+//   1. A BUSY session's turn is cancelled first (interruptTurn: the same
+//      hard-stop core /stop uses, so the cancel is the verdict on every
+//      backend and the parked caller gets a terminal, not silence). The
+//      terminal still flows through the ordinary event path, so the
+//      busy/turn bookkeeping unwinds itself afterwards.
+//   2. closeConversation -- the backend's own release (antigravity: the
+//      bounded EOF/TERM/KILL escalation; zcode: session/close; codex/mock:
+//      deliberate no-ops). Not live the moment it starts: the cap and the
+//      busy refusal stop counting the session HERE, before the child is
+//      even dead.
+//   3. The bridge-side maps are dropped so nothing routes to the dead
+//      session id again. The store entry keeps its sessionId: antigravity
+//      conversations survive on disk and zcode sessions resume, so a topic
+//      closed from the Telegram UI that is later reopened just picks the
+//      conversation back up.
+// Errors on one path never stop the others: a close must close.
+async function releaseSessionForKey(key) {
+  const sessionId = store.getTopic(key)?.sessionId;
+  if (!sessionId) return;
+  const wasBusy = busySessions.has(sessionId);
+  if (wasBusy) {
+    await interruptTurn(sessionId, { killEverything: true });
+  }
+  await backendForSession(sessionId).closeConversation(sessionId).catch((e) => console.error(`[bridge] topic ${key}: closing session ${sessionId}: ${e.message}`));
+  subscribedSessions.delete(sessionId);
+  sessionToTopic.delete(sessionId);
+  // A caller parked on message_send(wait) gets an explicit "closed" instead
+  // of the turn's terminal (the maps above are gone, so finalizeTurn can no
+  // longer noteReply) -- or, in the race where the reply landed first,
+  // nothing: already-resolved waiters have nothing to fail.
+  if (wasBusy) {
+    stranded(key, `this conversation was closed (session_close), so its running turn was CANCELLED -- no reply is coming; create a new session and send again`);
+  }
+}
+
+// The terminal form of a close, shared by MCP session_close and /close:
+// release the process (above), close the Telegram topic itself, and mark
+// the key closed -- closed is final, so every later prompt into the topic
+// (message_send's own guard, and dispatchUserPrompt's for the Telegram
+// side) is refused rather than spawning a fresh session over the grave.
+async function closeSessionForKey(key) {
+  const t = store.getTopic(key) ?? {};
+  await releaseSessionForKey(key);
+  await tg.closeForumTopic({ chatId: chatOf(key), messageThreadId: Number(t.threadId) }).catch(() => {});
+  store.setTopic(key, { closed: true });
+}
+
 // --- Telegram message handling ---
 
 // '/usage@botname arg' -> 'usage'; null for anything that isn't a command.
@@ -2334,6 +2404,7 @@ function helpText() {
     'Bridge commands (each scoped to this topic):',
     '/usage — plan usage & quota for this bridge’s backend',
     '/stop, /cancel — cancel the running turn',
+    '/close — release this topic’s session process and close the topic (final)',
     '/queue — show queued messages',
     '/clearqueue — drop queued messages',
     '/model [name] — list / switch this topic’s model',
@@ -2506,6 +2577,31 @@ async function handleMessage(message) {
     updateTopicStatus(topicKey, 'idle').catch(() => {});
     return;
   }
+  // A topic closed or deleted from the Telegram UI releases its session
+  // process, exactly as session_close does -- otherwise the child (and its
+  // AGY_MAX_PROCS slot) survived the close for as long as its turn ran.
+  // The two service messages differ in reversibility and in where they
+  // carry the thread id:
+  //   - forum_topic_closed freezes the topic and can be undone (reopen):
+  //     the session is released NOW and the store keeps its sessionId, so a
+  //     reopened topic's next message resumes the conversation. `closed` is
+  //     NOT set -- the topic's prompts stay legal.
+  //   - forum_topic_deleted is final, and the deletion notice arrives in
+  //     the chat with the doomed thread id in its payload rather than on
+  //     the message itself. The key is marked closed so a stray prompt at
+  //     that thread id is refused instead of spawning a phantom session.
+  if (message.forum_topic_closed || message.forum_topic_deleted) {
+    const deleted = message.forum_topic_deleted;
+    const threadNum = Number(deleted?.message_thread_id ?? messageThread);
+    const key = threadNum ? keyFor(chatId, threadNum) : null;
+    const entry = key ? store.getTopic(key) : null;
+    if (entry) {
+      await releaseSessionForKey(key);
+      if (deleted) store.setTopic(key, { closed: true });
+      console.log(`[bridge] topic ${key} ${deleted ? 'deleted' : 'closed'}${entry.sessionId ? ' -- session released' : ''}`);
+    }
+    return;
+  }
   // DMs and topicless groups carry no thread and are served whole (the
   // conversation key is the chat alone); topics keep their per-topic session.
   if (!message.text && !message.document) return; // stickers, photos, voice, ... still ignored
@@ -2542,6 +2638,10 @@ async function handleMessage(message) {
   }
   if (command === 'file') {
     await handleFileCommand(threadId, message.text.split(/\s+/).slice(1).join(' ').trim());
+    return;
+  }
+  if (command === 'close') {
+    await handleCloseCommand(threadId);
     return;
   }
   if (command === 'help') {
@@ -2687,6 +2787,18 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
 // Callers that don't care (handleMessage, the merge window, and drainQueue
 // via startTurn) ignore the value.
 async function dispatchUserPrompt(threadId, promptText, command) {
+  // A closed topic is final (MCP session_close or /close): refuse BEFORE
+  // getOrCreateSession, whose resume path would otherwise spawn a fresh
+  // child for the released session and put it straight back into the
+  // backend's cap -- the exact leak this close fix exists to drain. /stop
+  // needs no exemption: its session is gone by construction, and this
+  // notice is the honest version of "nothing is running".
+  if (store.getTopic(threadId)?.closed) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '🔒 This topic is closed. Its session was released; create a new session (or session_create) for a fresh one.' });
+    const why = 'this conversation is closed (session_close ran on it); the message was refused, not delivered';
+    stranded(threadId, why);
+    return why;
+  }
   // A redeploy is draining: don't start anything new (getOrCreateSession
   // below can itself call session/create, work an about-to-restart process
   // has no way to see through to completion). /stop and /cancel are exempt
@@ -3094,9 +3206,12 @@ async function main() {
         return { key, chat_id: chatId, thread_id: threadId, model: entry.model, backend, auto_picked: autoPicked };
       },
       sessionClose: async (key) => {
-        const t = store.getTopic(key) ?? {};
-        await tg.closeForumTopic({ chatId: chatOf(key), messageThreadId: Number(t.threadId) }).catch(() => {});
-        store.setTopic(key, { closed: true });
+        // The point is the PROCESS: release the session (cancel a mid-turn
+        // turn, run the backend's closeConversation, free its cap slot) --
+        // without this the child outlived the close and the cap refusal
+        // kept naming this key with advice that could not work. Closing the
+        // Telegram topic and marking the key closed are the visible half.
+        await closeSessionForKey(key);
         return { ok: true };
       },
       messageSend: async (key, text, wait) => {
