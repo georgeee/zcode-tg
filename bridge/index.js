@@ -2330,7 +2330,7 @@ function helpText() {
     '/clearqueue — drop queued messages',
     '/model [name] — list / switch this topic’s model',
     '/mode [name] — list / switch this topic’s mode',
-    '/backend [name] — list / switch this topic’s backend (zcode/codex/mock)',
+    '/backend [name] — list / switch this topic’s backend (zcode/codex/antigravity/mock)',
     '/file <path> — send a workspace file here',
     '',
     'Anything else is sent to the model. Replies stream into the ⌛ placeholder message. Messages sent while a turn is running are queued and run in order; reply to any message to quote it to the model. Send a file as a document and the agent reads it (saved to inbox/, your caption = instruction).',
