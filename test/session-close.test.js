@@ -5,14 +5,21 @@
 // antigravity sessions and all four children outlived it (the mid-turn idle
 // reaper is guarded off too), so the cap refused a new create while NAMING
 // the closed keys with advice ("session_close one") that could not work --
-// four hung turns wedged the backend until a bridge restart. These tests
-// pin the backend half (closeConversation: the bounded escalation, the
+// four hung turns wedged the backend until a bridge restart. The antigravity
+// tests pin that backend half (closeConversation: the bounded escalation, the
 // cancel-is-the-verdict mid-turn rule, the cap freed and the refusal list
-// clean) and the safe-on-every-backend closes. Runs against
+// clean); the other backends are pinned with what exists on every branch:
+// zcode's close must be a REAL session/close on the runtime carrying the raw
+// id (the request log's record), and mock's close must actually stop a
+// mid-flight streamed turn (the timers its cancel()/closeConversation() clear
+// are its live in-flight state). Codex's close stays a deliberate no-op --
+// pinned so "safe on every backend" stays true. All of it runs against
 // test/fixtures/fake-agy.mjs and fake-zcode-app-server.mjs (zero
 // credentials, zero quota). The wiring itself -- index.js's sessionClose
 // actually CALLING closeConversation -- is e2e-backend-lifecycle.mjs
-// scenario 12, which is where the original gap lived.
+// scenario 12, which is where the original gap lived. index.js exports
+// nothing and cannot be imported without booting (the repo's standing
+// policy), so these exercise the backends directly.
 //
 // Run: node --test test/session-close.test.js
 import test from 'node:test';
@@ -73,8 +80,9 @@ async function waitFor(fn, what, ms = 10_000) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const terminals = (events) => events.filter((e) => e.method === 'v4/telemetry/event' && e.params.kind === 'turn.terminal');
+const sessionEvents = (events) => events.filter((e) => e.method === 'session/event');
 const turnStarted = (events) => events.filter((e) => e.method === 'v4/telemetry/event' && e.params.kind === 'turn.started');
+const turnTerminal = (events) => events.filter((e) => e.method === 'v4/telemetry/event' && e.params.kind === 'turn.terminal');
 
 test('session_close on a BUSY session: the child dies within the escalation bound, the cap is freed, the turn ends failed', async (t) => {
   const dir = tmp('busy');
@@ -118,8 +126,8 @@ test('session_close on a BUSY session: the child dies within the escalation boun
   assert.ok(elapsed <= eofGrace + termGrace + 3_000, `child died within the escalation bound (took ${elapsed}ms, bound ${eofGrace + termGrace}ms)`);
   await p;
 
-  const failed = terminals(events).at(-1);
-  assert.equal(failed?.params?.status, 'failed', `the mid-turn close failed the turn: ${JSON.stringify(terminals(events))}`);
+  const failed = turnTerminal(events).at(-1);
+  assert.equal(failed?.params?.status, 'failed', `the mid-turn close failed the turn: ${JSON.stringify(turnTerminal(events))}`);
   assert.equal(backend.procSnapshot().live, 1, 'exactly the new child is live');
 });
 
@@ -131,7 +139,7 @@ test('session_close on an IDLE session: the child is released at once, no turn t
 
   await backend.closeConversation(sessionId);
   await waitFor(() => backend.procSnapshot().live === 0, 'the idle child to die at once', 3_000);
-  assert.equal(terminals(events).length, 0, 'no turn ever ran, so no terminal');
+  assert.equal(turnTerminal(events).length, 0, 'no turn ever ran, so no terminal');
   assert.equal(reaps.length, 0, 'a caller-requested close is not a reap (no log line)');
   // Closing an unknown session id resolves quietly -- safe to call best-
   // effort from any close path without pre-checking the registry.
@@ -183,7 +191,7 @@ test('the busy refusal never lists a closed key', async (t) => {
   );
 });
 
-test('the zcode backend\'s close is a real session/close on the runtime, carrying the raw session id', async (t) => {
+test("the zcode backend's close is a real session/close on the runtime, carrying the raw session id", async (t) => {
   const dir = tmp('zcode');
   const reqLog = path.join(dir, 'requests.jsonl');
   process.env.FIXTURE_ZCODE_LOG = reqLog; // ZcodeClient spawns with ...process.env, so the fixture inherits this
@@ -207,15 +215,37 @@ test('the zcode backend\'s close is a real session/close on the runtime, carryin
   assert.equal(close.params.sessionId, sessionId.slice('zcode:'.length), 'the close names the raw session id');
 });
 
-test('closeConversation is safe on every other backend: codex and mock resolve without touching any child', async (t) => {
-  const dir = tmp('others');
+test('a mid-turn closeConversation on mock stops the streamed turn: nothing further is emitted, and the close of an unknown id resolves', async (t) => {
+  const dir = tmp('mock');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  // Enough chunks at a long enough spacing that the turn would emit for
+  // ~4s: only the close can end it inside this test.
+  const backend = new MockBackend({ streamChunks: 100, streamIntervalMs: 40 });
+  const events = [];
+  backend.on('event', (e) => events.push(e));
+  const { sessionId } = await backend.createConversation({});
+
+  await backend.sendMessage(sessionId, 'a prompt long enough to stream across one hundred mock chunks without empty trailing deltas');
+  await waitFor(() => turnStarted(events).length >= 1, 'the streamed turn to start');
+  await waitFor(() => sessionEvents(events).length >= 3, 'the stream to be mid-flight');
+
+  await backend.closeConversation(sessionId);
+  const atClose = events.length;
+  await sleep(500); // 12+ stream intervals: a mutator that leaves the timers pending fails here loudly
+  assert.equal(events.length, atClose, `nothing may be emitted after the close: ${JSON.stringify(events.slice(atClose))}`);
+  assert.equal(turnTerminal(events).length, 0, 'a closed turn has no terminal -- the cancel is the verdict');
+
+  // Closing an unknown session id resolves quietly -- safe to call best-
+  // effort from any close path without pre-checking anything.
+  await backend.closeConversation('mock:never-existed');
+});
+
+test("closeConversation is safe on codex: resolves without touching any child (the deliberate no-op)", async (t) => {
+  const dir = tmp('codex');
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   // Constructed but never started: closeConversation must not need a live
   // subprocess (codex's close is a DELIBERATE no-op -- an idle thread costs
-  // nothing and thread/archive's effect on resumability is unverified --
-  // and mock has no upstream resource at all).
+  // nothing and thread/archive's effect on resumability is unverified).
   const codex = new CodexBackend({ codexBin: '/nonexistent/codex', codexHome: dir, cwd: dir, autoApprovePermissions: true });
   await codex.closeConversation('codex:any-thread');
-  const mock = new MockBackend();
-  await mock.closeConversation('mock:any-session');
 });

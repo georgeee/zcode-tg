@@ -14,6 +14,28 @@
 // exactly the requirement this backend exists to satisfy: obviously
 // distinguishable, not a best-effort simulation of a real reply.
 //
+// STREAMING MODE (env knobs read here, once at construction -- this backend
+// keeps no entry in bridge/config.js, the same way telegram.js owns its own
+// TELEGRAM_API_ROOT read):
+//   MOCK_STREAM_CHUNKS       int, default 0. 0 (or <= 0) is TODAY'S instant
+//                            single-burst reply, byte for byte. N > 0 streams
+//                            the same echo as N incremental text_delta events
+//                            spaced MOCK_STREAM_INTERVAL_MS apart, so the
+//                            bridge's real streaming machinery (streamer /
+//                            milestone reporter, coalescing, the terminal-
+//                            render handoff) gets exercised end to end; the
+//                            final result text is IDENTICAL to the instant
+//                            echo (a prompt shorter than N yields empty
+//                            trailing deltas -- harmless, they only mark the
+//                            preview dirty).
+//   MOCK_STREAM_INTERVAL_MS  int, default 500 -- the spacing above.
+// The final events ride the LAST delta's timer, in the instant path's exact
+// order, so a streamed turn ends with the identical result + turn.terminal
+// tail. cancel()/closeConversation() clear any still-pending streaming timers:
+// once the knobs make this backend stateful, a stopped turn must actually
+// stop (the property /stop and the topic-delete path rely on for real
+// backends).
+//
 // listModels() returns exactly one synthetic model ref ('mock-1'). Model-
 // switching policy, decided here and documented for the next person who
 // adds a backend (see CLAUDE.md's "Model policy differs by backend"
@@ -35,11 +57,28 @@ import { Backend, makeSessionId } from '../backend.js';
 // "switchable: false" contract -- see the module comment.
 export const MOCK_MODEL_REF = 'mock-1';
 const MOCK_MODEL_LABEL = 'Mock Echo Model (synthetic, no real inference)';
+const DEFAULT_STREAM_INTERVAL_MS = 500;
+
+function intKnob(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 export class MockBackend extends Backend {
-  constructor() {
+  // Both knobs are injectable for unit tests; absent injection, they come
+  // from the env (deployment config, read once -- a running bridge does not
+  // change its mind mid-turn).
+  constructor({ streamChunks, streamIntervalMs } = {}) {
     super('mock');
     this._turnSeq = 0;
+    this._streamChunks = streamChunks ?? Math.trunc(intKnob(process.env.MOCK_STREAM_CHUNKS, 0));
+    this._streamIntervalMs = Math.max(
+      0,
+      streamIntervalMs ?? intKnob(process.env.MOCK_STREAM_INTERVAL_MS, DEFAULT_STREAM_INTERVAL_MS),
+    );
+    // Pending streaming timers per session: what cancel()/closeConversation()
+    // clear so a stopped streamed turn emits nothing further.
+    this._streamTimers = new Map(); // sessionId -> Set<Timeout>
   }
 
   // No subprocess to spawn -- these exist only for symmetry with the real
@@ -81,6 +120,47 @@ export class MockBackend extends Backend {
   async sendMessage(sessionId, text) {
     const turnId = `mock-turn-${++this._turnSeq}`;
     const reply = `[mock echo] ${text}`;
+
+    // Streaming mode (MOCK_STREAM_CHUNKS > 0): turn.started up front (still
+    // deferred one microtask, preserving the register-before-events guarantee
+    // the instant path documents), then the echo in N deltas on real timers,
+    // the LAST delta's timer carrying the identical result + turn.terminal
+    // tail. The 'result' event -- not the deltas -- is what finalizeTurn
+    // renders, so the final delivery is byte-identical to the instant path;
+    // the deltas only feed the live preview.
+    if (this._streamChunks > 0) {
+      const chunks = this._streamChunks;
+      const interval = this._streamIntervalMs;
+      const base = Math.floor(reply.length / chunks);
+      const rem = reply.length % chunks;
+      const pending = this._streamTimersFor(sessionId);
+      const startedAt = Date.now();
+      queueMicrotask(() => this._emitTelemetry(sessionId, turnId, 'turn.started'));
+      for (let i = 0, at = 0; i < chunks; i++) {
+        const take = base + (i < rem ? 1 : 0);
+        const delta = reply.slice(at, at + take);
+        at += take;
+        const last = i === chunks - 1;
+        const t = setTimeout(() => {
+          pending.delete(t);
+          this._emitSession(sessionId, turnId, { kind: 'text_delta', delta });
+          if (!last) return;
+          this._emitSession(sessionId, turnId, { kind: 'result', content: reply });
+          this._emitTelemetry(sessionId, turnId, 'turn.terminal', {
+            status: 'success',
+            durationMs: Date.now() - startedAt,
+            // Synthetic (character counts, not real tokens) -- clearly not real
+            // usage, matching this backend's overall "obviously not a real
+            // model" spirit (see the module comment).
+            tokenCount: text.length + reply.length,
+            toolCallCount: 0,
+          });
+        }, interval * (i + 1));
+        pending.add(t);
+      }
+      return;
+    }
+
     queueMicrotask(() => {
       this._emitTelemetry(sessionId, turnId, 'turn.started');
       this._emitSession(sessionId, turnId, { kind: 'text_delta', delta: reply });
@@ -104,8 +184,31 @@ export class MockBackend extends Backend {
     });
   }
 
-  async cancel() {} // nothing ever runs long enough to need cancelling
-  async closeConversation() {} // no upstream resource to release
+  // A cancelled or closed streamed turn must emit nothing further -- with the
+  // streaming knobs this backend finally has in-flight state to release.
+  _cancelStreamTimers(sessionId) {
+    const pending = this._streamTimers.get(sessionId);
+    if (!pending) return;
+    for (const t of pending) clearTimeout(t);
+    this._streamTimers.delete(sessionId);
+  }
+
+  _streamTimersFor(sessionId) {
+    let pending = this._streamTimers.get(sessionId);
+    if (!pending) {
+      pending = new Set();
+      this._streamTimers.set(sessionId, pending);
+    }
+    return pending;
+  }
+
+  async cancel(sessionId) {
+    this._cancelStreamTimers(sessionId); // nothing else ever runs long enough to need cancelling
+  }
+
+  async closeConversation(sessionId) {
+    this._cancelStreamTimers(sessionId); // no upstream resource to release
+  }
   async cancelBackgroundTask() {} // no background-task concept
 
   // Deliberately a no-op, not a throw -- see the module comment's "Model-

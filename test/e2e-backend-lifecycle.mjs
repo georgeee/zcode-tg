@@ -39,18 +39,33 @@
 //     bridge (never listed, constructed, or resolved to), mock-default
 //     bridges see themselves, a named list is honored wholesale, unknown
 //     names refuse to boot.
-// 11. (scenario11, above) the antigravity backend end to end.
-// 12. CLOSE-AS-RELEASE (2026-09-25): MCP session_close on a BUSY
-//     antigravity session cancels the turn and releases the child (the cap
-//     slot frees), so a new session_create succeeds -- measured live before
-//     the fix: all four session_closes answered OK, all four children
-//     outlived them, and a new create was refused forever, naming closed
-//     keys with advice ("session_close one") that could not work.
+// 11. (scenario11, above) mock-default streaming: MOCK_STREAM_CHUNKS drives
+//     the real preview machinery with no zcode anything.
+// 11a. (scenario11Agy) the antigravity backend end to end: MCP-only boot
+//     (no Telegram at all -- the agy deployment shape), a full turn against
+//     the fake agy, the effort-knob model policy, quota error mapping and
+//     local-accounting usage_get, resume across a bridge restart, and the
+//     Telegram path with antigravity as the default backend.
+// 12. CLOSE-AS-RELEASE (ported 2026-09-25 from ztg-status b0ef7a8): MCP
+//     session_close on a BUSY session cancels the turn -- the parked
+//     message_send(wait) caller is failed with the cancel verdict instead of
+//     sitting out its wait -- then runs the backend's release: session/stop
+//     then session/close on the runtime, carrying the raw id, read off the
+//     fixture's request log. The release is surgical -- a new session_create
+//     SUCCEEDS on the same runtime right after -- and the closed key stays
+//     closed (message_send and progress_get both refuse it). MCP-only boot:
+//     no Telegram at all.
+// 12a. (scenario12Agy) the same close on the antigravity backend, where the
+//     finding was measured live: the child keeps its AGY_MAX_PROCS cap slot
+//     while its turn runs, so a close that only marked the store wedged the
+//     backend forever. Cap 1, reaper off, one 30s turn, session_close
+//     mid-turn: the child dies within the escalation bound and the next
+//     session_create SUCCEEDS.
 //
 // Drive: node test/e2e-backend-lifecycle.mjs
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 
@@ -380,7 +395,18 @@ async function scenario4() {
     // progress_get, model_get, usage_get, model_set (this count had drifted --
     // the e2e still said "seven" after progress_get joined the list).
     const lines = await unixJsonRpc(sock, [{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }]);
-    check('tools/list over the unix socket advertises the eight tools', lines[0]?.result?.tools?.length === 8, JSON.stringify(lines[0]).slice(0, 300));
+    // The ADVERTISED SET, BY NAME -- not a count (a count went stale when
+    // session_close joined and nobody could tell what drifted). A tool added
+    // or removed fails here naming the difference.
+    const ADVERTISED_TOOLS = ['session_create', 'session_close', 'message_send', 'replies_get', 'progress_get', 'model_get', 'usage_get', 'model_set'];
+    const advertised = (lines[0]?.result?.tools ?? []).map((t) => t.name).sort();
+    const missing = ADVERTISED_TOOLS.filter((n) => !advertised.includes(n));
+    const unexpected = advertised.filter((n) => !ADVERTISED_TOOLS.includes(n));
+    check(
+      `tools/list over the unix socket advertises exactly the agreed tool set by name`,
+      missing.length === 0 && unexpected.length === 0,
+      `missing: [${missing}] unexpected: [${unexpected}] -- advertised: [${advertised.join(', ')}]`,
+    );
     check('zcode was NEVER spawned for a mock-default bridge (no start-marker)', !existsSync(zcodeMarker), b.log.slice(-2000));
   } finally {
     b.proc.kill('SIGKILL');
@@ -975,18 +1001,18 @@ async function scenario10() {
   }
 }
 
-// --- scenario 11: the antigravity backend. (a) MCP-ONLY BOOT: no
-// TELEGRAM_* at all -- the bridge serves MCP exclusively off a stub Telegram
-// (the antigravity deployment shape: the owner's surfaces are the
-// antigravity.google dashboard via --remote-control and this MCP). (b) a
-// full session_create -> message_send -> reply round trip against the fake
-// agy, asserting the spawn contract (argv + HOME) through the REAL bridge.
+// --- scenario 11a: the antigravity backend. (a) MCP-ONLY BOOT: no
+// TELEGRAM_* at all -- the bridge serves MCP exclusively (the antigravity
+// deployment shape: the owner's surfaces are the antigravity.google
+// dashboard via --remote-control and this MCP). (b) a full session_create ->
+// message_send -> reply round trip against the fake agy, asserting the
+// spawn contract (argv + HOME + the private cwd) through the REAL bridge.
 // (c) the effort-knob model policy over MCP. (d) quota error mapping and the
 // local-accounting usage_get. (e) resume across a BRIDGE RESTART (store ->
 // resumeConversation -> --conversation). (f) the Telegram path still works
 // with antigravity as the default backend. ---
-async function scenario11() {
-  console.log('\n--- scenario 11: antigravity — MCP-only boot, full turn, effort knob, usage, restart-resume, TG path ---');
+async function scenario11Agy() {
+  console.log('\n--- scenario 11a: antigravity — MCP-only boot, full turn, effort knob, usage, restart-resume, TG path ---');
   const sock = path.join(TMP, 's11-state', 'agy-tg', 'mcp.sock');
   const agyHome = path.join(TMP, 's11-agy-home');
   const agyState = path.join(TMP, 's11-agy-state');
@@ -1012,7 +1038,7 @@ async function scenario11() {
   let b = startBridge(baseEnv, 's11a');
   let call;
   try {
-    await waitFor(() => b.log.includes('MCP-only mode'), 15000, 'MCP-only mode notice');
+    await waitFor(() => b.log.includes('MCP-only'), 15000, 'MCP-only boot notice');
     check('(a) the bridge boots alive with NO Telegram config (MCP-only mode)', b.proc.exitCode === null, `exitCode=${b.proc.exitCode}\n${b.log.slice(-2000)}`);
     await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, '(a) mcp unix socket bind');
     const lines = await unixJsonRpc(sock, [{ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }]);
@@ -1075,8 +1101,8 @@ async function scenario11() {
     await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, '(e) socket rebind after restart');
     const call2 = (id, name, args) =>
       unixJsonRpc(sock, [{ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }]).then((ls) => ls[0]);
-    // The key lives in the store (chat -100 sentinel + the stub topic id) --
-    // read it back out rather than guessing the synthetic thread number.
+    // The key is the synthetic `m<N>` session_create minted (MCP-only keys
+    // name no chat) -- read it back out of the store rather than guessing N.
     const key2 = waitFor(() => {
       const doc = JSON.parse(readFileSync(storePath, 'utf8'));
       const entry = Object.entries(doc.topics ?? {}).find(([, t]) => t.backend === 'antigravity' && t.name === 'agy-mcp');
@@ -1096,7 +1122,7 @@ async function scenario11() {
   // (f) the Telegram path: antigravity as default backend, fake Telegram
   // configured -- a topic message must produce a delivered reply.
   const { srv, port, calls, pushUpdate } = await startFakeTelegram();
-  const b3 = startBridge(
+    const b3 = startBridge(
     {
       ...baseEnv,
       TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
@@ -1119,17 +1145,73 @@ async function scenario11() {
   }
 }
 
-// --- scenario 12: session_close RELEASES the session's process. The
-// measured 2026-09-25 finding: session_close only closed the Telegram topic
-// and marked the store entry -- the antigravity child kept its cap slot for
-// as long as its turn ran (the mid-turn idle-reaper guard keeps the reaper
-// off too), and the cap refusal then named closed keys with advice that
-// could not work. Four hung turns wedged the backend until a bridge
-// restart. Here: cap 1, reaper off, one 30s turn, session_close mid-turn --
-// the child must die within the escalation bound and the next session_create
-// must SUCCEED (pre-fix it was refused forever). MCP-only boot, like 11a. ---
-async function scenario12() {
-  console.log('\n--- scenario 12: session_close on a BUSY session releases the child and frees the cap ---');
+// --- scenario 11: a Telegram-served mock-default bridge needs NO zcode
+// credential and never spawns zcode -- and with MOCK_STREAM_CHUNKS it
+// STREAMS: the ReplyStreamer edits a live preview, then the final render
+// lands with the identical echo text ---
+async function scenario11() {
+  console.log('\n--- scenario 11: mock-default + MOCK_STREAM_CHUNKS: no zcode anything, real streaming preview ---');
+  const { srv, port, calls, pushUpdate } = await startFakeTelegram();
+  const zcodeMarker = path.join(TMP, 's11-zcode-started.json');
+  const b = startBridge(
+    {
+      TELEGRAM_API_ROOT: `http://127.0.0.1:${port}`,
+      TELEGRAM_BOT_TOKEN: 'fake',
+      TELEGRAM_CHAT_ID: '-100111',
+      TELEGRAM_ALLOWED_USER_ID: '1',
+      DEFAULT_BACKEND: 'mock',
+      // ZCODE_BIN/ZCODE_WORKSPACE_DIR are demanded by config.js for every
+      // boot mode -- but for a mock-default bridge they are never USED: the
+      // fixture stand-in satisfies the variable and (asserted below) is
+      // never spawned, and no zcode credential exists anywhere in this run.
+      ZCODE_NODE_BIN: NODE,
+      ZCODE_BIN: ZCODE_FIXTURE,
+      ZCODE_WORKSPACE_DIR: TMP,
+      FIXTURE_ZCODE_MARKER: zcodeMarker, // must NEVER be written here
+      STORE_PATH: path.join(TMP, 's11-store.json'),
+      // The streaming knobs under test + a preview throttle small enough to
+      // flush mid-stream (the production default 5000ms would outlast it).
+      MOCK_STREAM_CHUNKS: '4',
+      MOCK_STREAM_INTERVAL_MS: '150',
+      STREAM_PROGRESS: 'preview',
+      STREAM_EDIT_INTERVAL_MS: '200',
+    },
+    's11',
+  );
+  try {
+    await waitFor(() => b.log.includes('starting.'), 15000, 'bridge boot');
+    check('the bridge boots Telegram-served with DEFAULT_BACKEND=mock and no zcode credential', b.proc.exitCode === null, `exitCode=${b.proc.exitCode}\n${b.log.slice(-2000)}`);
+    pushUpdate(tgMessage(77, 'stream this prompt'));
+    const final = await waitFor(
+      () => calls.edit.find((e) => (e.text || '').includes('[mock echo] stream this prompt')),
+      20000,
+      'the final render',
+    );
+    check('the streamed turn delivered the final render with the IDENTICAL echo text', !!final, JSON.stringify(calls.edit.map((e) => (e.text || '').slice(0, 50))));
+    const previewIdx = calls.edit.findIndex((e) => (e.text || '').startsWith('⌛'));
+    check('a live ⌛ preview edit landed BEFORE the final render (the ReplyStreamer streamed)', previewIdx >= 0 && previewIdx < calls.edit.indexOf(final), JSON.stringify(calls.edit.map((e) => (e.text || '').slice(0, 40))));
+    const previews = calls.edit.filter((e) => (e.text || '').startsWith('⌛'));
+    check('more than one preview edit (the deltas actually streamed, spaced apart)', previews.length >= 2, `${previews.length} preview edits`);
+    check('zcode was NEVER spawned (no credential, no install -- the fixture path is never executed)', !existsSync(zcodeMarker), b.log.slice(-2000));
+    check('no codex was involved either (mock-default touches nothing else)', !/codex/i.test(b.log), b.log.slice(-1000));
+  } finally {
+    b.proc.kill('SIGKILL');
+    srv.close();
+  }
+}
+
+// --- scenario 12a: session_close RELEASES the session's process on the
+// antigravity backend, where the finding was measured live: the child keeps
+// its AGY_MAX_PROCS cap slot for as long as its turn runs (the mid-turn
+// idle-reaper guard keeps the reaper off too), and a close that only marked
+// the store refused every later create forever, naming closed keys with
+// advice that could not work. Four hung turns wedged the backend until a
+// bridge restart. Here: cap 1, reaper off, one 30s turn, session_close
+// mid-turn -- the child must die within the escalation bound and the next
+// session_create must SUCCEED (pre-fix it was refused forever). MCP-only
+// boot, like 11a. ---
+async function scenario12Agy() {
+  console.log('\n--- scenario 12a: session_close on a BUSY antigravity session releases the child and frees the cap ---');
   const sock = path.join(TMP, 's12-state', 'agy-tg', 'mcp.sock');
   const agyHome = path.join(TMP, 's12-agy-home');
   const markerLog = path.join(TMP, 's12-agy-spawns.jsonl');
@@ -1151,7 +1233,7 @@ async function scenario12() {
   };
   const b = startBridge(baseEnv, 's12');
   try {
-    await waitFor(() => b.log.includes('MCP-only mode'), 15000, 'MCP-only mode notice');
+    await waitFor(() => b.log.includes('MCP-only'), 15000, 'MCP-only boot notice');
     await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, 'mcp unix socket bind');
     let id = 100;
     const call = (name, args) => unixJsonRpc(sock, [{ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } }]).then((ls) => ls[0]);
@@ -1200,12 +1282,109 @@ async function scenario12() {
   }
 }
 
+// --- scenario 12: session_close RELEASES the session (ported 2026-09-25
+// from ztg-status b0ef7a8, reshaped for this branch). There the measured
+// finding was a cap wedge: session_close only closed the Telegram topic, so
+// busy antigravity children kept their AGY_MAX_PROCS slots and a new create
+// was refused forever, naming closed keys. This branch has no antigravity
+// backend -- no cap -- but the same close-shaped hole: session_close marked
+// the store entry and never touched the session, so a mid-turn close
+// cancelled nothing (its parked message_send(wait) caller sat out the full
+// wait) and the runtime never heard of the close at all. Here: MCP-only
+// boot, zcode fixture, one 30s scripted turn, session_close mid-turn -- the
+// parked caller must be failed with the cancel verdict, the request log must
+// show session/stop then session/close carrying the raw id, a new
+// session_create must succeed on the same runtime, and the closed key must
+// stay closed. (The antigravity twin of this scenario -- the cap-slot half,
+// on the backend that measured the wedge -- is scenario12Agy above.) ---
+async function scenario12() {
+  console.log('\n--- scenario 12: session_close on a BUSY session cancels the turn and releases the session ---');
+  const sock = path.join(TMP, 's12', 'mcp.sock');
+  const reqLog = path.join(TMP, 's12-zcode-requests.jsonl');
+  const turnScript = path.join(TMP, 's12-turn-script.json');
+  // The turn outlives the scenario: only the close can end it.
+  writeFileSync(turnScript, JSON.stringify({ deltas: ['close', '-as', '-release'], deltaDelayMs: 150, terminalDelayMs: 30000 }));
+  const b = startBridge(
+    {
+      TELEGRAM_BOT_TOKEN: '', // MCP-only: no Telegram transport, so the close has no topic half -- the release IS the whole close
+      DEFAULT_BACKEND: 'zcode',
+      ZCODE_NODE_BIN: NODE,
+      ZCODE_BIN: ZCODE_FIXTURE,
+      ZCODE_WORKSPACE_DIR: TMP,
+      FIXTURE_ZCODE_LOG: reqLog,
+      FIXTURE_ZCODE_TURN_SCRIPT: turnScript,
+      STORE_PATH: path.join(TMP, 's12-store.json'),
+      MCP_UNIX_SOCKET: sock,
+    },
+    's12',
+  );
+  try {
+    await waitFor(() => b.log.includes('MCP-only'), 15000, 'MCP-only boot notice');
+    await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, 'mcp unix socket bind');
+    let id = 100;
+    const call = (name, args) => unixJsonRpc(sock, [{ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } }]).then((ls) => ls[0]);
+
+    const created = await call('session_create', { name: 's12-busy' });
+    const createdOk = created?.result?.isError === false;
+    check('(a) session_create completes', createdOk, JSON.stringify(created).slice(0, 400));
+    const key = createdOk ? JSON.parse(created.result.content[0].text).key : null;
+
+    // The BUSY half: a wait:true send parks an MCP caller for the turn's
+    // reply; the scripted turn runs 30s, so only the close can end either.
+    const parked = unixJsonRpc(sock, [{ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name: 'message_send', arguments: { key, text: 'a turn only the close can end', wait: true } } }]);
+    await waitFor(() => existsSync(reqLog) && readFileSync(reqLog, 'utf8').includes('session/send'), 15000, 'the turn to be dispatched to the runtime');
+    const progress = await call('progress_get', { key });
+    const progressText = progress?.result?.isError === false ? JSON.parse(progress.result.content[0].text) : {};
+    check('(a) the turn is BUSY mid-flight', progressText.active === true, JSON.stringify(progress).slice(0, 300));
+
+    // THE FIX over MCP: session_close cancels the mid-turn turn (the parked
+    // caller gets the verdict, not a timeout) and releases the session.
+    const closed = await call('session_close', { key });
+    check('(b) session_close answers ok', closed?.result?.isError === false, JSON.stringify(closed).slice(0, 300));
+    const parkedResp = (await Promise.race([parked, sleep(20_000).then(() => null)]))?.[0];
+    const parkedText = parkedResp?.result?.content?.[0]?.text || '';
+    check(
+      '(b) the parked message_send(wait) caller was failed with the cancel verdict',
+      parkedResp && parkedResp.result?.isError === true && /CANCELLED|closed/i.test(parkedText),
+      parkedResp ? JSON.stringify(parkedResp).slice(0, 300) : 'the caller was still parked 20s after the close',
+    );
+
+    // The release, on the fixture's request log: session/stop (the cancel)
+    // then session/close, carrying the raw session id.
+    const reqs = () => (existsSync(reqLog) ? readFileSync(reqLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+    const logReqs = await waitFor(() => (reqs().some((r) => r.method === 'session/close') ? reqs() : null), 10_000, 'the session/close request to reach the runtime');
+    const stopIdx = logReqs.findIndex((r) => r.method === 'session/stop');
+    const closeIdx = logReqs.findIndex((r) => r.method === 'session/close');
+    check('(b) the release cancelled the turn then closed the session, in that order', stopIdx >= 0 && closeIdx > stopIdx, `requests: ${JSON.stringify(logReqs.map((r) => r.method))}`);
+    check('(b) the close carries the raw session id', logReqs[closeIdx]?.params?.sessionId === 'fake-z-1', JSON.stringify(logReqs[closeIdx]));
+
+    // The release is surgical: the same runtime serves a brand-new session
+    // right after (the upstream scenario asserted this as "the cap was
+    // freed"; here there is no cap, so it asserts the runtime was not
+    // merely killed to free the session).
+    const second = await call('session_create', { name: 's12-after-close' });
+    check('(c) after session_close a new session_create SUCCEEDS on the same runtime', second?.result?.isError === false, JSON.stringify(second).slice(0, 400));
+
+    // The closed key stays terminal: no prompt or progress peek can
+    // resurrect it. (This branch's getOrCreateSession deliberately answers
+    // a closed topic's TELEGRAM prompt with a fresh conversation -- the MCP
+    // surface refuses.)
+    const after = await call('message_send', { key, text: 'anyone there?', wait: false });
+    check('(c) message_send to the closed key is refused', after?.result?.isError === true && /is closed/.test(after.result.content?.[0]?.text || ''), JSON.stringify(after).slice(0, 300));
+    const prog = await call('progress_get', { key });
+    check('(c) progress_get on the closed key refuses', prog?.result?.isError === true && /is closed/.test(prog.result.content?.[0]?.text || ''), JSON.stringify(prog).slice(0, 300));
+  } finally {
+    b.proc.kill('SIGKILL');
+    await sleep(300);
+  }
+}
+
 // EACH SCENARIO REPORTS ITS OWN FAILURE, so one scenario's throw (which is
 // how a bridge that dies at boot usually surfaces -- a waitFor timeout)
 // doesn't silently skip the scenarios after it: on the :546 boot-crash
 // this file exists to catch, EVERY non-zcode-default scenario is red, and
 // the run must say so rather than stop at the first.
-for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11, scenario12]) {
+for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11, scenario11Agy, scenario12, scenario12Agy]) {
     try {
       await s();
     } catch (e) {

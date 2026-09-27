@@ -58,7 +58,6 @@ import { pickForumChat } from './chatpick.js';
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { loadEnv, resolveEnvPath } from './env.js';
-import { existsSync } from 'node:fs';
 import { ZcodeBackend } from './backends/zcodeBackend.js';
 import { CodexBackend } from './backends/codexBackend.js';
 import { AntigravityBackend, AGY_MODEL_REF, parseAgyModelRef } from './backends/antigravityBackend.js';
@@ -66,13 +65,15 @@ import { reapOrphanAgyChildren } from './agyProcesses.js';
 import { MockBackend, MOCK_MODEL_REF } from './backends/mockBackend.js';
 import { makeSessionId, backendNameOf, rawSessionId } from './backend.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
+import { buildConfig, ConfigError } from './config.js';
 import { Store } from './store.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
 import { ProgressReporter, stepDetail, noteActivity, progressForTopic } from './progress.js';
-import { readZaiApiKey, readZaiProvider, fetchUsage, usagePercentages, usageSnapshotOrThrow, codexUsageSnapshotOrThrow, codexUsageFetchError, usageTelegramText, createUsageCache, unconfiguredUsageError } from './usage.js';
+import { readZaiApiKey, readZaiProvider, fetchUsage, usageSnapshotOrThrow, codexUsageSnapshotOrThrow, codexUsageFetchError, usageTelegramText, createUsageCache, unconfiguredUsageError, statusPercentages, statusModelFor, statusLineText } from './usage.js';
 import { runtimePreferences } from './runtimePrefs.js';
 import { mergeModelLists, resolveModelRef } from './modelref.js';
+import { parseCommandText, commandIsOurs, proxiedBackendSwitchRefusal } from './commands.js';
 import { createTopicStatusTracker } from './topicStatus.js';
 
 // Deliberately NOT ../.env (repo root == the zcode agent's own workspace):
@@ -83,190 +84,20 @@ import { createTopicStatusTracker } from './topicStatus.js';
 // compatibility fallbacks.
 loadEnv(resolveEnvPath({ override: process.env.ZCODE_TG_ENV || process.env.ZCODE_MOBILE_ENV }));
 
-// Numeric env with a fallback, and WITHOUT Number()'s traps: '' -> fallback,
-// garbage -> fallback, and a real 0 survives (AGY_IDLE_CLOSE_MIN=0 must stay
-// 0 -- it means "disable the reaper" -- where `|| fallback` would erase it).
-function numberEnv(name, fallback) {
-  const raw = process.env[name];
-  if (raw == null || String(raw).trim() === '') return fallback;
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : fallback;
+// Parsed in bridge/config.js so the three boot states (Telegram, MCP-only,
+// neither) are unit-testable without booting this file. A ConfigError is the
+// operator-facing boot refusal -- printed and exited exactly as the inline
+// need() it replaced did; anything else is a bug and propagates.
+let cfg;
+try {
+  cfg = buildConfig(process.env);
+} catch (e) {
+  if (e instanceof ConfigError) {
+    console.error(e.message);
+    process.exit(1);
+  }
+  throw e;
 }
-
-const cfg = {
-  // MCP-ONLY MODE (2026-09-24, with the antigravity backend). A deployment
-  // that configures an MCP listener (MCP_UNIX_SOCKET / MCP_HTTP_PORT) but no
-  // Telegram bot runs the whole bridge with a stub Telegram client: MCP
-  // session_create/message_send/replies_get/usage_get work unchanged, every
-  // Telegram call becomes a benign no-op, and the getUpdates loop never
-  // starts. This exists for the antigravity backend, whose owner-facing
-  // surfaces are the antigravity.google dashboard (via --remote-control) and
-  // MCP -- not a Telegram group. A missing bot token WITHOUT any MCP
-  // listener keeps the old hard failure with the config-file pointer (the
-  // guarded need() call just below the cfg block).
-  mcpOnly: !process.env.TELEGRAM_BOT_TOKEN && !!(process.env.MCP_UNIX_SOCKET?.trim() || process.env.MCP_HTTP_PORT?.trim()),
-  telegramToken: process.env.TELEGRAM_BOT_TOKEN || '',
-  // In MCP-only mode these two have nothing real to point at: chatId gets a
-  // syntactically-valid sentinel supergroup id (topics created against the
-  // stub Telegram are as synthetic as the chat), allowedUserId 0 trusts
-  // nobody -- which cannot matter, since no Telegram update is ever read.
-  chatId: Number(process.env.TELEGRAM_CHAT_ID) || -100,
-  allowedUserId: Number(process.env.TELEGRAM_ALLOWED_USER_ID) || 0,
-  nodeBin: process.env.ZCODE_NODE_BIN || process.execPath,
-  zcodeBin: need('ZCODE_BIN'),
-  workspaceDir: need('ZCODE_WORKSPACE_DIR'),
-  defaultModel: process.env.ZCODE_DEFAULT_MODEL || 'zai/glm-5.3-flash',
-  // Codex support is opt-in and lazily started (see getBackend()): a topic
-  // never touches `codex app-server` unless something actually asks for the
-  // 'codex' backend, so a deployment that never sets these env vars behaves
-  // exactly as before this file learned about a second backend.
-  codexBin: process.env.CODEX_BIN || 'codex',
-  codexHome: process.env.CODEX_HOME || '',
-  // Codex's OWN server-side default is currently gpt-6-astra (its newest,
-  // most expensive model, confirmed live via model/list's isDefault flag) --
-  // leaving this unset meant every Codex session silently ran Astra unless a
-  // human happened to /model away from it first. gpt-5.6-terra ("balanced
-  // agentic coding model for everyday work") is the junior/default tier --
-  // Codex's Sonnet-equivalent, positioned below Sol (its flagship, ≈Opus)
-  // and above Luna (fastest/cheapest, ≈Haiku). This is what every NEW
-  // session gets absent an explicit /model switch, and — because MCP's
-  // session_create has no model argument at all (see mcp.js) — it is also
-  // the ONLY model an MCP-driven Codex session can ever run: there is no
-  // code path by which an MCP caller could reach Sol or Astra.
-  codexDefaultModel: process.env.CODEX_DEFAULT_MODEL || 'gpt-5.6-terra',
-  // Set on a deployment that must never spend Astra-tier usage (e.g. this
-  // bridge's own test bots) — refuses `/model gpt-6-astra` in Telegram with
-  // a clear message rather than silently ignoring the switch. Off by
-  // default: a normal deployment's human owner may pick any model they
-  // like via Telegram, same as always. Codex-specific: zcode has no
-  // per-model cost tier this drastic to guard against.
-  codexDisallowAstra: /^(1|true|yes)$/i.test(process.env.CODEX_DISALLOW_ASTRA || ''),
-  // The antigravity backend (Google Antigravity CLI, `agy`): opt-in and
-  // lazily started exactly like codex -- a deployment that never sets
-  // AGY_HOME pays nothing for it. agyBin may be a bare 'agy' on PATH or the
-  // nix store path; agyHome is the credential HOME (the CODEX_HOME analogue:
-  // it holds .gemini/antigravity-cli/antigravity-oauth-token, 0600, one
-  // login per bridge model account -- never a path under the workspace);
-  // agyEffort is the reasoning-effort default for new sessions
-  // (low|medium|high, per George's single-model decision 2026-09-24).
-  agyBin: process.env.AGY_BIN || 'agy',
-  agyHome: process.env.AGY_HOME || '',
-  agyEffort: process.env.AGY_EFFORT || 'medium',
-  // agy's PRIVATE working directory -- never the workspace, which the
-  // executor writes and agy would read project config from (see
-  // antigravityClient.js). Made 0700 at spawn; empty = the default,
-  // <AGY_HOME's parent>/.local/state/agent-cage/agy-bridge/cwd
-  // (defaultAgyBridgeCwd).
-  agyBridgeCwd: process.env.AGY_BRIDGE_CWD || '',
-  // THE AGY PROCESS GC (2026-09-24). agy's stream-json mode runs one
-  // process per conversation with no multiplexing, and an idle child costs
-  // 93-181 MB anon RSS -- before the GC, children of finished sessions were
-  // never reaped and lived until the bridge died.
-  //   AGY_IDLE_CLOSE_MIN -- close a session's child after this many idle
-  //     minutes (clock: end of the last turn, or the spawn; a session
-  //     mid-turn is never reaped). Default 20; 0 disables.
-  //   AGY_MAX_PROCS -- live agy children per bridge. A new child at the cap
-  //     evicts the least-recently-used IDLE child; if all are mid-turn the
-  //     request is refused with the busy keys listed. Default 4.
-  // Closing a child never loses a conversation: agy persists it under
-  // AGY_HOME, and the next message respawn-resumes with --conversation.
-  agyIdleCloseMin: numberEnv('AGY_IDLE_CLOSE_MIN', 20),
-  agyMaxProcs: numberEnv('AGY_MAX_PROCS', 4),
-  // Which backend a brand-new topic/session runs on absent an explicit
-  // choice (a stored per-topic 'backend', or an MCP session_create
-  // 'backend' argument). Left at 'zcode' so the live deployment's behavior
-  // is unchanged unless this is deliberately switched.
-  defaultBackend: process.env.DEFAULT_BACKEND || 'zcode',
-  // Which backends are constructed AND started eagerly at boot: a comma
-  // list, defaulting to the default backend alone -- the bug-#3 property (a
-  // codex-default bridge never spawns `zcode app-server` at boot) is the
-  // DEFAULT, not a side effect, and an operator opts in per deployment
-  // (e.g. EAGER_BACKENDS=codex,zcode on a bridge whose chat must list both
-  // backends' models without a lazy first touch). Unknown names fail the
-  // boot loudly, exactly like an unknown DEFAULT_BACKEND.
-  eagerBackends: (process.env.EAGER_BACKENDS ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-  // Which backends /model spans: a comma list. RAW parse here; the default
-  // (every known backend except mock) is filled in after BACKEND_FACTORIES
-  // below, because it reads the two knobs this list sits between --
-  // defaultBackend and eagerBackends. Unknown names refuse to boot, same as
-  // EAGER_BACKENDS.
-  modelBackendsEnv: (process.env.MODEL_BACKENDS ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-  storePath: process.env.STORE_PATH || new URL('../data/sessions.json', import.meta.url).pathname,
-  permissionTimeoutMs: Number(process.env.PERMISSION_TIMEOUT_MS || 10 * 60 * 1000), // 10 min
-  // Empty string is "off"; a bare 0 means an ephemeral listen (what the e2e uses).
-  mcpHttpPort: process.env.MCP_HTTP_PORT?.trim() ? Number(process.env.MCP_HTTP_PORT) : null,
-  // The production transport: a per-fleet unix socket. Its PARENT directory
-  // is the agent's own state dir (0700), so the socket file is connectable
-  // by the agent account alone — that is the authentication, and there is
-  // no wire to encrypt.
-  mcpUnixSocket: process.env.MCP_UNIX_SOCKET || '',
-  autoApprovePermissions: process.env.AUTO_APPROVE_PERMISSIONS !== 'false', // default: on
-  defaultSessionMode: process.env.ZCODE_DEFAULT_MODE || 'yolo',
-  // Turns STREAM their reply into the placeholder; this paces those edits
-  // (one edit per message per interval, per the agreed Telegram-side
-  // contract -- the 20 msg/min group cap is explicitly not a constraint).
-  streamEditIntervalMs: Number(process.env.STREAM_EDIT_INTERVAL_MS || 5000),
-  // Turn-progress presentation. 'messages' (branch default): one Telegram
-  // message per milestone, last one live-updating, steps listed inside
-  // (bridge/progress.js). 'preview': the pre-branch single-placeholder
-  // streaming (bridge/streamer.js). 'off': a bare placeholder, edits only
-  // at completion.
-  streamProgress: process.env.STREAM_PROGRESS || 'messages',
-  // Telegram splits long input into several near-simultaneous messages; a
-  // burst within this window (measured from the LAST part, hard-capped by
-  // inputMergeMaxMs from the first) is treated as ONE prompt. Also applies
-  // to consecutive queue additions. 0 disables merging.
-  inputMergeMs: Number(process.env.INPUT_MERGE_MS ?? 800),
-  // Circuit breaker for blocking TaskOutput waits: a turn whose CURRENT
-  // tool is TaskOutput(block=true) for longer than this is auto-interrupted
-  // (session/stop; background tasks keep running and will still notify).
-  // The anti-pattern this ends -- an agent camping through 10-minute
-  // TaskOutput timeouts for hours -- was observed live three separate times
-  // before the guidance landed, and old-context sessions never read the
-  // guidance at all. 0 disables.
-  taskBlockLimitMs: Number(process.env.TASK_BLOCK_LIMIT_MS ?? 15 * 60 * 1000),
-  inputMergeMaxMs: Number(process.env.INPUT_MERGE_MAX_MS ?? 3000),
-  // A turn stuck inside ONE long tool call (VM boot, a slow test run, ...)
-  // gets no update() calls between the tool starting and finishing -- the
-  // placeholder's displayed elapsed time would otherwise freeze for the
-  // whole stretch and a genuinely-running turn looks abandoned. This is
-  // the "still alive" pulse period, independent of and coarser than
-  // streamEditIntervalMs above (which paces REAL content). 0 disables it.
-  streamHeartbeatMs: Number(process.env.STREAM_HEARTBEAT_MS ?? 60000),
-  // How long a posted AskUserQuestion prompt waits for a button tap before
-  // being declined (the turn keeps going either way).
-  userInputTimeoutMs: Number(process.env.USER_INPUT_TIMEOUT_MS || 10 * 60 * 1000),
-  // /file upload cap (Telegram bots accept up to 50 MB documents).
-  maxFileBytes: Number(process.env.MAX_FILE_MB || 45) * 1024 * 1024,
-  // Inbound (user-sent) document cap. 20 MB is Telegram's hard bot download
-  // limit -- anything larger can sit in chat but can never be fetched.
-  maxInboundFileBytes: Math.min(Number(process.env.MAX_INBOUND_FILE_MB ?? 20), 20) * 1024 * 1024,
-  // Opt-in-only safety net for a turn that's accepted but never emits
-  // turn.terminal. DISABLED by default (0) per owner decision 2026-09-01:
-  // a 20-minute cap killed real, merely-slow turns (turns here regularly
-  // run longer), so /stop is the designated escape hatch instead. Set
-  // TURN_TIMEOUT_MS to re-arm it.
-  turnTimeoutMs: Number(process.env.TURN_TIMEOUT_MS || 0),
-  // /usage reads the key from zcode's own config at call time -- never
-  // copied into this process's env or the store.
-  zaiConfigPath: process.env.ZAI_CONFIG_PATH || `${process.env.HOME}/.zcode/cli/config.json`,
-  maxQueuePerTopic: Number(process.env.MAX_QUEUE_PER_TOPIC || 20),
-  // shutdown()'s graceful-drain window: how long to let turns already in
-  // flight at redeploy time finish NATURALLY (through the ordinary
-  // finalizeTurn delivery path) before falling back to the interrupt-and-
-  // notify behavior. Defaults generous, in the same spirit as
-  // turnTimeoutMs=0 above: turns here regularly run 10-30+ minutes, and a
-  // redeploy that waits under load costs far less than an interrupted turn
-  // does. Set to 0 to skip draining and go straight to notify-and-kill.
-  shutdownDrainMs: Number(process.env.SHUTDOWN_DRAIN_MS ?? 25 * 60 * 1000), // 25 min
-};
-
 // The MCP gateway handle (module-level because finalizeTurn's reply hook
 // notes replies into it); created in main() when MCP_HTTP_PORT is set.
 let mcp = null;
@@ -286,70 +117,22 @@ const BOT_COMMANDS = [
   { command: 'help', description: 'Bridge commands' },
 ];
 
-function need(key) {
-  const v = process.env[key];
-  if (!v) {
-    // The first var every fresh install trips on is TELEGRAM_BOT_TOKEN, and
-    // a bare "missing required env var" sent people digging through the
-    // README. Point at the config path actually being searched (honoring
-    // ZCODE_TG_ENV and any fallbacks) and say what to do about it.
-    if (key.startsWith('TELEGRAM_')) {
-      const cfgPath = resolveEnvPath({ override: process.env.ZCODE_TG_ENV || process.env.ZCODE_MOBILE_ENV });
-      const have = existsSync(cfgPath);
-      const lines = [
-        `missing required env var: ${key}`,
-        have
-          ? `${cfgPath} exists but doesn't define ${key} -- fill it in (see .env.example in the repo).`
-          : `No config found. Create ${cfgPath} (template: .env.example in the repo) with at least TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID and TELEGRAM_ALLOWED_USER_ID.`,
-        `To use a different location, set ZCODE_TG_ENV=/path/to/.env.`,
-      ];
-      console.error(lines.join('\n'));
-      process.exit(1);
-    }
-    throw new Error(`missing required env var: ${key}`);
-  }
-  return v;
-}
-
-// A deployment with no Telegram bot AND no MCP listener has nothing to
-// serve: keep the old hard failure (with the config-file pointer) rather
-// than boot a bridge that answers to no one. Every other no-token shape is
-// MCP-only mode, handled by the stub below.
-if (!process.env.TELEGRAM_BOT_TOKEN && !cfg.mcpOnly) need('TELEGRAM_BOT_TOKEN');
-
-// THE MCP-ONLY TELEGRAM STAND-IN. Same method surface as TelegramClient
-// (everything index.js calls), returning benign shapes instead of touching
-// the network: getChat claims a forum so session_create's default-target
-// pick succeeds, createForumTopic hands out synthetic thread ids, sends
-// return synthetic message ids. One quiet log line at construction -- the
-// stub itself stays silent, mirrors and replies are deliberately no-ops.
-function makeNullTelegram() {
-  let nextMessageId = 1;
-  let nextThreadId = 9000;
-  console.log('[bridge] MCP-only mode: no TELEGRAM_BOT_TOKEN -- Telegram calls are no-ops, MCP serves everything');
-  const forumChat = (chatId) => ({ id: Number(chatId), type: 'supergroup', is_forum: true, title: 'mcp-only' });
-  return {
-    getUpdates: async () => [],
-    sendMessage: async () => ({ message_id: nextMessageId++ }),
-    editMessageText: async () => ({ message_id: nextMessageId++ }),
-    createForumTopic: async (p) => ({ message_thread_id: nextThreadId++, chat_id: p.chatId, name: p.name }),
-    closeForumTopic: async () => ({}),
-    getMe: async () => ({ id: 0, is_bot: true, username: 'mcp-only' }),
-    getChat: async ({ chatId }) => forumChat(chatId),
-    getChatMember: async () => ({ status: 'administrator' }),
-    leaveChat: async () => ({}),
-    pinChatMessage: async () => ({}),
-    deleteMessage: async () => ({}),
-    setMyCommands: async () => ({}),
-    sendDocument: async () => ({ message_id: nextMessageId++ }),
-    getFile: async () => ({ file_path: '' }),
-    downloadFile: async () => Buffer.alloc(0),
-    answerCallbackQuery: async () => ({}),
-  };
-}
-
 const store = new Store(cfg.storePath);
-const tg = cfg.mcpOnly ? makeNullTelegram() : new TelegramClient({ token: cfg.telegramToken });
+
+// THE TELEGRAM TRANSPORT IS OPTIONAL. Constructed only when a token is
+// configured; MCP-only mode (MCP_UNIX_SOCKET / MCP_HTTP_PORT with
+// TELEGRAM_BOT_TOKEN absent -- shared-group design section 6) runs the same
+// store, backends and MCP gateway with `tg` permanently null: no bot, no
+// group, no polling, no setMyCommands. The client's constructor refuses a
+// missing token, so the condition here is also what keeps that refusal from
+// killing a token-less boot.
+const tg = cfg.telegramToken ? new TelegramClient({ token: cfg.telegramToken }) : null;
+// THE ONE PREDICATE every MCP-only guard is written against. Each code path
+// that can run without Telegram checks it ONCE, at its single entry (the
+// function head, or the one branch that posts to the chat) -- never as
+// scattered `if (tg)` null-dodges. A path that genuinely needs Telegram and
+// is still reached refuses with a clear error instead of crashing on null.
+const telegramEnabled = () => tg !== null;
 
 // --- backend registry ---
 // One long-lived instance per backend KIND (not per session/topic) --
@@ -419,20 +202,27 @@ const BACKEND_FACTORIES = {
     if (!cfg.codexHome) throw new Error("the 'codex' backend needs CODEX_HOME set (see README)");
     return new CodexBackend({ codexBin: cfg.codexBin, codexHome: cfg.codexHome, cwd: cfg.workspaceDir, autoApprovePermissions: cfg.autoApprovePermissions });
   },
+  // The antigravity backend (Google Antigravity CLI, `agy`): opt-in and
+  // lazily started exactly like codex -- a deployment that never sets
+  // AGY_HOME (nor DEFAULT_BACKEND/EAGER_BACKENDS/MODEL_BACKENDS 'antigravity')
+  // pays nothing for it. The knobs live in bridge/config.js (agyBin/agyHome/
+  // agyEffort/agyBridgeCwd/agyIdleCloseMin/agyMaxProcs).
   antigravity: () => {
     if (!cfg.agyHome) throw new Error("the 'antigravity' backend needs AGY_HOME set (see README)");
     return new AntigravityBackend({
       agyBin: cfg.agyBin,
       agyHome: cfg.agyHome,
       cwd: cfg.workspaceDir,
+      // agy's PRIVATE working directory -- never the workspace (see
+      // antigravityClient.js). Empty = the backend's default beside AGY_HOME.
       privateCwd: cfg.agyBridgeCwd || null,
       effort: cfg.agyEffort,
       autoApprovePermissions: cfg.autoApprovePermissions,
-      // The GC knobs (see cfg above): minutes -> ms, 0 meaning disabled
-      // survives the translation.
+      // The GC knobs: minutes -> ms, 0 meaning disabled survives the
+      // translation.
       idleCloseMs: cfg.agyIdleCloseMin > 0 ? cfg.agyIdleCloseMin * 60_000 : 0,
       maxProcs: cfg.agyMaxProcs,
-      // C4: the marker every agy child carries and the boot sweep matches.
+      // The marker every agy child carries and the boot sweep matches.
       // Hash of the state path, so two bridges on one host never sweep each
       // other's children.
       bridgeMarker: agyBridgeMarker(),
@@ -481,11 +271,11 @@ function defaultModelFor(backendName) {
   return cfg.defaultModel;
 }
 
-// C4: the identity every agy child of THIS bridge carries in its
-// environment (CAGE_AGY_BRIDGE) and the boot-time orphan sweep matches. The
-// state path is what already distinguishes this deployment from any other
-// bridge on the host (two bridges, two stores, two markers -- neither's
-// sweep can kill the other's children).
+// The identity every agy child of THIS bridge carries in its environment
+// (CAGE_AGY_BRIDGE) and the boot-time orphan sweep matches. The state path
+// is what already distinguishes this deployment from any other bridge on
+// the host (two bridges, two stores, two markers -- neither's sweep can
+// kill the other's children).
 function agyBridgeMarker() {
   return createHash('sha256').update('zcode-tg agy bridge\n').update(cfg.storePath).digest('hex').slice(0, 16);
 }
@@ -493,12 +283,12 @@ function agyBridgeMarker() {
 // The MCP conversation key for a session id -- the string an MCP caller can
 // actually pass to session_close -- or null when the session has no topic.
 // Feeds the GC's reap logs and the cap refusal, which must speak keys, not
-// bare session ids.
+// bare session ids. sessionToTopic's `threadId` field IS the store key on
+// this branch (real topic keys and minted `m<N>` MCP-only keys alike), and
+// the store key is the conversation key every MCP tool takes.
 function mcpKeyForSession(sessionId) {
   const topic = sessionToTopic.get(sessionId);
-  if (!topic) return null;
-  const entry = store.getTopic(topic.threadId);
-  return entry ? keyFor(entry.chatId, entry.threadId) : null;
+  return topic ? topic.threadId : null;
 }
 
 function wireBackend(backend) {
@@ -694,7 +484,7 @@ async function shutdown(signal) {
   );
   await sleep(100); // let those rejections reach the socket before it closes
 
-  // C4: the backends' stop() is the bounded child escalation (stdin EOF,
+  // The backends' stop() is the bounded child escalation (stdin EOF,
   // SIGTERM, SIGKILL -- the antigravity backend's is <=15s total). Await it
   // under a race so one wedged backend cannot hang the redeploy past its
   // bound -- and so an agy child cannot outlive us holding its memory and
@@ -766,6 +556,13 @@ const pendingPrompts = new Map(); // threadId -> { parts: [promptText...], first
 // currently zcode only; Codex's nearest analog is experimental and unwired,
 // see bridge/backends/codexBackend.js.
 async function onUserInputRequest(params) {
+  // MCP-only: there is no chat to post the question into and no one to tap
+  // it, so waiting out the timeout would only park the turn. Decline at
+  // once -- the same answer the timeout eventually gives, honestly labeled --
+  // so the turn keeps moving; the reason goes back to the model.
+  if (!telegramEnabled()) {
+    return { action: 'decline', reason: 'bridge: MCP-only mode (no Telegram) -- nobody can answer a mid-turn question' };
+  }
   const topic = sessionToTopic.get(params.sessionId);
   const questions = Array.isArray(params.questions) ? params.questions : [];
   if (!topic || !questions.length || !questions.every((q) => Array.isArray(q.options) && q.options.length)) {
@@ -911,6 +708,14 @@ async function onPermissionRequest(params) {
     return { decision: 'deny', reason: 'bridge: no Telegram topic mapped for this session' };
   }
 
+  // MCP-only with AUTO_APPROVE_PERMISSIONS=false: an interactive prompt
+  // genuinely needs the Telegram chat its buttons live in -- the one path
+  // in this file with no MCP-only behavior. Refuse with a schema-valid deny
+  // naming the way out, rather than post into the void.
+  if (!telegramEnabled()) {
+    return { decision: 'deny', reason: 'bridge: MCP-only mode has no Telegram chat to approve in -- run with AUTO_APPROVE_PERMISSIONS=true (the default) to auto-approve' };
+  }
+
   const tokenMap = new Map();
   const buttons = params.options.map((opt) => {
     const token = 'p_' + randomBytes(6).toString('hex');
@@ -1039,6 +844,9 @@ function pickAutoApproveOption(options) {
 // a human is least likely to be watching to notice a gap.
 let autoApproveNoticeQueue = Promise.resolve();
 function queueAutoApproveNotice(text, threadId) {
+  // MCP-only: the audit notice has no chat to go to. The approval itself
+  // already happened in onPermissionRequest -- only the 🔓 mirror is skipped.
+  if (!telegramEnabled()) return;
   autoApproveNoticeQueue = autoApproveNoticeQueue
     .then(() => tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text }))
     .catch((e) => console.error('[bridge] failed to post auto-approve notice:', e.message))
@@ -1257,6 +1065,14 @@ async function adoptUnclaimedTurn(sessionId, params) {
   // something to land on; placeholderMessageId fills in once posted.
   const entry = { placeholderMessageId: null, textBuffer: '', startedAt: Date.now(), turnId: params.turnId, toolNames: new Map(), adopted: true };
   activeTurns.set(sessionId, entry);
+  // MCP-only: no chat to post the 🌀 placeholder into -- but the turn MUST
+  // stay tracked (unlike the send-failure drop below), or its reply would be
+  // generated and then silently lost with no activeTurns entry to deliver
+  // it through. finalizeTurn notes it into the MCP reply log either way.
+  if (!telegramEnabled()) {
+    console.log(`[bridge] adopted auto-started turn ${params.turnId} on session ${sessionId} (MCP-only: no placeholder to post)`);
+    return;
+  }
   let msg;
   try {
     // Fixed: was chatOf(threadId), a bare undefined module-global -- see the
@@ -1275,6 +1091,10 @@ async function adoptUnclaimedTurn(sessionId, params) {
 }
 
 async function handleBackgroundTaskFinished(sessionId, payload) {
+  // MCP-only: the 🌀 notice has no chat to go to. The runtime's own
+  // task-notification turn still runs and lands in the MCP reply log (see
+  // adoptUnclaimedTurn).
+  if (!telegramEnabled()) return;
   const topic = sessionToTopic.get(sessionId);
   if (!topic) return;
   const label = truncate(payload.description || payload.command || payload.taskId, 120);
@@ -1399,6 +1219,10 @@ function fmtDuration(ms) {
 // file -- the protocol has no native mechanism) are stripped here and sent
 // as documents after the text, workspace-restricted like /file.
 async function deliverReply(placeholderMessageId, threadId, text, footerHtml = '') {
+  // MCP-only: finalizeTurn has already noted the reply into the MCP reply
+  // log (replies_get / a parked message_send waiter) -- the Telegram edit-
+  // and-send below is the chat mirror, and there is no chat.
+  if (!telegramEnabled()) return;
   const { paths, cleaned } = extractFileMarkers(text);
   const chunks = renderReply(cleaned);
   if (!chunks.length || !chunks[0]) {
@@ -1495,12 +1319,16 @@ setInterval(async () => {
         turn.streamer?.stop();
         turn.progress?.stop();
         updateTopicStatus(topic.threadId, 'idle').catch(() => {});
-        const liveId = turnLiveMessageId(turn);
-        const text = `⚠️ Auto-interrupted after ${mins} min blocked on TaskOutput. Background tasks were NOT cancelled -- they keep running and will notify on completion; send a message to continue.`;
-        if (liveId) {
-          await tg.editMessageText({ chatId: chatOf(topic.threadId), messageId: liveId, text }).catch(() => {});
-        } else {
-          await tg.sendMessage({ chatId: chatOf(topic.threadId), messageThreadId: threadOf(topic.threadId), text }).catch(() => {});
+        // The breaker itself is transport-independent and still runs; only
+        // the chat label is Telegram's to show.
+        if (telegramEnabled()) {
+          const liveId = turnLiveMessageId(turn);
+          const text = `⚠️ Auto-interrupted after ${mins} min blocked on TaskOutput. Background tasks were NOT cancelled -- they keep running and will notify on completion; send a message to continue.`;
+          if (liveId) {
+            await tg.editMessageText({ chatId: chatOf(topic.threadId), messageId: liveId, text }).catch(() => {});
+          } else {
+            await tg.sendMessage({ chatId: chatOf(topic.threadId), messageThreadId: threadOf(topic.threadId), text }).catch(() => {});
+          }
         }
         void drainQueue(topic.threadId);
       }
@@ -1519,16 +1347,20 @@ setInterval(async () => {
     activeTurns.delete(sessionId);
     busySessions.delete(sessionId);
     const topic = sessionToTopic.get(sessionId);
-    tg
-      .editMessageText({
-        // Fixed: was chatOf(threadId), a bare undefined module-global -- see
-        // the identical fix in onUserInputRequest above.
-        chatId: chatOf(topic?.threadId),
-        messageId: turn.placeholderMessageId,
-        text: '⚠️ No response after a long time — the turn has been stopped. Send another message to try again (or /stop next time to cancel earlier).',
-      })
-      .catch((e) => console.error('[bridge] failed to edit watchdog-timeout notice:', e.message))
-      .finally(() => topic && drainQueue(topic.threadId));
+    if (telegramEnabled()) {
+      tg
+        .editMessageText({
+          // Fixed: was chatOf(threadId), a bare undefined module-global -- see
+          // the identical fix in onUserInputRequest above.
+          chatId: chatOf(topic?.threadId),
+          messageId: turn.placeholderMessageId,
+          text: '⚠️ No response after a long time — the turn has been stopped. Send another message to try again (or /stop next time to cancel earlier).',
+        })
+        .catch((e) => console.error('[bridge] failed to edit watchdog-timeout notice:', e.message))
+        .finally(() => topic && drainQueue(topic.threadId));
+    } else {
+      if (topic) void drainQueue(topic.threadId);
+    }
   }
 }, 60_000);
 
@@ -1548,8 +1380,33 @@ setInterval(async () => {
 // to creating a brand new one) -- see the caller in startTurn for why that
 // distinction matters despite resumeConversation itself having succeeded.
 async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
+  // A CLOSED entry is a finished conversation -- MCP session_close marked it,
+  // and in proxied mode so does the relay-synthesized forum_topic_deleted
+  // handler below (relay-owned-group design section 4: after a /rebind moves
+  // the topic away and it later comes BACK to this agent, the next message
+  // must start a FRESH session, not resume the closed one -- the closed
+  // session's upstream thread may not even exist anymore, and resuming would
+  // silently append a new conversation onto a session messageSend already
+  // refuses). Read off the store regardless of forceFresh, because a fresh
+  // session written over a closed entry must lift that mark: setTopic MERGES,
+  // so merely creating would leave closed:true stamped on the new session and
+  // messageSend would refuse a conversation that is demonstrably live again.
+  // The mark is cleared only by the successful creation write, so if
+  // session/create throws the topic stays closed and refuses, as it should.
+  // Applies in legacy mode too (there `closed` only ever comes from MCP
+  // session_close, whose topic Telegram itself has closed -- a message
+  // arriving after a reopen is a new conversation all the same).
+  const wasClosed = !!store.getTopic(threadId)?.closed;
   let entry = forceFresh ? null : store.getTopic(threadId);
   let resumed = false;
+  if (entry?.closed) {
+    console.log(`[bridge] topic ${threadId}: previous session was closed -- starting a fresh session for the new conversation`);
+    // Strip ONLY the session: the topic's own identity (backend, model, mode)
+    // survives into the fresh session, exactly as a /model fresh-switch keeps
+    // it. The `!entry.sessionId` stub branch below then routes this to the
+    // ordinary creation path.
+    entry = { ...entry, sessionId: undefined };
+  }
 
   // Migration for a store entry written before this backend refactor: its
   // sessionId is a bare zcode id with no "backend:" prefix. Treat it as
@@ -1608,7 +1465,9 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
     const mode = stored?.mode || cfg.defaultSessionMode;
     const created = await backend.createConversation({ workspaceDir: cfg.workspaceDir, workspaceKey, model, mode });
     entry = { sessionId: created.sessionId, model: created.model ?? model, mode: created.mode ?? mode, backend: backendName };
-    store.setTopic(threadId, entry);
+    // See wasClosed above: the explicit false is the point -- a plain entry
+    // merge would leave the old closed:true in place underneath it.
+    store.setTopic(threadId, wasClosed ? { ...entry, closed: false } : entry);
     console.log(`[bridge] topic ${threadId}: created ${backendName} session ${created.sessionId} (${entry.model}${entry.mode ? `, mode=${entry.mode}` : ''})`);
   }
 
@@ -1678,23 +1537,26 @@ const zaiUsageCache = createUsageCache({
   onFailure: (e) => console.error(`[bridge] usage refresh failed (figures will lag or be omitted): ${e.message}`),
 });
 
-// getUsageData returns whatever is cached RIGHT NOW, stale or not, and
-// refreshes the cache in the background if it is due.
-//
-// THE STALE VALUE, IMMEDIATELY, NEVER AWAITED: a status write fires on
-// every turn start/end across every topic, and must never stall one on a
-// call to an endpoint that can itself hang or 429 -- so this renders the
-// PREVIOUS cache and figures lag by at most one refresh cycle.
-function getUsageData() {
-  return zaiUsageCache.heartbeat();
+// The cache the status line renders from: the SAME source selection
+// usage_get uses (usageGetForMcp's branch on cfg.defaultBackend), on the
+// HEARTBEAT path -- whatever is cached RIGHT NOW, refreshes fired
+// fire-and-forget below, never explicitAsk, never awaited: a status write
+// fires on every turn start/end across every topic and must never stall
+// one on a call to an endpoint that can itself hang or 429. Mock &c keep
+// the z.ai cache (its unconfigured classification expects exactly that).
+function statusUsageCache() {
+  return cfg.defaultBackend === 'codex' ? codexUsageCache : zaiUsageCache;
 }
 
 function refreshUsagePercentages() {
-  getUsageData(); // fire-and-forget: this call alone is what keeps the cache warm
+  statusUsageCache().heartbeat(); // fire-and-forget: this call alone is what keeps the selected cache warm
 }
 
 function statusUsageText() {
-  const { shortPct, weekPct } = usagePercentages(zaiUsageCache.data);
+  const { shortPct, weekPct } = statusPercentages(cfg.defaultBackend, {
+    zaiData: zaiUsageCache.data,
+    codexData: codexUsageCache.data,
+  });
   const seg = [];
   if (shortPct != null) seg.push(`${shortPct}% session`);
   if (weekPct != null) seg.push(`${weekPct}% week`);
@@ -1763,7 +1625,7 @@ function antigravityUsageGetForMcp() {
     cachedAt: new Date().toISOString(),
   };
   if (u.lastQuotaError) snap.quotaError = u.lastQuotaError;
-  // C6: the live-process picture (children hold 93-181 MB each; the cap and
+  // The live-process picture (children hold 93-181 MB each; the cap and
   // the reaper manage it -- this says what they are managing right now).
   const procs = getBackend('antigravity').procSnapshot();
   snap.agyProcs = { live: procs.live, totalRssBytes: procs.totalRssBytes };
@@ -1811,13 +1673,18 @@ async function usageGetForMcp() {
   return snap;
 }
 
-// Owner-specified format (2026-09-01): one compact line -- one-word state,
-// "N queued" / "no queued", and usage as percentages only. Model and mode
-// are deliberately not here; /model and /mode each confirm their own effect.
-// C6: the agy segment of the pinned topic status -- live children and
-// their combined RSS, since idle agy processes are this bridge's only
-// unbounded memory consumer. Nothing when the antigravity backend is not
-// live or has no children (never constructs one just to report on it).
+// Owner-specified format: the tail is the 2026-09-01 line (one-word state,
+// "N queued" / "no queued", usage as percentages only); the shared-group
+// design (section 3) prepends identity -- fleet/model when TELEGRAM_FLEET
+// is set, the model alone when not -- so the pinned line names what the
+// topic runs. The model segment is the topic's STORED model, never the
+// backend default when one is stored. Mode stays off the line; /mode
+// confirms its own effect. All wording lives in usage.js's statusLineText,
+// pure and unit-tested; this only gathers what the topic actually is.
+// The agy segment of the pinned topic status -- live children and their
+// combined RSS, since idle agy processes are this bridge's only unbounded
+// memory consumer. Nothing when the antigravity backend is not live or has
+// no children (never constructs one just to report on it).
 function agyProcStatusText() {
   const snapshot = backends.antigravity?.procSnapshot?.();
   if (!snapshot?.live) return null;
@@ -1825,12 +1692,16 @@ function agyProcStatusText() {
 }
 
 function topicStatusText(threadId, state) {
-  const parts = [state === 'busy' ? 'busy' : 'idle', `${store.getQueue(threadId).length || 'no'} queued`];
-  const usage = statusUsageText();
-  if (usage) parts.push(usage);
+  const entry = store.getTopic(threadId);
+  const line = statusLineText({
+    fleet: cfg.fleet,
+    model: statusModelFor(entry, cfg.defaultBackend, defaultModelFor),
+    state,
+    queued: store.getQueue(threadId).length,
+    ...statusUsageText(),
+  });
   const agy = agyProcStatusText();
-  if (agy) parts.push(agy);
-  return `📌 ${parts.join(' · ')}`;
+  return agy ? `${line} · ${agy}` : line;
 }
 
 // Queue-depth changes are status changes too (owner-observed gap
@@ -1849,6 +1720,10 @@ function refreshTopicStatusForQueue(threadId) {
 // instead of each posting their own status message (the why is in
 // bridge/topicStatus.js).
 async function updateTopicStatus(threadId, state) {
+  // MCP-only: the pinned status line and its pin machinery are chat
+  // furniture -- every caller's write is skipped here, at the one place all
+  // of them funnel through.
+  if (!telegramEnabled()) return;
   const entry = store.getTopic(threadId);
   if (!entry) return; // topic never used (no store entry) -- nothing to report
   refreshUsagePercentages(); // fire-and-forget; this write uses the last cache
@@ -1957,6 +1832,19 @@ async function handleModelCommand(threadId, arg) {
   }
   const { backend: resolvedBackend, ref } = resolution;
 
+  // Proxied mode (relay-owned-group design, section 4): the resolver found
+  // the ref on ANOTHER backend -- the fresh-session switch below would move
+  // this topic to a provider its fleet/model binding does not name, so it
+  // is refused, exactly as /backend is. Within-backend switches (the
+  // resolved backend IS the topic's) fall through to the in-session switch,
+  // unchanged -- and with no unix: root this gate is inert, byte for byte
+  // today's cross-backend behavior.
+  const proxiedRefusal = proxiedBackendSwitchRefusal(cfg.proxied, currentBackend, resolvedBackend);
+  if (proxiedRefusal) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: proxiedRefusal });
+    return;
+  }
+
   // CODEX_DISALLOW_ASTRA (and any future per-backend dial) operates on the
   // backend the ref was FOUND in, not the topic's current one.
   if (resolvedBackend === 'codex' && ref === 'gpt-6-astra' && cfg.codexDisallowAstra) {
@@ -2007,7 +1895,8 @@ async function handleModelCommand(threadId, arg) {
   // never applied to the topic's current backend by default (that guess is
   // the recorded live bug this command's resolver exists to make impossible).
   // The switch promises "a fresh session on your next message", which is
-  // exactly the way out of a closed topic -- so it also un-closes.
+  // exactly the way out of a closed topic -- so it also un-closes (ported
+  // from ztg-status b0ef7a8; the closed mark belonged to the old session).
   store.setTopic(threadId, { ...entry, backend: resolvedBackend, sessionId: undefined, model: ref, closed: false });
   await updateTopicStatus(threadId, 'idle').catch(() => {});
   await tg.sendMessage({
@@ -2099,14 +1988,13 @@ const AGY_MCP_MODELS = [AGY_MODEL_REF, `${AGY_MODEL_REF}:low`, `${AGY_MODEL_REF}
 // (Terra, for Codex -- see cfg.codexDefaultModel).
 //
 // ANTIGRAVITY (fourth backend, policy decided 2026-09-24 per George's
-// single-model decision, written up in CLAUDE.md's "Model policy" section):
-// exactly one model (gemini-3.8-flash) whose reasoning effort is the only
-// switch. MCP callers express it as an effort-suffixed ref --
-// gemini-3.8-flash:low|medium|high (default medium via AGY_EFFORT) -- or the
-// bare ref, which keeps the session's current effort. This is the form
-// parseAgyModelRef accepts; the backend maps it to agy's `--effort` flag at
-// spawn/resume time (never an effort-suffixed slug: agy hard-errors on that
-// combination). Anything else is refused with a clear error, never ignored.
+// single-model decision): exactly one model (gemini-3.8-flash) whose
+// reasoning effort is the only switch. MCP callers express it as an
+// effort-suffixed ref -- gemini-3.8-flash:low|medium|high (default medium
+// via AGY_EFFORT) -- or the bare ref, which keeps the session's current
+// effort. This is the form parseAgyModelRef accepts; the backend maps it to
+// agy's `--effort` flag at spawn/resume time. Anything else is refused with
+// a clear error, never ignored.
 function validateMcpModel(backend, model) {
   if (model == null) return undefined;
   if (backend === 'antigravity') {
@@ -2143,6 +2031,19 @@ async function handleBackendCommand(threadId, arg) {
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `Already on '${arg}'.` });
     return;
   }
+  // Proxied mode (relay-owned-group design, section 4): a unix: API root
+  // means a relay stands in for Telegram, and this topic's provider is fixed
+  // by its fleet/model binding -- moving the conversation to another backend
+  // would leave the relay filing its messages under the old agent. Refused
+  // before any state changes and before the getBackend probe (the refusal is
+  // the binding's, not the backend's configurability); in the direct world
+  // this gate is inert. The relay-native way to reach '${arg}' is a topic
+  // of its own, which the pick binds to the agent holding that provider.
+  const proxiedRefusal = proxiedBackendSwitchRefusal(cfg.proxied, current, arg);
+  if (proxiedRefusal) {
+    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: proxiedRefusal });
+    return;
+  }
   if (busySessions.has(entry.sessionId)) {
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '⚠️ A turn is running in this topic — /stop it first, then switch backends.' });
     return;
@@ -2161,25 +2062,15 @@ async function handleBackendCommand(threadId, arg) {
     subscribedSessions.delete(entry.sessionId);
     sessionToTopic.delete(entry.sessionId);
   }
+  // Same un-close rule as the cross-backend /model switch above: the fresh
+  // session this promises is the way out of a closed topic (ztg-status
+  // b0ef7a8), and messageSend refuses a key still marked closed.
   store.setTopic(threadId, { ...entry, backend: arg, sessionId: undefined, model: undefined, closed: false });
   await tg.sendMessage({
     chatId: chatOf(threadId),
     messageThreadId: threadOf(threadId),
     text: `✅ This topic now runs on '${arg}' — a fresh session starts on your next message (history does not carry over).`,
   });
-}
-
-// --- /close: the Telegram face of session_close ---
-// Same terminal semantics over both surfaces: the session's process is
-// released (a mid-turn turn is cancelled -- the cancel is the verdict), the
-// Telegram topic itself is closed, and the key is marked closed so no later
-// prompt can spawn a fresh session into it. Unlike a UI close (which only
-// freezes the topic and is handled as forum_topic_closed below), this is
-// final; a reopened forum topic still refuses prompts.
-async function handleCloseCommand(threadId) {
-  const had = !!store.getTopic(threadId)?.sessionId;
-  await closeSessionForKey(threadId);
-  await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: had ? '🔒 Session closed and its process released. This topic is closed for good — send /backend or open a new topic to start fresh.' : '🔒 This topic is closed for good — send /backend or open a new topic to start fresh.' });
 }
 
 // --- /file: send a workspace file into the topic as a document ---
@@ -2329,69 +2220,93 @@ async function interruptTurn(sessionId, { killEverything }) {
 }
 
 // Release a topic's session PROCESS: the half every close path shares --
-// MCP session_close, Telegram /close, a forum_topic_closed/deleted service
-// message. Measured 2026-09-25: session_close only closed the Telegram
-// topic and marked the store entry, so an antigravity child (one
-// AGY_MAX_PROCS slot) outlived the close for as long as its turn ran, and
-// the cap refusal then named closed keys with advice ("session_close one")
-// that could not work -- four hung turns wedged the backend until a bridge
-// restart. Order matters:
+// MCP session_close, and the relay-synthesized forum_topic_deleted. Ported
+// 2026-09-25 from the antigravity fix (ztg-status b0ef7a8), where session_close
+// only closed the Telegram topic and marked the store entry: the conversation's
+// process outlived the close, a mid-turn close cancelled nothing (its parked
+// caller sat out the full wait), and the relay-topic-delete handler below
+// duplicated this shape by hand -- minus the release, so a closed topic's
+// session stayed subscribed and closeable only by accident. Order matters:
 //   1. A BUSY session's turn is cancelled first (interruptTurn: the same
 //      hard-stop core /stop uses, so the cancel is the verdict on every
-//      backend and the parked caller gets a terminal, not silence). The
-//      terminal still flows through the ordinary event path, so the
-//      busy/turn bookkeeping unwinds itself afterwards.
-//   2. closeConversation -- the backend's own release (antigravity: the
-//      bounded EOF/TERM/KILL escalation; zcode: session/close; codex/mock:
-//      deliberate no-ops). Not live the moment it starts: the cap and the
-//      busy refusal stop counting the session HERE, before the child is
-//      even dead.
-//   3. The bridge-side maps are dropped so nothing routes to the dead
-//      session id again. The store entry keeps its sessionId: antigravity
-//      conversations survive on disk and zcode sessions resume, so a topic
-//      closed from the Telegram UI that is later reopened just picks the
-//      conversation back up.
+//      backend). Unlike /stop, the bookkeeping is unwound HERE rather than
+//      left to the turn's terminal: the maps this function drops are what the
+//      terminal's delivery routes through, and mock's cancel emits no
+//      terminal at all -- in both cases busy/turn state would leak.
+//   2. closeConversation -- the backend's own release (zcode: session/close
+//      on the runtime; codex: deliberate no-op; mock: clears any still-
+//      pending streaming timers, same rule as its cancel()).
+//   3. The bridge-side maps are dropped so nothing routes to the released
+//      session id again. The store entry keeps its sessionId: zcode sessions
+//      resume, so a closed topic's next message starts a fresh conversation
+//      (getOrCreateSession's closed-entry path) instead of touching this one.
 // Errors on one path never stop the others: a close must close.
-async function releaseSessionForKey(key) {
+async function releaseSessionForKey(key, { killEverything = true, strandWhy = 'this conversation was closed, so its running turn was CANCELLED -- no reply is coming; create a new session and send again' } = {}) {
   const sessionId = store.getTopic(key)?.sessionId;
   if (!sessionId) return;
   const wasBusy = busySessions.has(sessionId);
   if (wasBusy) {
-    await interruptTurn(sessionId, { killEverything: true });
+    console.log(`[bridge] topic ${key}: releasing busy session ${sessionId} -- interrupting in-flight turn`);
+    await interruptTurn(sessionId, { killEverything });
+    busySessions.delete(sessionId);
+    const turn = activeTurns.get(sessionId);
+    activeTurns.delete(sessionId);
+    turn?.streamer?.stop();
+    turn?.progress?.stop();
   }
   await backendForSession(sessionId).closeConversation(sessionId).catch((e) => console.error(`[bridge] topic ${key}: closing session ${sessionId}: ${e.message}`));
   subscribedSessions.delete(sessionId);
   sessionToTopic.delete(sessionId);
-  // A caller parked on message_send(wait) gets an explicit "closed" instead
-  // of the turn's terminal (the maps above are gone, so finalizeTurn can no
+  // A caller parked on message_send(wait) gets an explicit reason instead of
+  // the turn's terminal (the maps above are gone, so finalizeTurn can no
   // longer noteReply) -- or, in the race where the reply landed first,
   // nothing: already-resolved waiters have nothing to fail.
   if (wasBusy) {
-    stranded(key, `this conversation was closed (session_close), so its running turn was CANCELLED -- no reply is coming; create a new session and send again`);
+    stranded(key, strandWhy);
   }
 }
 
-// The terminal form of a close, shared by MCP session_close and /close:
-// release the process (above), close the Telegram topic itself, and mark
-// the key closed -- closed is final, so every later prompt into the topic
-// (message_send's own guard, and dispatchUserPrompt's for the Telegram
-// side) is refused rather than spawning a fresh session over the grave.
+// The terminal form of a close, shared by MCP session_close (and any future
+// Telegram-surface close that is not the relay's /close -- that verb is the
+// RELAY's, which tears the topic down upstream and tells this bridge via the
+// forum_topic_deleted handler): release the process (above) and mark the key
+// closed. In MCP-only mode there is no topic to close -- the session itself
+// is the whole lifecycle, and marking it closed is what replies_get and
+// message_send key off.
 async function closeSessionForKey(key) {
   const t = store.getTopic(key) ?? {};
   await releaseSessionForKey(key);
-  await tg.closeForumTopic({ chatId: chatOf(key), messageThreadId: Number(t.threadId) }).catch(() => {});
+  if (telegramEnabled()) await tg.closeForumTopic({ chatId: chatOf(key), messageThreadId: Number(t.threadId) }).catch(() => {});
   store.setTopic(key, { closed: true });
 }
 
 // --- Telegram message handling ---
 
-// '/usage@botname arg' -> 'usage'; null for anything that isn't a command.
-// Only the bridge's OWN commands are intercepted below -- anything else
-// starting with '/' (zcode's /init, /memo, ...) passes through to the model
-// as ordinary input.
-function parseCommand(text) {
-  const m = text.match(/^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s|$)/);
-  return m ? m[1].toLowerCase() : null;
+// '/usage@botname arg' -> 'usage'; null for anything that isn't a command
+// for us. Parsing is bridge/commands.js's; the @-addressing verdict is THIS
+// bridge's, because only it knows whether the suffix is its own name.
+// A command carrying @somename belongs to somename or nobody (shared-group
+// design section 1): ours only when the suffix equals our own username, and
+// NEVER while getMe hasn't answered -- "assume ours" is how two bots in one
+// group both end up answering. Only our own commands are intercepted below;
+// anything else starting with '/' (zcode's /init, /memo, ...) passes through
+// to the model as ordinary input. A foreign-suffixed command, though, is
+// dropped OUTRIGHT -- not run as a command and not passed to the model
+// either: an owner typing /stop@otherbot is talking to the other bot.
+function resolveOwnCommand(text) {
+  const parsed = parseCommandText(text);
+  if (!parsed) return { command: null };
+  if (parsed.suffix == null) return { command: parsed.name };
+  const own = botUsername();
+  if (!own) {
+    console.warn(`[bridge] /${parsed.name}@${parsed.suffix} dropped: own username unknown (getMe not answered yet) -- a suffixed command is never assumed ours`);
+    return { command: null, drop: true };
+  }
+  if (!commandIsOurs(parsed.suffix, own)) {
+    console.log(`[bridge] /${parsed.name}@${parsed.suffix} is addressed to another bot -- dropped`);
+    return { command: null, drop: true };
+  }
+  return { command: parsed.name };
 }
 
 async function handleUsageCommand(threadId) {
@@ -2411,12 +2326,11 @@ function helpText() {
     'Bridge commands (each scoped to this topic):',
     '/usage — plan usage & quota for this bridge’s backend',
     '/stop, /cancel — cancel the running turn',
-    '/close — release this topic’s session process and close the topic (final)',
     '/queue — show queued messages',
     '/clearqueue — drop queued messages',
     '/model [name] — list / switch this topic’s model',
     '/mode [name] — list / switch this topic’s mode',
-    '/backend [name] — list / switch this topic’s backend (zcode/codex/antigravity/mock)',
+    '/backend [name] — list / switch this topic’s backend (zcode/codex/mock)',
     '/file <path> — send a workspace file here',
     '',
     'Anything else is sent to the model. Replies stream into the ⌛ placeholder message. Messages sent while a turn is running are queued and run in order; reply to any message to quote it to the model. Send a file as a document and the agent reads it (saved to inbox/, your caption = instruction).',
@@ -2469,12 +2383,43 @@ const chatOf = (key) => {
 };
 const threadOf = (key) => parseTopicKey(key).threadId;
 
-// The bot's own Telegram user id, fetched once -- getChatMember needs it to
-// ask about our own admin status when auto-picking a session target.
-let botUserId = null;
+// The session key an MCP-only session_create mints: a synthetic `m<N>`,
+// numbered past anything already in the store (so a restart can't mint a
+// colliding key over a live session). Why not the chat-less `c<chat>` form
+// keyFor already has: that form keys a real chat, and without Telegram there
+// is no chat id to put in it -- every MCP-only session would collapse onto
+// the same `c<chat>` string and share one conversation, reply log and
+// session. `m<N>` is unique per session, names no chat that doesn't exist,
+// and if a bug ever carried one into a Telegram call anyway, parseTopicKey's
+// no-match fallback sends it to chat 0 -- where the call fails loudly rather
+// than posting into some real group.
+function mintMcpOnlySessionKey() {
+  let max = 0;
+  for (const key of Object.keys(store.data.topics)) {
+    const m = /^m(\d+)$/.exec(key);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `m${max + 1}`;
+}
+
+// The bot's own Telegram identity, fetched once -- the id getChatMember
+// needs to ask about our own admin status when auto-picking a session
+// target, and the username a command's @suffix is compared against
+// (resolveOwnCommand above). Until getMe answers, username is null and a
+// suffixed command is treated as NOT ours, never assumed ours.
+let botSelf = null; // { id, username }
+async function ensureBotSelf() {
+  if (botSelf == null) {
+    const me = await tg.getMe();
+    botSelf = { id: me.id, username: me.username ?? null };
+  }
+  return botSelf;
+}
 async function ensureBotUserId() {
-  if (botUserId == null) botUserId = (await tg.getMe()).id;
-  return botUserId;
+  return (await ensureBotSelf()).id;
+}
+function botUsername() {
+  return botSelf?.username ?? null;
 }
 
 // A group the bot is IN and has SERVED (the owner spoke in it, created a
@@ -2549,8 +2494,107 @@ function handleMyChatMember(m) {
     .catch((e) => console.error('[bridge] leaveChat failed:', e.message));
 }
 
+// --- the relay's synthetic topic deletion (relay-owned-group design §4,
+// "Re-bind and close") ---
+//
+// In proxied mode the relay stands between this bridge and Telegram, and
+// when a bound topic moves away -- an owner's /rebind or /close, or the
+// topic physically deleted through the Telegram UI -- the relay synthesizes
+// a Bot-API-shaped MESSAGE update carrying `forum_topic_deleted: {}` into
+// this bridge's getUpdates stream. It is NOT a real Bot API field (Telegram
+// itself has forum_topic_closed, and sends it as a service message) -- it is
+// the relay's agreed synthetic marker for "this topic is no longer yours".
+//
+// NOT forum_topic_closed, deliberately: a human closing a topic in the
+// Telegram UI is REVERSIBLE (they can reopen it), so it must not end the
+// session here; only the deletion marker does. A real forum_topic_closed
+// service message therefore falls through to the ordinary message path and
+// is ignored like any other service message.
+//
+// THE TRUST BOUNDARY is the transport, not the message: the synthetic
+// update's `from` is the relay's synthetic identity -- not the owner -- so
+// the owner gate must not (and does not) see this message. It is accepted
+// ONLY when cfg.proxied (TELEGRAM_API_ROOT is a unix: root): only the relay
+// can inject updates into that stream, because only the relay is on the
+// other end of the socket. In legacy mode a real Telegram never sends this
+// field, and a bridge must ignore it rather than let any injected-looking
+// update close a session -- the field's arrival there would mean something
+// is wrong, and closing a session is the one act we do not take on a
+// maybe-hostile maybe-nothing.
+//
+// What it does is the MCP session_close path MINUS the Telegram half, through
+// the shared releaseSessionForKey (ported from ztg-status b0ef7a8):
+//   - any in-flight turn for the topic is stopped cleanly (the turn's
+//     session is cancelled; background tasks keep running so their
+//     completion notifications still land -- the circuit-breaker rule,
+//     since killing them would orphan exactly the work the model was
+//     waiting on; hence killEverything: false, where session_close's
+//     terminal close is the hard-stop form);
+//   - the session's process is released -- the backend's closeConversation
+//     runs and the bridge maps are dropped, so a closed topic's session is
+//     genuinely gone, not merely unmarked (the release this handler predated:
+//     it used to interrupt the turn and stop there, leaving the session
+//     subscribed and never closed on the backend);
+//   - queued messages are dropped and their parked MCP callers told why;
+//   - the store entry is marked closed, which messageSend then refuses;
+//   - and closeForumTopic is NOT called: the topic is no longer ours (it is
+//     deleted, or the binding has moved), the relay owns the real topic
+//     lifecycle, and the proxy's scope check would 403 the call anyway.
+// No chat writes at all, for the same reason: the topic may already be gone
+// or re-bound elsewhere, and every send would just 403.
+//
+// Idempotent by design: the relay may deliver the delete more than once
+// (at-least-once across a restart, design section 9), and a second delete
+// for an unknown or already-closed topic is a logged no-op.
+async function handleRelayTopicDeleted(message) {
+  if (!cfg.proxied) {
+    console.warn(`[bridge] ignoring forum_topic_deleted for thread ${message.message_thread_id} in chat ${message.chat?.id}: not in proxied mode (a real Telegram never sends this field)`);
+    return;
+  }
+  const threadId = keyFor(message.chat?.id, message.message_thread_id);
+  const entry = store.getTopic(threadId);
+  if (!entry) {
+    console.log(`[bridge] forum_topic_deleted: no session for topic ${threadId} -- nothing to close (already gone, or never bound)`);
+    return;
+  }
+  if (entry.closed) {
+    console.log(`[bridge] forum_topic_deleted: topic ${threadId} is already closed -- ignoring duplicate`);
+    return;
+  }
+  console.log(`[bridge] forum_topic_deleted: closing session for topic ${threadId} (relay reports the topic deleted or re-bound)`);
+  // Stop the in-flight turn FIRST, so its streamer/progress views cannot
+  // fire another edit into a topic that is leaving, and so the turn's own
+  // terminal (if the cancel races one) finalizes into a topic entry that is
+  // already closed rather than re-busying it -- then closeConversation and
+  // the map drops, so the session's process is genuinely released (see
+  // releaseSessionForKey; the relay shape keeps its gentler interrupt).
+  await releaseSessionForKey(threadId, {
+    killEverything: false,
+    strandWhy: 'the topic was deleted or re-bound to another agent while a turn was running, so the turn was CANCELLED -- no reply is coming',
+  });
+  // Queued prompts would otherwise drain straight into a fresh session after
+  // a re-bind -- a message the user sent to the OLD conversation must not run
+  // on a new one. Parked MCP waiters are told why their reply never comes.
+  const queued = store.getQueue(threadId).length;
+  if (queued) {
+    store.setQueue(threadId, []);
+    stranded(threadId, `the topic was deleted or re-bound to another agent while this message was queued, so it was DROPPED and will not be answered`);
+    console.log(`[bridge] forum_topic_deleted: dropped ${queued} queued message(s) for topic ${threadId}`);
+  }
+  // The sessionClose mark: messageSend refuses from here on. Deliberately
+  // NOT tg.closeForumTopic() -- see this function's comment.
+  store.setTopic(threadId, { closed: true });
+}
+
 async function handleMessage(message) {
   try {
+  // The relay's synthetic deletion arrives with a non-owner `from`, so it
+  // must be handled BEFORE the owner gate (which would drop it). The handler
+  // itself carries the proxied-mode trust boundary.
+  if (message.forum_topic_deleted) {
+    await handleRelayTopicDeleted(message);
+    return;
+  }
   if (message.from?.is_bot) return;
   if (!isOwner(message.from?.id)) {
     console.warn(`[bridge] ignoring message from unauthorized user ${message.from?.id} in chat ${message.chat?.id}`);
@@ -2584,31 +2628,6 @@ async function handleMessage(message) {
     updateTopicStatus(topicKey, 'idle').catch(() => {});
     return;
   }
-  // A topic closed or deleted from the Telegram UI releases its session
-  // process, exactly as session_close does -- otherwise the child (and its
-  // AGY_MAX_PROCS slot) survived the close for as long as its turn ran.
-  // The two service messages differ in reversibility and in where they
-  // carry the thread id:
-  //   - forum_topic_closed freezes the topic and can be undone (reopen):
-  //     the session is released NOW and the store keeps its sessionId, so a
-  //     reopened topic's next message resumes the conversation. `closed` is
-  //     NOT set -- the topic's prompts stay legal.
-  //   - forum_topic_deleted is final, and the deletion notice arrives in
-  //     the chat with the doomed thread id in its payload rather than on
-  //     the message itself. The key is marked closed so a stray prompt at
-  //     that thread id is refused instead of spawning a phantom session.
-  if (message.forum_topic_closed || message.forum_topic_deleted) {
-    const deleted = message.forum_topic_deleted;
-    const threadNum = Number(deleted?.message_thread_id ?? messageThread);
-    const key = threadNum ? keyFor(chatId, threadNum) : null;
-    const entry = key ? store.getTopic(key) : null;
-    if (entry) {
-      await releaseSessionForKey(key);
-      if (deleted) store.setTopic(key, { closed: true });
-      console.log(`[bridge] topic ${key} ${deleted ? 'deleted' : 'closed'}${entry.sessionId ? ' -- session released' : ''}`);
-    }
-    return;
-  }
   // DMs and topicless groups carry no thread and are served whole (the
   // conversation key is the chat alone); topics keep their per-topic session.
   if (!message.text && !message.document) return; // stickers, photos, voice, ... still ignored
@@ -2623,7 +2642,8 @@ async function handleMessage(message) {
     fileNote = await receiveInboundDocument(message, threadId);
     if (fileNote === null) return; // specific failure already posted to the topic
   }
-  const command = parseCommand(message.text ?? '');
+  const { command, drop } = resolveOwnCommand(message.text ?? '');
+  if (drop) return; // addressed to another bot (or ours not yet known): never ours to act on
 
   // Bridge-own commands that never need a session run before anything else,
   // so a stray /usage in a brand-new topic doesn't spawn a zcode session.
@@ -2645,10 +2665,6 @@ async function handleMessage(message) {
   }
   if (command === 'file') {
     await handleFileCommand(threadId, message.text.split(/\s+/).slice(1).join(' ').trim());
-    return;
-  }
-  if (command === 'close') {
-    await handleCloseCommand(threadId);
     return;
   }
   if (command === 'help') {
@@ -2775,7 +2791,12 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
     refreshTopicStatusForQueue(threadId);
     return null;
   }
-  const notice = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: noticeText });
+  // MCP-only: no "📥 Queued" notice to post -- the queue itself (persistence,
+  // merging, drain order) is transport-independent and still works; the
+  // queued item just carries a null placeholder, which drainQueue handles.
+  const notice = telegramEnabled()
+    ? await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: noticeText })
+    : { message_id: null };
   store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id, at: Date.now() }]);
   refreshTopicStatusForQueue(threadId);
   return null;
@@ -2794,18 +2815,6 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
 // Callers that don't care (handleMessage, the merge window, and drainQueue
 // via startTurn) ignore the value.
 async function dispatchUserPrompt(threadId, promptText, command) {
-  // A closed topic is final (MCP session_close or /close): refuse BEFORE
-  // getOrCreateSession, whose resume path would otherwise spawn a fresh
-  // child for the released session and put it straight back into the
-  // backend's cap -- the exact leak this close fix exists to drain. /stop
-  // needs no exemption: its session is gone by construction, and this
-  // notice is the honest version of "nothing is running".
-  if (store.getTopic(threadId)?.closed) {
-    await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '🔒 This topic is closed. Its session was released; create a new session (or session_create) for a fresh one.' });
-    const why = 'this conversation is closed (session_close ran on it); the message was refused, not delivered';
-    stranded(threadId, why);
-    return why;
-  }
   // A redeploy is draining: don't start anything new (getOrCreateSession
   // below can itself call session/create, work an about-to-restart process
   // has no way to see through to completion). /stop and /cancel are exempt
@@ -2814,11 +2823,13 @@ async function dispatchUserPrompt(threadId, promptText, command) {
   if (draining && command !== 'stop' && command !== 'cancel') {
     const queue = store.getQueue(threadId);
     if (queue.length >= cfg.maxQueuePerTopic) {
-      await tg.sendMessage({
-        chatId: chatOf(threadId),
-        messageThreadId: threadOf(threadId),
-        text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. Try again once the bridge is back.`,
-      });
+      if (telegramEnabled()) {
+        await tg.sendMessage({
+          chatId: chatOf(threadId),
+          messageThreadId: threadOf(threadId),
+          text: `⚠️ Queue for this topic is full (${cfg.maxQueuePerTopic}) — this message was dropped. Try again once the bridge is back.`,
+        });
+      }
       const why = `this conversation's queue is full (${cfg.maxQueuePerTopic}) and the bridge is restarting, so the message was DROPPED, not queued. Nothing will answer it. Send it again once the bridge is back`;
       stranded(threadId, why);
       return why;
@@ -2835,9 +2846,11 @@ async function dispatchUserPrompt(threadId, promptText, command) {
     // only a server-side log line. The per-update catch in main() logs it
     // but was never going to tell them anything.
     console.error(`[bridge] topic ${threadId}: failed to get/create session:`, e);
-    await tg
-      .sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Couldn't start a session: ${e.message}` })
-      .catch((sendErr) => console.error('[bridge] failed to post session-creation failure notice:', sendErr.message));
+    if (telegramEnabled()) {
+      await tg
+        .sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: `⚠️ Couldn't start a session: ${e.message}` })
+        .catch((sendErr) => console.error('[bridge] failed to post session-creation failure notice:', sendErr.message));
+    }
     const why = `the agent session could not be started, so this message was never delivered to a model: ${e.message}`;
     stranded(threadId, why);
     return why;
@@ -2882,7 +2895,11 @@ async function dispatchUserPrompt(threadId, promptText, command) {
     return;
   }
 
-  const placeholder = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '⌛ …' });
+  // MCP-only: no ⌛ placeholder to post -- startTurn runs with a null
+  // placeholder and delivers through the MCP reply log alone.
+  const placeholder = telegramEnabled()
+    ? await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '⌛ …' })
+    : { message_id: null };
   return startTurn(threadId, session, promptText, placeholder.message_id);
 }
 
@@ -2904,6 +2921,11 @@ async function dispatchUserPrompt(threadId, promptText, command) {
 // id. Only a fleet whose TELEGRAM_CHAT_ID is something else -- a DM, a stale id
 // -- takes the "c<chat>:t<thread>" form and shows the bug.
 function attachTurnView(turn, { placeholderMessageId, threadId }) {
+  // MCP-only: the progress views exist to post Telegram messages; without a
+  // transport the turn simply has no view (turn.progress/turn.streamer stay
+  // unset -- every consumer already treats them as optional) and delivery is
+  // finalizeTurn's MCP reply log alone.
+  if (!telegramEnabled()) return;
   const common = { tg, chatId: chatOf(threadId), threadId: threadOf(threadId), minEditIntervalMs: cfg.streamEditIntervalMs };
   if (cfg.streamProgress === 'messages') {
     turn.progress = new ProgressReporter({ ...common, seedMessageId: placeholderMessageId, editIntervalMs: cfg.streamEditIntervalMs });
@@ -3024,9 +3046,11 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
     // process is already counting down to exit behind it.
     const why = `the prompt could not be handed to the model, so this turn never ran and nothing will answer it: ${e.message}`;
     stranded(threadId, why);
-    await tg
-      .editMessageText({ chatId: chatOf(threadId), messageId: placeholderMessageId, text: `⚠️ Failed to send: ${e.message}` })
-      .catch((editErr) => console.error('[bridge] failed to edit failure notice:', editErr.message));
+    if (telegramEnabled()) {
+      await tg
+        .editMessageText({ chatId: chatOf(threadId), messageId: placeholderMessageId, text: `⚠️ Failed to send: ${e.message}` })
+        .catch((editErr) => console.error('[bridge] failed to edit failure notice:', editErr.message));
+    }
     // The message behind this failed one doesn't deserve to wait forever
     // just because its predecessor's send was rejected.
     void drainQueue(threadId);
@@ -3056,9 +3080,11 @@ async function drainQueue(threadId) {
     session = await getOrCreateSession(threadId);
   } catch (e) {
     console.error(`[bridge] topic ${threadId}: failed to get/create session for a queued message:`, e);
-    await tg
-      .editMessageText({ chatId: chatOf(threadId), messageId: next.placeholderMessageId, text: `⚠️ Couldn't start a session: ${e.message}` })
-      .catch(() => {});
+    if (telegramEnabled()) {
+      await tg
+        .editMessageText({ chatId: chatOf(threadId), messageId: next.placeholderMessageId, text: `⚠️ Couldn't start a session: ${e.message}` })
+        .catch(() => {});
+    }
     stranded(threadId, `this message reached the front of the queue and the agent session could not be started, so nothing will answer it: ${e.message}`);
     await drainQueue(threadId); // give the one behind it the same chance
     return;
@@ -3070,9 +3096,11 @@ async function drainQueue(threadId) {
     store.setQueue(threadId, [next, ...store.getQueue(threadId)]);
     return;
   }
-  await tg
-    .editMessageText({ chatId: chatOf(threadId), messageId: next.placeholderMessageId, text: '⌛ …' })
-    .catch((e) => console.error('[bridge] failed to promote queued notice to placeholder:', e.message));
+  if (telegramEnabled()) {
+    await tg
+      .editMessageText({ chatId: chatOf(threadId), messageId: next.placeholderMessageId, text: '⌛ …' })
+      .catch((e) => console.error('[bridge] failed to promote queued notice to placeholder:', e.message));
+  }
   await startTurn(threadId, session, next.text, next.placeholderMessageId);
 }
 
@@ -3136,14 +3164,21 @@ async function handleCallbackQuery(cq) {
 // --- main poll loop ---
 async function main() {
   console.log(`[bridge] starting. chat=${cfg.chatId} workspace=${cfg.workspaceDir} model=${cfg.defaultModel}`);
+  // THE MCP-ONLY BOOT LINE, and the only announcement the mode gets (its
+  // legibility is the point -- shared-group design section 6): no token
+  // means no Telegram transport, so nothing below may construct one, poll,
+  // or post -- zcode/codex are reachable as MCPs and nothing else.
+  if (!telegramEnabled()) {
+    console.log('[bridge] MCP-only: no Telegram transport configured (TELEGRAM_BOT_TOKEN absent)');
+  }
 
-  // C4, boot half: an agy child that outlived the bridge -- a SIGKILLed or
-  // crashed predecessor -- still holds its memory and its credential HOME,
-  // and nothing is its parent any more. Every child we spawn carries our
-  // bridge marker; sweep our own uid's processes for that marker on
-  // processes whose parent is not us, before anything else can spawn more.
-  // Fire-and-forget: the sweep's own TERM/KILL escalation is bounded and
-  // must not delay boot.
+  // Boot half of the agy orphan sweep: an agy child that outlived the
+  // bridge -- a SIGKILLed or crashed predecessor -- still holds its memory
+  // and its credential HOME, and nothing is its parent any more. Every
+  // child we spawn carries our bridge marker; sweep our own uid's processes
+  // for that marker on processes whose parent is not us, before anything
+  // else can spawn more. Fire-and-forget: the sweep's own TERM/KILL
+  // escalation is bounded and must not delay boot.
   if (cfg.agyHome) {
     reapOrphanAgyChildren({ marker: agyBridgeMarker(), log: (m) => console.error(`[bridge] [antigravity] ${m}`) }).catch((e) =>
       console.error(`[bridge] [antigravity] orphan sweep failed: ${e.message}`),
@@ -3167,9 +3202,9 @@ async function main() {
     });
     mcp.wire({
       // sessionCreate's 5th argument is the calling MCP connection's id
-      // (the creator tie, C2): the antigravity GC closes a vanished
-      // connection's sessions. Other backends have nothing to GC (one
-      // long-lived multiplexing process) and ignore the id.
+      // (the creator tie): the antigravity GC closes a vanished connection's
+      // sessions. Other backends have nothing to GC (one long-lived
+      // multiplexing process) and ignore the id.
       sessionCreate: async (name, chatIdNum, backendName, modelArg, connId) => {
         const backend = backendName || cfg.defaultBackend;
         if (!KNOWN_BACKENDS.includes(backend)) throw new Error(`unknown backend: ${backend} (known: ${KNOWN_BACKENDS.join(', ')})`);
@@ -3185,6 +3220,31 @@ async function main() {
         // resolve to it (only the four exact refs in this map are ever
         // accepted, not arbitrary strings that pattern-match).
         const model = validateMcpModel(backend, modelArg);
+        // MCP-ONLY (shared-group design section 6): no transport means no
+        // forum chat to pick and no topic to create. The key is a synthetic
+        // `m<N>` (see mintMcpOnlySessionKey), the backend session is created
+        // exactly as today, and the caller is told `telegram: false` so it
+        // knows replies come through replies_get / this tool's wait alone.
+        // An explicit chat_id names a Telegram chat, which cannot exist
+        // here -- refuse rather than silently ignore it.
+        if (!telegramEnabled()) {
+          if (chatIdNum != null) throw new Error('session_create: chat_id names a Telegram chat, but this bridge runs MCP-only (no Telegram transport configured)');
+          const key = mintMcpOnlySessionKey();
+          // `threadId: key` -- the store's threadId field holds the RAW
+          // Telegram thread for real topics; for a topic-less session the
+          // conversation key is the closest truth, and it is what
+          // model_set's workspaceKey derivation reads.
+          store.setTopic(key, { name, backend, model, mode: cfg.defaultSessionMode, threadId: key });
+          await getOrCreateSession(key);
+          const entry = store.getTopic(key);
+          // Creator tie (see sessionCreate's signature above), here too:
+          // MCP-only is the antigravity deployment shape, so the vanished-
+          // connection GC must work when no Telegram transport exists.
+          if (backend === 'antigravity' && connId != null && entry?.sessionId) {
+            getBackend('antigravity').noteSessionCreator(entry.sessionId, connId);
+          }
+          return { key, model: entry.model, backend, telegram: false };
+        }
         // No chat_id: auto-pick. The old default was the configured home
         // chat, unconditionally -- which turned a stale TELEGRAM_CHAT_ID
         // into Telegram's "the chat is not a forum" (2026-09-10 cage-pod
@@ -3204,7 +3264,7 @@ async function main() {
         store.setTopic(key, { chatId, threadId, name, backend, model, mode: cfg.defaultSessionMode });
         await getOrCreateSession(key);
         const entry = store.getTopic(key);
-        // C2: record WHICH connection created this session, so its
+        // Creator tie: record WHICH connection created this session, so its
         // disappearance closes the session (idle now, busy after its turn).
         // Telegram-created sessions get no creator and are never touched.
         if (backend === 'antigravity' && connId != null && entry?.sessionId) {
@@ -3213,11 +3273,13 @@ async function main() {
         return { key, chat_id: chatId, thread_id: threadId, model: entry.model, backend, auto_picked: autoPicked };
       },
       sessionClose: async (key) => {
-        // The point is the PROCESS: release the session (cancel a mid-turn
-        // turn, run the backend's closeConversation, free its cap slot) --
-        // without this the child outlived the close and the cap refusal
-        // kept naming this key with advice that could not work. Closing the
-        // Telegram topic and marking the key closed are the visible half.
+        // The point is the PROCESS (ported from ztg-status b0ef7a8): release
+        // the session -- cancel a mid-turn turn (the cancel is the verdict;
+        // its parked caller is failed with that reason, not left to time
+        // out), run the backend's closeConversation, free the bridge maps --
+        // without which the session outlived the close on every backend.
+        // Closing the Telegram topic and marking the key closed are the
+        // visible half.
         await closeSessionForKey(key);
         return { ok: true };
       },
@@ -3236,10 +3298,15 @@ async function main() {
         // its 429 budget, and past that a dropped mirror costs one log line,
         // never the prompt.
         if (store.getTopic(key)?.closed) throw new Error(`session ${key} is closed`);
-        try {
-          await tg.sendMessage({ chatId: chatOf(key), messageThreadId: threadOf(key), text });
-        } catch (e) {
-          console.error(`[bridge] message_send: prompt mirror into ${key} dropped (delivering to the agent anyway): ${e.message}`);
+        // MCP-only: the mirror IS the skipped part (silently -- it is
+        // best-effort even in Telegram mode); the prompt goes to the agent
+        // and the reply comes back through this tool's wait / replies_get.
+        if (telegramEnabled()) {
+          try {
+            await tg.sendMessage({ chatId: chatOf(key), messageThreadId: threadOf(key), text });
+          } catch (e) {
+            console.error(`[bridge] message_send: prompt mirror into ${key} dropped (delivering to the agent anyway): ${e.message}`);
+          }
         }
         if (!wait) {
           // queued:true is a promise that the agent has the prompt. The
@@ -3313,7 +3380,7 @@ async function main() {
         return { backend, model, switchable: true };
       },
       usageGet: () => usageGetForMcp(),
-      // C2: an MCP connection went away. Handed to the antigravity backend
+      // An MCP connection went away. Handed to the antigravity backend
       // ONLY if one is already live -- constructing and starting a backend
       // (credential checks, settings seeding) because a dying socket once
       // created a session on it would be the tail wagging the dog; if the
@@ -3332,18 +3399,26 @@ async function main() {
     });
   }
   restoreTopicStatuses();
-  refreshUsagePercentages(); // warm the cache so the first status write has figures
-  await cleanupOrphanedPermissionRequests();
+  refreshUsagePercentages(); // warm the selected usage cache so the first status write has figures
+  if (telegramEnabled()) {
+    // Warm the own-identity cache too: a suffixed command arriving before getMe
+    // answers is dropped as not-ours (never assumed ours), so the answer should
+    // be in hand well before the first owner message. Fire-and-forget -- a getMe
+    // failure costs the username, never the boot; the next ensureBotUserId
+    // call retries it.
+    ensureBotSelf().catch((e) => console.error('[bridge] getMe failed (suffixed commands stay unclaimed until it answers):', e.message));
+    await cleanupOrphanedPermissionRequests();
 
-  // Command autocomplete: idempotent, safe on every boot. The chat scope is
-  // the one forum group this bridge serves (so the list shows exactly there);
-  // the default scope covers a 1:1 chat with the bot. Failure is logged and
-  // non-fatal -- the commands still work typed out in full.
-  try {
-    await tg.setMyCommands({ commands: BOT_COMMANDS, scope: { type: 'chat', chat_id: cfg.chatId } });
-    await tg.setMyCommands({ commands: BOT_COMMANDS });
-  } catch (e) {
-    console.error('[bridge] setMyCommands failed (no / autocomplete; commands still work):', e.message);
+    // Command autocomplete: idempotent, safe on every boot. The chat scope is
+    // the one forum group this bridge serves (so the list shows exactly there);
+    // the default scope covers a 1:1 chat with the bot. Failure is logged and
+    // non-fatal -- the commands still work typed out in full.
+    try {
+      await tg.setMyCommands({ commands: BOT_COMMANDS, scope: { type: 'chat', chat_id: cfg.chatId } });
+      await tg.setMyCommands({ commands: BOT_COMMANDS });
+    } catch (e) {
+      console.error('[bridge] setMyCommands failed (no / autocomplete; commands still work):', e.message);
+    }
   }
 
   // Queues persisted by a previous process instance: their "📥 Queued"
@@ -3363,14 +3438,12 @@ async function main() {
     for (const threadId of restoredThreadIds) await drainQueue(threadId);
   }
 
+  // MCP-only stops here: with no transport there is nothing to poll, and
+  // main() returning leaves the process alive on the MCP listener (and any
+  // backend subprocesses). The loop below is the only getUpdates there is.
+  if (!telegramEnabled()) return;
+
   let offset = store.getOffset();
-  // MCP-only mode never polls: there is no bot token to poll with, and the
-  // stub getUpdates would just return [] forever. The MCP listener(s) keep
-  // the process alive; main() returning here is the normal end state.
-  if (cfg.mcpOnly) {
-    console.log('[bridge] MCP-only mode: serving MCP exclusively (no Telegram polling)');
-    return;
-  }
   for (;;) {
     let updates;
     try {

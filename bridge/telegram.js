@@ -6,8 +6,20 @@
 // real zcode app-server child included -- runs against canned updates
 // without touching the live bot (whose getUpdates long-poll tolerates
 // exactly one consumer).
+//
+// The relay design (docs/relay-owned-group-design.md section 2) adds a
+// unix: form -- unix:/path/to/sock dials that socket as plain HTTP with the
+// SAME /bot<token>/<method> paths -- while the https default and any
+// http(s) root stay byte-for-byte today's fetch behavior. fetch cannot dial
+// a unix socket, so the unix form goes through unixFetch below.
+
+import http from 'node:http';
 
 const API_ROOT = process.env.TELEGRAM_API_ROOT || 'https://api.telegram.org';
+
+// The socket to dial when API_ROOT is the unix: form; null for the default
+// and for http(s) roots, which keep their fetch path unchanged.
+const UNIX_SOCKET = API_ROOT.startsWith('unix:') ? API_ROOT.slice('unix:'.length).trim() : null;
 
 // sendMessage's 429 budget: total attempts (the initial try plus retries)
 // before the 429 goes back to the caller.
@@ -16,16 +28,28 @@ const RATE_LIMIT_ATTEMPTS = 3;
 export class TelegramClient {
   constructor({ token }) {
     if (!token) throw new Error('TelegramClient: token required');
+    if (UNIX_SOCKET !== null && !UNIX_SOCKET) throw new Error(`TelegramClient: TELEGRAM_API_ROOT='${API_ROOT}' is a unix: root with no socket path -- write it as unix:/path/to/sock.`);
     this.token = token;
-    this.base = `${API_ROOT}/bot${token}`;
+    // Over the socket the base is a bare path -- the same /bot<token> prefix
+    // (the relay keys the connection by the token alone); on https/http it
+    // is the URL fetch dials, exactly as before.
+    this.base = `${UNIX_SOCKET ? '' : API_ROOT}/bot${token}`;
   }
 
   async _call(method, body) {
-    const res = await fetch(`${this.base}/${method}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body ?? {}),
-    });
+    const res = UNIX_SOCKET
+      ? await unixFetch({
+          socketPath: UNIX_SOCKET,
+          path: `${this.base}/${method}`,
+          method: 'POST',
+          headers: { 'content-type': 'application/json', host: 'api.telegram.org' },
+          body: JSON.stringify(body ?? {}),
+        })
+      : await fetch(`${this.base}/${method}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body ?? {}),
+        });
     const json = await res.json();
     if (!json.ok) {
       const err = new Error(`telegram ${method} failed: ${json.description || res.status}`);
@@ -124,17 +148,28 @@ export class TelegramClient {
   // Multipart document upload for /file. Node 22 has the fetch/FormData/Blob
   // globals this needs; no dependency. Telegram caps bot uploads at 50 MB.
   async sendDocument({ chatId, messageThreadId, blob, filename, caption }) {
-    const res = await fetch(`${this.base}/sendDocument`, {
-      method: 'POST',
-      body: (() => {
-        const form = new FormData();
-        form.append('chat_id', String(chatId));
-        if (messageThreadId) form.append('message_thread_id', String(messageThreadId));
-        if (caption) form.append('caption', caption);
-        form.append('document', blob, filename);
-        return form;
-      })(),
-    });
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    if (messageThreadId) form.append('message_thread_id', String(messageThreadId));
+    if (caption) form.append('caption', caption);
+    form.append('document', blob, filename);
+    let res;
+    if (UNIX_SOCKET) {
+      // Over the socket there is no fetch to serialize the form, so stage it
+      // through Response(form): undici's own encoder, handing back exactly
+      // the bytes and the multipart content-type (boundary included) fetch
+      // would have put on the wire.
+      const staged = new Response(form);
+      res = await unixFetch({
+        socketPath: UNIX_SOCKET,
+        path: `${this.base}/sendDocument`,
+        method: 'POST',
+        headers: { 'content-type': staged.headers.get('content-type'), host: 'api.telegram.org' },
+        body: Buffer.from(await staged.arrayBuffer()),
+      });
+    } else {
+      res = await fetch(`${this.base}/sendDocument`, { method: 'POST', body: form });
+    }
     const json = await res.json();
     if (!json.ok) throw new Error(`telegram sendDocument failed: ${json.description || res.status}`);
     return json.result;
@@ -170,7 +205,14 @@ export class TelegramClient {
   }
 
   async downloadFile(filePath) {
-    const res = await fetch(`${API_ROOT}/file/bot${this.token}/${filePath}`);
+    const res = UNIX_SOCKET
+      ? await unixFetch({
+          socketPath: UNIX_SOCKET,
+          path: `/file/bot${this.token}/${filePath}`,
+          method: 'GET',
+          headers: { host: 'api.telegram.org' },
+        })
+      : await fetch(`${API_ROOT}/file/bot${this.token}/${filePath}`);
     if (!res.ok) throw new Error(`telegram file download failed: HTTP ${res.status}`);
     return Buffer.from(await res.arrayBuffer());
   }
@@ -191,4 +233,37 @@ export class TelegramClient {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// The whole unix: transport (docs/relay-owned-group-design.md section 2):
+// fetch cannot dial a unix socket; http.request can, via socketPath. Plain
+// HTTP over the relay socket, the same path the https form builds, Host
+// header included (the relay ignores it; some servers require one), plus
+// content-length like fetch always sends. Resolves a minimal fetch-Response-
+// shaped object -- status/ok/json/arrayBuffer, the only members the call
+// sites use -- so everything below the dispatch (the 429 parsing, the
+// result unwrapping) is shared with the fetch path and unchanged.
+function unixFetch({ socketPath, path, method, headers, body }) {
+  const wire = body == null ? null : Buffer.isBuffer(body) ? body : Buffer.from(body);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { socketPath, path, method, headers: wire ? { ...headers, 'content-length': wire.length } : headers },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const buffer = Buffer.concat(chunks);
+          resolve({
+            status: res.statusCode,
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            json: async () => JSON.parse(buffer.toString('utf8')),
+            arrayBuffer: async () => buffer,
+          });
+        });
+      }
+    );
+    req.on('error', reject);
+    if (wire) req.write(wire);
+    req.end();
+  });
 }

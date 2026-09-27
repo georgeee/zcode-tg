@@ -254,3 +254,92 @@ test('the stale reason is upstream text: escaped, never trusted', () => {
   assert.ok(out.includes('⚠️ figures 45s old · refresh failed: &lt;b&gt;gateway&lt;/b&gt; error'), out);
   assert.ok(!out.includes('<b>gateway</b> error'), out);
 });
+
+// --- the pinned per-topic status line (shared-group design, section 3) ---
+//
+// Identity first (fleet/model; the model alone when unmanaged), then the
+// dynamics, then usage. The z.ai tail is the owner-agreed 2026-09-01 line;
+// the fleet/model head is new. The renderer is pure: index.js feeds it the
+// topic's stored model and the selected cache's percentages.
+
+import { statusLineText, statusPercentages, statusModelFor, codexUsagePercentages } from '../bridge/usage.js';
+
+const CODEX_RATES = {
+  rateLimits: {
+    planType: 'pro',
+    primary: { usedPercent: 23.4, windowDurationMins: 300, resetsAt: 1800000000 },
+    secondary: { usedPercent: 7, windowDurationMins: 10080, resetsAt: 1800518400 },
+  },
+};
+
+test('statusLineText: with fleet, the segment is fleet/model', () => {
+  assert.equal(
+    statusLineText({ fleet: 'cage', model: 'zai/glm-5.3-flash', state: 'busy', queued: 2, shortPct: 11, weekPct: 5 }),
+    '📌 cage/zai/glm-5.3-flash · busy · 2 queued · 11% session / 5% week',
+  );
+});
+
+test('statusLineText: without fleet (unmanaged), the segment is the model alone', () => {
+  assert.equal(
+    statusLineText({ fleet: '', model: 'zai/glm-5.3-flash', state: 'idle', queued: 0, shortPct: 11, weekPct: 5 }),
+    '📌 zai/glm-5.3-flash · idle · no queued · 11% session / 5% week',
+  );
+});
+
+test('statusLineText: the model given is the model rendered -- the stored one, never a substituted default', () => {
+  // the caller passes entry.model when one is stored, the backend default
+  // when not; the renderer must render exactly whichever it is handed
+  const stored = statusLineText({ fleet: 'cage', model: 'gpt-6-astra', state: 'idle', queued: 0, shortPct: null, weekPct: null });
+  const defaulted = statusLineText({ fleet: 'cage', model: 'gpt-5.6-terra', state: 'idle', queued: 0, shortPct: null, weekPct: null });
+  assert.ok(stored.includes('gpt-6-astra'), stored);
+  assert.ok(defaulted.includes('gpt-5.6-terra'), defaulted);
+});
+
+test('statusLineText: codex percentages ride the same session/week slots', () => {
+  assert.equal(
+    statusLineText({ fleet: 'cage', model: 'gpt-5.6-terra', state: 'busy', queued: 1, shortPct: 23, weekPct: 7 }),
+    '📌 cage/gpt-5.6-terra · busy · 1 queued · 23% session / 7% week',
+  );
+});
+
+test('statusLineText: no usage figures -> the segment is omitted, not "null%"', () => {
+  assert.equal(
+    statusLineText({ fleet: '', model: 'm', state: 'idle', queued: 0, shortPct: null, weekPct: null }),
+    '📌 m · idle · no queued',
+  );
+  assert.equal(
+    statusLineText({ fleet: '', model: 'm', state: 'idle', queued: 0 }),
+    '📌 m · idle · no queued',
+  );
+});
+
+test('statusModelFor: a stored model wins over the backend default -- never the reverse', () => {
+  const defaults = { zcode: 'zai/glm-5.3-flash', codex: 'gpt-5.6-terra' };
+  const defaultModelFor = (b) => defaults[b];
+  assert.equal(statusModelFor({ model: 'gpt-6-astra', backend: 'codex' }, 'zcode', defaultModelFor), 'gpt-6-astra');
+  // no stored model: the topic's OWN backend default, not the bridge default's
+  assert.equal(statusModelFor({ backend: 'codex' }, 'zcode', defaultModelFor), 'gpt-5.6-terra');
+  assert.equal(statusModelFor({}, 'zcode', defaultModelFor), 'zai/glm-5.3-flash');
+  assert.equal(statusModelFor(null, 'zcode', defaultModelFor), 'zai/glm-5.3-flash');
+});
+
+test('statusPercentages: a codex-default config renders the CODEX account percentages', () => {
+  assert.deepEqual(statusPercentages('codex', { codexData: CODEX_RATES, zaiData: null }), { shortPct: 23, weekPct: 7 });
+  // a cold codex cache: nulls, never the z.ai figures
+  assert.deepEqual(statusPercentages('codex', { codexData: null, zaiData: LIVE_PAYLOAD.data }), { shortPct: null, weekPct: null });
+});
+
+test('statusPercentages: a zcode-default config renders the z.ai windows, as before', () => {
+  assert.deepEqual(statusPercentages('zcode', { zaiData: LIVE_PAYLOAD.data, codexData: CODEX_RATES }), { shortPct: 6, weekPct: 1 });
+  assert.deepEqual(statusPercentages('zcode', { zaiData: null }), { shortPct: null, weekPct: null });
+});
+
+test('statusPercentages: a mock-default config has no quota to report', () => {
+  assert.deepEqual(statusPercentages('mock', { zaiData: LIVE_PAYLOAD.data, codexData: CODEX_RATES }), { shortPct: null, weekPct: null });
+});
+
+test('codexUsagePercentages: primary->session, secondary->week, over the raw cached payload', () => {
+  assert.deepEqual(codexUsagePercentages(CODEX_RATES), { shortPct: 23, weekPct: 7 });
+  assert.deepEqual(codexUsagePercentages(null), { shortPct: null, weekPct: null });
+  assert.deepEqual(codexUsagePercentages({ rateLimits: { primary: { usedPercent: 41 } } }), { shortPct: 41, weekPct: null });
+});
