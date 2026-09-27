@@ -977,8 +977,8 @@ async function scenario10() {
 
 // --- scenario 11: the antigravity backend. (a) MCP-ONLY BOOT: no
 // TELEGRAM_* at all -- the bridge serves MCP exclusively off a stub Telegram
-// (the antigravity deployment shape: the owner's surfaces are the
-// antigravity.google dashboard via --remote-control and this MCP). (b) a
+// (the antigravity deployment shape: this MCP is the surface; bridge
+// sessions never register with the antigravity.google dashboard). (b) a
 // full session_create -> message_send -> reply round trip against the fake
 // agy, asserting the spawn contract (argv + HOME) through the REAL bridge.
 // (c) the effort-knob model policy over MCP. (d) quota error mapping and the
@@ -1033,7 +1033,7 @@ async function scenario11() {
     const reply = sent?.result?.isError === false ? JSON.parse(sent.result.content[0].text).reply : null;
     check('(b) message_send returns the turn reply', reply === 'FAKE-REPLY: hello antigravity', JSON.stringify(sent).slice(0, 400));
     const spawn1 = JSON.parse(readFileSync(markerLog, 'utf8').trim().split('\n').at(-1));
-    check('(b) the spawn contract: --remote-control AND --dangerously-skip-permissions on argv', spawn1.argv.includes('--remote-control') && spawn1.argv.includes('--dangerously-skip-permissions'), JSON.stringify(spawn1.argv));
+    check('(b) the spawn contract: --dangerously-skip-permissions on argv and NO --remote-control', !spawn1.argv.includes('--remote-control') && spawn1.argv.includes('--dangerously-skip-permissions'), JSON.stringify(spawn1.argv));
     check('(b) the spawn contract: the child ran with HOME=AGY_HOME', spawn1.home === agyHome, spawn1.home);
     // No AGY_BRIDGE_CWD here: the default beside the agy HOME, never the workspace (TMP).
     check('(b) the spawn contract: agy ran in the default private cwd, not the workspace', spawn1.cwd === path.join(TMP, '.local', 'state', 'agent-cage', 'agy-bridge', 'cwd'), spawn1.cwd);

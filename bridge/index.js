@@ -100,8 +100,9 @@ const cfg = {
   // session_create/message_send/replies_get/usage_get work unchanged, every
   // Telegram call becomes a benign no-op, and the getUpdates loop never
   // starts. This exists for the antigravity backend, whose owner-facing
-  // surfaces are the antigravity.google dashboard (via --remote-control) and
-  // MCP -- not a Telegram group. A missing bot token WITHOUT any MCP
+  // surface is MCP -- not a Telegram group (bridge sessions do not register
+  // with the antigravity.google dashboard; the fleet's own `agy
+  // remote-control serve` daemon does). A missing bot token WITHOUT any MCP
   // listener keeps the old hard failure with the config-file pointer (the
   // guarded need() call just below the cfg block).
   mcpOnly: !process.env.TELEGRAM_BOT_TOKEN && !!(process.env.MCP_UNIX_SOCKET?.trim() || process.env.MCP_HTTP_PORT?.trim()),

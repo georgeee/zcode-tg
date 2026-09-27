@@ -125,7 +125,7 @@ function declaresServersOrPlugins(text) {
 }
 
 export class AntigravityBackend extends Backend {
-  constructor({ agyBin, agyHome, cwd, privateCwd = null, effort = 'medium', autoApprovePermissions = true, remoteControl = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null }) {
+  constructor({ agyBin, agyHome, cwd, privateCwd = null, effort = 'medium', autoApprovePermissions = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null }) {
     super('antigravity');
     this.agyBin = agyBin;
     this.agyHome = agyHome;
@@ -135,11 +135,11 @@ export class AntigravityBackend extends Backend {
     this.privateCwd = privateCwd || defaultAgyBridgeCwd(agyHome);
     this.effort = effort;
     this.autoApprovePermissions = autoApprovePermissions;
-    // Owner decision (2026-09-24): every session starts with --remote-control
-    // so the SAME conversation is visible and drivable from the
-    // antigravity.google dashboard. Session-scoped: the tunnel dies with the
-    // process (design doc §13). Not Claude's remote-control trap.
-    this.remoteControl = remoteControl;
+    // Owner decision (2026-09-27, reversing 2026-09-24): sessions NEVER
+    // start with --remote-control. Each registered instance takes one of the
+    // Google account's scarce dashboard slots (429 RESOURCE_EXHAUSTED once
+    // they run out); the fleet's own `agy remote-control serve` daemon is the
+    // single registered instance. There is deliberately no option for it.
     this.initTimeoutMs = initTimeoutMs; // cold first runs unpack skills (5-15s measured; 90s is generous)
     // Test seam for the conversation-store watcher (see _startWatcher):
     // where its cursor starts. null (production) = tail -- history is never
@@ -651,7 +651,6 @@ export class AntigravityBackend extends Backend {
       workspaceDir,
       model: AGY_MODEL_REF,
       effort,
-      remoteControl: this.remoteControl,
       skipPermissions: this.autoApprovePermissions,
       // C4: the bridge marker. The orphan sweep at boot identifies OUR
       // bridge's leftover agy children by exactly this variable -- it is
@@ -725,9 +724,9 @@ export class AntigravityBackend extends Backend {
   }
 
   _onChildExit(session, info) {
-    // The watcher dies with the child too: the --remote-control tunnel is
-    // the child's, so nothing can journal new dashboard turns while it is
-    // down (a respawn starts a fresh watcher with a fresh tail cursor).
+    // The watcher dies with the child too: nothing can journal new turns
+    // into this conversation's store while the child is down (a respawn
+    // starts a fresh watcher with a fresh tail cursor).
     session.watcher?.stop();
     this._pending.delete(session); // died before init: its cap slot goes back
     session.lastExitAt = Date.now();
@@ -765,8 +764,12 @@ export class AntigravityBackend extends Backend {
   // Tails the session's conversation .db for turns typed in the
   // antigravity.google dashboard. MEASURED (conversation-db-notes.md): those
   // turns and their replies never appear on agy's stream-json stdout -- they
-  // are journalled only in the SQLite store, and --remote-control sessions
-  // run them while this bridge sits idle. Emitted as session/event payloads
+  // are journalled only in the SQLite store, and a --remote-control instance
+  // runs them while this bridge sits idle. Bridge sessions no longer start
+  // with --remote-control (2026-09-27), so in production the watcher only
+  // ever sees our own stdin turns, classifies them 'ours' and emits nothing:
+  // an inert 2s poll per live child, kept so a conversation that does get
+  // driven from the dashboard stays visible. Emitted as session/event payloads
   // of kind 'dashboard_message' ({role, origin:'dashboard', text}) which
   // index.js notes into the MCP reply log -- the session's reply stream.
   _startWatcher(session) {

@@ -477,13 +477,14 @@ Two properties are deliberate and owner-mandated:
   `AUTO_APPROVE_PERMISSIONS=false` the flag is withheld, but the backend is
   not otherwise usable that way yet (a mid-turn prompt would just stall the
   turn inside agy).
-- **`--remote-control` on every session.** Each session registers itself
-  with the antigravity.google Remote Control dashboard, so the same
-  conversation is visible and drivable from the owner's phone. This is
-  agy's own session-scoped feature — the tunnel lives and dies with the
-  session process, no OS service is installed, and it has nothing to do
-  with the Claude `remote-control --session-id` capacity trap described in
-  the workspace AGENTS.md.
+- **No `--remote-control`, ever.** Bridge sessions do not register with
+  the antigravity.google Remote Control dashboard. Every registered agy
+  instance takes one of the Google account's scarce remote-control slots,
+  and Google refuses registration with 429 `RESOURCE_EXHAUSTED` once they
+  run out; the fleet's separately-supervised `agy remote-control serve`
+  daemon (not in this repo) is the single registered instance. Bridge
+  (MCP) sessions work whether or not any dashboard registration succeeds.
+  (Owner decision 2026-09-27, reversing the 2026-09-24 one.)
 
 **The pre-turn config gate.** Measured live (agy 1.2.9): if the model uses
 its in-process file tool to write `$AGY_HOME/.gemini/config/mcp_config.json`
