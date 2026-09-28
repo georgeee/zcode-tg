@@ -67,6 +67,7 @@ import { MockBackend, MOCK_MODEL_REF } from './backends/mockBackend.js';
 import { makeSessionId, backendNameOf, rawSessionId } from './backend.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
+import { makeNullTelegram } from './allocator.js';
 import { renderReply, toPlainText, extractFileMarkers } from './format.js';
 import { ReplyStreamer } from './streamer.js';
 import { ProgressReporter, stepDetail, noteActivity, progressForTopic } from './progress.js';
@@ -318,39 +319,8 @@ function need(key) {
 // MCP-only mode, handled by the stub below.
 if (!process.env.TELEGRAM_BOT_TOKEN && !cfg.mcpOnly) need('TELEGRAM_BOT_TOKEN');
 
-// THE MCP-ONLY TELEGRAM STAND-IN. Same method surface as TelegramClient
-// (everything index.js calls), returning benign shapes instead of touching
-// the network: getChat claims a forum so session_create's default-target
-// pick succeeds, createForumTopic hands out synthetic thread ids, sends
-// return synthetic message ids. One quiet log line at construction -- the
-// stub itself stays silent, mirrors and replies are deliberately no-ops.
-function makeNullTelegram() {
-  let nextMessageId = 1;
-  let nextThreadId = 9000;
-  console.log('[bridge] MCP-only mode: no TELEGRAM_BOT_TOKEN -- Telegram calls are no-ops, MCP serves everything');
-  const forumChat = (chatId) => ({ id: Number(chatId), type: 'supergroup', is_forum: true, title: 'mcp-only' });
-  return {
-    getUpdates: async () => [],
-    sendMessage: async () => ({ message_id: nextMessageId++ }),
-    editMessageText: async () => ({ message_id: nextMessageId++ }),
-    createForumTopic: async (p) => ({ message_thread_id: nextThreadId++, chat_id: p.chatId, name: p.name }),
-    closeForumTopic: async () => ({}),
-    getMe: async () => ({ id: 0, is_bot: true, username: 'mcp-only' }),
-    getChat: async ({ chatId }) => forumChat(chatId),
-    getChatMember: async () => ({ status: 'administrator' }),
-    leaveChat: async () => ({}),
-    pinChatMessage: async () => ({}),
-    deleteMessage: async () => ({}),
-    setMyCommands: async () => ({}),
-    sendDocument: async () => ({ message_id: nextMessageId++ }),
-    getFile: async () => ({ file_path: '' }),
-    downloadFile: async () => Buffer.alloc(0),
-    answerCallbackQuery: async () => ({}),
-  };
-}
-
 const store = new Store(cfg.storePath);
-const tg = cfg.mcpOnly ? makeNullTelegram() : new TelegramClient({ token: cfg.telegramToken });
+const tg = cfg.mcpOnly ? makeNullTelegram(store, cfg.chatId) : new TelegramClient({ token: cfg.telegramToken });
 
 // --- backend registry ---
 // One long-lived instance per backend KIND (not per session/topic) --
@@ -3202,6 +3172,9 @@ async function main() {
         store.noteChat(chatId, { lastSeenAt: Date.now() }); // a successful create is the strongest "we serve this chat"
         const threadId = created.message_thread_id;
         const key = keyFor(chatId, threadId);
+        if (store.isKeyRecorded(key, threadId)) {
+          throw new Error(`cannot create session: key "${key}" already has an existing record`);
+        }
         store.setTopic(key, { chatId, threadId, name, backend, model, mode: cfg.defaultSessionMode });
         await getOrCreateSession(key);
         const entry = store.getTopic(key);

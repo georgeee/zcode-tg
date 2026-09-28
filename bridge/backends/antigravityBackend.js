@@ -373,7 +373,8 @@ export class AntigravityBackend extends Backend {
     if (!parsed) throw this._badModelRefError(model);
     const session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort });
     const init = await session.initPromise;
-    return { sessionId: makeSessionId('antigravity', init.conversation_id), model: AGY_MODEL_REF };
+    const effectiveModel = parsed.effort ? `${AGY_MODEL_REF}:${parsed.effort}` : AGY_MODEL_REF;
+    return { sessionId: makeSessionId('antigravity', init.conversation_id), model: effectiveModel };
   }
 
   // Resume = respawn with --conversation (agy persists conversations as

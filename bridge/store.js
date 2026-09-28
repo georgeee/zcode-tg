@@ -146,6 +146,47 @@ export class Store {
     this._save();
   }
 
+  getTopics() {
+    return this.data.topics || {};
+  }
+
+  maxPersistedKey() {
+    let max = 0;
+    for (const [k, t] of Object.entries(this.data.topics || {})) {
+      if (/^\d+$/.test(k)) {
+        max = Math.max(max, Number(k));
+      }
+      if (t && Number.isInteger(Number(t.threadId))) {
+        max = Math.max(max, Number(t.threadId));
+      }
+      const m = String(k).match(/:t(\d+)$/);
+      if (m) {
+        max = Math.max(max, Number(m[1]));
+      }
+    }
+    return max;
+  }
+
+  isKeyRecorded(key, threadId = null) {
+    if (!this.data.topics) return false;
+    if (key != null && this.data.topics[key] != null) return true;
+    if (threadId != null) {
+      const sId = String(threadId);
+      if (this.data.topics[sId] != null) return true;
+      for (const [k, t] of Object.entries(this.data.topics)) {
+        if (k === sId) return true;
+        if (t && Number(t.threadId) === Number(threadId)) return true;
+      }
+    }
+    return false;
+  }
+
+  close() {
+    try {
+      unlinkSync(this.lockPath);
+    } catch {}
+  }
+
   // --- known group chats (default-target resolution for MCP session_create) ---
   // The Bot API cannot enumerate a bot's chats, so the bridge remembers every
   // group it has served (owner message seen, topic created, bot added).
