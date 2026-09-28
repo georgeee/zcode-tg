@@ -421,7 +421,7 @@ const BACKEND_FACTORIES = {
     return new CodexBackend({ codexBin: cfg.codexBin, codexHome: cfg.codexHome, cwd: cfg.workspaceDir, autoApprovePermissions: cfg.autoApprovePermissions });
   },
   antigravity: () => {
-    if (!cfg.agyHome) throw new Error("the 'antigravity' backend needs AGY_HOME set (see README)");
+    if (!cfg.agyHome) throw new Error("the 'antigravity' backend needs AGY_HOME set — this bridge was not started for antigravity; use the cage-antigravity MCP server instead (see README)");
     return new AntigravityBackend({
       agyBin: cfg.agyBin,
       agyHome: cfg.agyHome,
