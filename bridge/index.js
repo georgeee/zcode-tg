@@ -154,6 +154,7 @@ const cfg = {
   agyBin: process.env.AGY_BIN || 'agy',
   agyHome: process.env.AGY_HOME || '',
   agyEffort: process.env.AGY_EFFORT || 'medium',
+  agyConfigVerifier: process.env.AGY_CONFIG_VERIFIER || '',
   // agy's PRIVATE working directory -- never the workspace, which the
   // executor writes and agy would read project config from (see
   // antigravityClient.js). Made 0700 at spawn; empty = the default,
@@ -399,6 +400,7 @@ const BACKEND_FACTORIES = {
       privateCwd: cfg.agyBridgeCwd || null,
       effort: cfg.agyEffort,
       autoApprovePermissions: cfg.autoApprovePermissions,
+      configVerifier: cfg.agyConfigVerifier || null,
       // The GC knobs (see cfg above): minutes -> ms, 0 meaning disabled
       // survives the translation.
       idleCloseMs: cfg.agyIdleCloseMin > 0 ? cfg.agyIdleCloseMin * 60_000 : 0,

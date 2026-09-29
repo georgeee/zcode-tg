@@ -575,3 +575,251 @@ test('listModels: exactly one ref -- the single-model decision', async (t) => {
   assert.deepEqual(await backend.listModels(), [{ ref: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' }]);
   assert.deepEqual(backend.listModes(), []);
 });
+
+test('the integrity gate with AGY_CONFIG_VERIFIER: exit 0 allows turn to proceed, nothing quarantined', async (t) => {
+  const dir = tmp('gate-verifier-ok');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, 'fake-verifier.sh');
+  writeFileSync(script, '#!/bin/sh\nexit 0\n');
+  chmodSync(script, 0o755);
+
+  const { backend, events } = makeBackend(dir, { configVerifier: script });
+  t.after(() => backend.stop());
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  const terminal = await runOneTurn(backend, events, sessionId, 'hello');
+  assert.equal(terminal.params.status, 'success');
+  const configDir = path.join(dir, 'home', '.gemini', 'config');
+  if (existsSync(configDir)) {
+    assert.ok(!readdirSync(configDir).some((n) => n.includes('.quarantined-')), 'nothing was quarantined');
+  }
+});
+
+test('the integrity gate with AGY_CONFIG_VERIFIER: exit 3 + path quarantines file, stops session', async (t) => {
+  const dir = tmp('gate-verifier-exit3');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, 'fake-verifier.sh');
+  const triggerFile = path.join(dir, 'trigger-violation');
+  writeFileSync(
+    script,
+    `#!/bin/sh
+if [ -f "${triggerFile}" ]; then
+  echo "$2/.gemini/config/mcp_config.json"
+  echo "unauthorized MCP server configured" >&2
+  exit 3
+fi
+exit 0
+`,
+  );
+  chmodSync(script, 0o755);
+
+  const turnLog = path.join(dir, 'turns.jsonl');
+  process.env.FIXTURE_AGY_LOG = turnLog;
+  t.after(() => { delete process.env.FIXTURE_AGY_LOG; });
+
+  const { backend, events } = makeBackend(dir, { configVerifier: script });
+  t.after(() => backend.stop());
+  const warns = [];
+  backend.on('warn', (m) => warns.push(m));
+  const reapLines = [];
+  backend.on('reap', (line) => reapLines.push(line));
+
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  await runOneTurn(backend, events, sessionId, 'one');
+
+  // Plant the config and arm the verifier trigger
+  const configDir = path.join(dir, 'home', '.gemini', 'config');
+  mkdirSync(configDir, { recursive: true });
+  const poison = path.join(configDir, 'mcp_config.json');
+  writeFileSync(poison, JSON.stringify({ mcpServers: { evil: { command: 'curl' } } }));
+  writeFileSync(triggerFile, '1');
+
+  const before = terminals(events).length;
+  await backend.sendMessage(sessionId, 'two');
+  const terminal = await waitFor(() => terminals(events).slice(before)[0], 'turn.terminal (refused)');
+  assert.equal(terminal.params.status, 'failed');
+  assert.match(terminal.params.errorCode, /mcp_config\.json defines MCP servers\/plugins/);
+  assert.match(terminal.params.errorCode, /quarantined as .*mcp_config\.json\.quarantined-\d+/);
+  assert.match(terminal.params.errorCode, /review before continuing/);
+
+  assert.ok(!existsSync(poison), 'offending file was renamed');
+  assert.ok(readdirSync(configDir).some((n) => /^mcp_config\.json\.quarantined-\d+/.test(n)), 'quarantined copy kept');
+
+  // Verify session child was stopped
+  const session = backend._sessions.get(sessionId.slice('antigravity:'.length));
+  await waitFor(() => session.client.exited, 'the session child to be stopped');
+  assert.ok(reapLines.some((l) => /^quarantine path=.*mcp_config\.json key=antigravity:/.test(l)));
+});
+
+test('the integrity gate with AGY_CONFIG_VERIFIER: exit 7 stops session, renames nothing', async (t) => {
+  const dir = tmp('gate-verifier-exit7');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, 'fake-verifier.sh');
+  const triggerFile = path.join(dir, 'trigger-exit7');
+  writeFileSync(
+    script,
+    `#!/bin/sh
+if [ -f "${triggerFile}" ]; then
+  echo "verifier internal explosion" >&2
+  exit 7
+fi
+exit 0
+`,
+  );
+  chmodSync(script, 0o755);
+
+  const { backend, events } = makeBackend(dir, { configVerifier: script });
+  t.after(() => backend.stop());
+  const warns = [];
+  backend.on('warn', (m) => warns.push(m));
+
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  await runOneTurn(backend, events, sessionId, 'one');
+
+  const configDir = path.join(dir, 'home', '.gemini', 'config');
+  mkdirSync(configDir, { recursive: true });
+  const sampleFile = path.join(configDir, 'mcp_config.json');
+  writeFileSync(sampleFile, '{"mcpServers":{}}');
+
+  writeFileSync(triggerFile, '1');
+
+  const before = terminals(events).length;
+  await backend.sendMessage(sessionId, 'two');
+  const terminal = await waitFor(() => terminals(events).slice(before)[0], 'turn.terminal (failed)');
+  assert.equal(terminal.params.status, 'failed');
+  assert.match(terminal.params.errorCode, /config verifier .* failed with exit code 7/);
+  assert.ok(warns.some((w) => /config verifier .* failed with exit code 7/.test(w)));
+
+  assert.ok(existsSync(sampleFile), 'config file was not renamed');
+  assert.ok(!readdirSync(configDir).some((n) => n.includes('.quarantined-')), 'nothing was quarantined');
+
+  const session = backend._sessions.get(sessionId.slice('antigravity:'.length));
+  await waitFor(() => session.client.exited, 'the session child to be stopped');
+});
+
+test('the integrity gate with AGY_CONFIG_VERIFIER: missing binary stops session, renames nothing', async (t) => {
+  const dir = tmp('gate-verifier-missing');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const script = path.join(dir, 'fake-verifier.sh');
+  writeFileSync(script, '#!/bin/sh\nexit 0\n');
+  chmodSync(script, 0o755);
+
+  const { backend, events } = makeBackend(dir, { configVerifier: script });
+  t.after(() => backend.stop());
+
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  await runOneTurn(backend, events, sessionId, 'one');
+
+  const configDir = path.join(dir, 'home', '.gemini', 'config');
+  mkdirSync(configDir, { recursive: true });
+  const sampleFile = path.join(configDir, 'mcp_config.json');
+  writeFileSync(sampleFile, '{"mcpServers":{}}');
+
+  backend.configVerifier = path.join(dir, 'non-existent-verifier-binary');
+
+  const before = terminals(events).length;
+  await backend.sendMessage(sessionId, 'two');
+  const terminal = await waitFor(() => terminals(events).slice(before)[0], 'turn.terminal (failed)');
+  assert.equal(terminal.params.status, 'failed');
+  assert.match(terminal.params.errorCode, /config verifier .* failed: /);
+
+  assert.ok(existsSync(sampleFile), 'config file was not renamed');
+  assert.ok(!readdirSync(configDir).some((n) => n.includes('.quarantined-')), 'nothing was quarantined');
+
+  const session = backend._sessions.get(sessionId.slice('antigravity:'.length));
+  await waitFor(() => session.client.exited, 'the session child to be stopped');
+});
+
+test('the integrity gate with AGY_CONFIG_VERIFIER: verifier timeout stops session, renames nothing', async (t) => {
+  const dir = tmp('gate-verifier-timeout');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const script = path.join(dir, 'fake-verifier.sh');
+  const triggerFile = path.join(dir, 'trigger-sleep');
+  writeFileSync(
+    script,
+    `#!/bin/sh
+if [ -f "${triggerFile}" ]; then
+  sleep 1
+  exit 0
+fi
+exit 0
+`,
+  );
+  chmodSync(script, 0o755);
+
+  const { backend, events } = makeBackend(dir, {
+    configVerifier: script,
+    configVerifierTimeoutMs: 100,
+  });
+  t.after(() => backend.stop());
+
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  await runOneTurn(backend, events, sessionId, 'one');
+
+  const configDir = path.join(dir, 'home', '.gemini', 'config');
+  mkdirSync(configDir, { recursive: true });
+  const sampleFile = path.join(configDir, 'mcp_config.json');
+  writeFileSync(sampleFile, '{"mcpServers":{}}');
+
+  writeFileSync(triggerFile, '1');
+
+  const before = terminals(events).length;
+  await backend.sendMessage(sessionId, 'two');
+  const terminal = await waitFor(() => terminals(events).slice(before)[0], 'turn.terminal (failed)');
+  assert.equal(terminal.params.status, 'failed');
+  assert.match(terminal.params.errorCode, /config verifier .* timed out after 100ms/);
+
+  assert.ok(existsSync(sampleFile), 'config file was not renamed');
+  assert.ok(!readdirSync(configDir).some((n) => n.includes('.quarantined-')), 'nothing was quarantined');
+
+  const session = backend._sessions.get(sessionId.slice('antigravity:'.length));
+  await waitFor(() => session.client.exited, 'the session child to be stopped');
+});
+
+test('the integrity gate picks up AGY_CONFIG_VERIFIER from process.env when unset in constructor', async (t) => {
+  const dir = tmp('gate-verifier-env');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const script = path.join(dir, 'fake-verifier.sh');
+  writeFileSync(script, '#!/bin/sh\nexit 0\n');
+  chmodSync(script, 0o755);
+
+  process.env.AGY_CONFIG_VERIFIER = script;
+  t.after(() => { delete process.env.AGY_CONFIG_VERIFIER; });
+
+  const { backend, events } = makeBackend(dir);
+  t.after(() => backend.stop());
+
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  const terminal = await runOneTurn(backend, events, sessionId, 'one');
+  assert.equal(terminal.params.status, 'success');
+});
+
+test('the integrity gate with AGY_CONFIG_VERIFIER: exit 0 still checks private cwd', async (t) => {
+  const dir = tmp('gate-verifier-cwd');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, 'fake-verifier.sh');
+  writeFileSync(script, '#!/bin/sh\nexit 0\n');
+  chmodSync(script, 0o755);
+
+  const privateCwd = path.join(dir, 'private-cwd');
+  mkdirSync(privateCwd, { recursive: true, mode: 0o700 });
+
+  const { backend, events } = makeBackend(dir, { configVerifier: script, privateCwd });
+  t.after(() => backend.stop());
+
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  await runOneTurn(backend, events, sessionId, 'one');
+
+  const planted = path.join(privateCwd, '.agents');
+  mkdirSync(planted);
+
+  const before = terminals(events).length;
+  await backend.sendMessage(sessionId, 'two');
+  const terminal = await waitFor(() => terminals(events).slice(before)[0], 'turn.terminal (refused)');
+  assert.equal(terminal.params.status, 'failed');
+  assert.match(terminal.params.errorCode, /project config in agy's private working directory/);
+  assert.match(terminal.params.errorCode, /quarantined as .*\.agents\.quarantined-\d+/);
+  assert.ok(readdirSync(privateCwd).some((n) => /^\.agents\.quarantined-\d+$/.test(n)));
+});
