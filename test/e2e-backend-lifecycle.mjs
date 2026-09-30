@@ -69,7 +69,7 @@ import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node
 import net from 'node:net';
 import path from 'node:path';
 
-const NODE = process.env.ZCODE_NODE_BIN || '/srv/agent-cage/etheron-bare/agent/etheron-bare/work/toolchain/node/bin/node';
+const NODE = process.env.ZCODE_NODE_BIN || process.execPath;
 const REPO = path.dirname(path.dirname(new URL(import.meta.url).pathname));
 const FIXTURES = path.join(REPO, 'test', 'fixtures');
 const ZCODE_FIXTURE = path.join(FIXTURES, 'fake-zcode-app-server.mjs');
