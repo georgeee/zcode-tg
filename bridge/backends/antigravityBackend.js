@@ -510,11 +510,19 @@ export class AntigravityBackend extends Backend {
     return message;
   }
 
-  _waitForTurnEnd(session) {
+  _waitForTurnEnd(session, timeoutMs = 600_000) {
     if (!session.turn) return Promise.resolve();
     return new Promise((resolve) => {
+      let timer = null;
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          this.off('event', onEvt);
+          resolve();
+        }, timeoutMs);
+      }
       const onEnd = () => {
         if (!session.turn) {
+          if (timer) clearTimeout(timer);
           this.off('event', onEvt);
           resolve();
         }
@@ -553,15 +561,20 @@ export class AntigravityBackend extends Backend {
       this._emitTelemetry(makeSessionId('antigravity', rawId), turnId, 'turn.terminal', { status: 'failed', errorCode: message });
       return;
     }
-    const preExisting = this._sessions.get(rawId);
-    if (preExisting && !preExisting.turn) preExisting.startingTurn = true;
     let session;
     try {
       session = await this._runningSession(sessionId);
-      if (session.turn) {
+      while (session.turn) {
         await this._waitForTurnEnd(session);
+        if (session.cancelPending) return;
       }
       session.startingTurn = true;
+      while (session.turn) {
+        session.startingTurn = false;
+        await this._waitForTurnEnd(session);
+        if (session.cancelPending) return;
+        session.startingTurn = true;
+      }
       // The first turn this CHILD receives carries the workspace note: agy's
       // cwd is its private directory, so the note is how the model learns
       // where its workspace is (antigravityClient.js, workspaceNote).
@@ -593,7 +606,6 @@ export class AntigravityBackend extends Backend {
       }
     } catch (e) {
       if (session) session.startingTurn = false;
-      else if (preExisting) preExisting.startingTurn = false;
       throw e;
     }
   }
@@ -894,7 +906,6 @@ export class AntigravityBackend extends Backend {
   // documents ---
 
   _onEvent(session, msg) {
-    session.idleSince = Date.now();
     // session.rawId is the resolved conversation id (spawn argument, or the
     // id init assigned -- see _spawn). Events before init have no turn to
     // attach to anyway.
@@ -903,8 +914,10 @@ export class AntigravityBackend extends Backend {
       case 'init':
         return; // consumed by the spawn-time initPromise; nothing to stream
       case 'step_update':
+        session.idleSince = Date.now();
         return this._onStepUpdate(session, sessionId, msg.step_update ?? {});
       case 'result':
+        session.idleSince = Date.now();
         return this._onResult(session, sessionId, msg.result ?? {});
       default:
         return; // unknown event kinds are ignored deliberately (forward-compat)
@@ -920,7 +933,7 @@ export class AntigravityBackend extends Backend {
   }
 
   _shouldAutoAdopt(session) {
-    return !session.turn && !session.startingTurn && this._isLive(session) && !session.cancelPending;
+    return !session.turn && this._isLive(session) && !session.cancelPending;
   }
 
   _onStepUpdate(session, sessionId, step) {

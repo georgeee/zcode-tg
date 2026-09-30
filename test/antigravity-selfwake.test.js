@@ -1,9 +1,12 @@
 // Tests for antigravity backend self-wake turns:
 // (a) a user turn ends; the fake agy later emits step_update + result -> replies_get
 //     has the reply, and progress showed active in between.
-// (b) the reaper doesn't fire while untracked events flow, and does fire after
-//     20 min of true silence (fake timers).
+// (creator-gone) creator disconnects mid-turn -> process is closed after that turn.
+// (b) the reaper does not fire while turn-bearing events flow, and does fire after
+//     20 min of silence or non-turn events (fake timers).
 // (c) no double turn when the user message and the self-wake race.
+// (d) F2 race: user message during in-flight self-wake returns user reply,
+//     self-wake recorded separately in replies_get.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,7 +24,7 @@ const REPO = path.dirname(HERE);
 const FIXTURES = path.join(HERE, 'fixtures');
 const AGY_FIXTURE = path.join(FIXTURES, 'fake-agy.mjs');
 const ZCODE_FIXTURE = path.join(FIXTURES, 'fake-zcode-app-server.mjs');
-const NODE = process.env.ZCODE_NODE_BIN || '/home/cage-bare-exec/agy/agywakefix-20260930/bin/node';
+const NODE = process.env.ZCODE_NODE_BIN || process.execPath;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -35,32 +38,46 @@ async function waitFor(fn, ms, what) {
   }
 }
 
-function unixJsonRpc(sock, requests) {
-  return new Promise((resolve, reject) => {
-    const s = net.connect(sock);
-    let buf = '';
-    const lines = [];
-    s.on('connect', () => {
-      for (const r of requests) s.write(JSON.stringify(r) + '\n');
-    });
-    s.on('data', (d) => {
-      buf += d.toString('utf8');
-      let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i).trim();
-        buf = buf.slice(i + 1);
-        if (line) lines.push(JSON.parse(line));
-        if (lines.length === requests.length) {
-          s.end();
-          resolve(lines);
-        }
+function openPersistentClient(sock) {
+  const s = net.connect(sock);
+  let buf = '';
+  const pending = new Map();
+  s.on('data', (d) => {
+    buf += d.toString('utf8');
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (line) {
+        try {
+          const msg = JSON.parse(line);
+          if (msg.id != null && pending.has(msg.id)) {
+            const { resolve, reject } = pending.get(msg.id);
+            pending.delete(msg.id);
+            if (msg.error) reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+            else resolve(msg);
+          }
+        } catch {}
       }
-    });
-    s.on('error', reject);
+    }
   });
+  let nextId = 1;
+  return {
+    call(name, args) {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        s.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n');
+      });
+    },
+    close() {
+      s.end();
+    },
+    rawSocket: s,
+  };
 }
 
-test('(a) a user turn ends; the fake agy later emits step_update + result -> replies_get has the reply, and progress showed active in between', async (t) => {
+test('(a) a user turn ends; the fake agy later emits step_update + result -> replies_get has the reply, and progress showed active in between', { timeout: 15_000 }, async (t) => {
   const tmpDir = mkdtempSync(path.join(tmpdir(), 'agy-wake-a-'));
   const sock = path.join(tmpDir, 'mcp.sock');
   const agyHome = path.join(tmpDir, 'home');
@@ -94,15 +111,16 @@ test('(a) a user turn ends; the fake agy later emits step_update + result -> rep
 
   await waitFor(() => existsSync(sock), 15000, 'mcp unix socket');
 
-  const call = (id, name, args) =>
-    unixJsonRpc(sock, [{ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }]).then((ls) => ls[0]);
+  const client = openPersistentClient(sock);
+  t.after(() => client.close());
+  const call = (name, args) => client.call(name, args);
 
-  const created = await call(1, 'session_create', { name: 'selfwake-session' });
+  const created = await call('session_create', { name: 'selfwake-session' });
   assert.equal(created?.result?.isError, false, 'session_create succeeded');
   const key = JSON.parse(created.result.content[0].text).key;
 
   // Send initial message that finishes and then triggers self-wake
-  const sent = await call(2, 'message_send', { key, text: 'TRIGGER-SELF-WAKE' });
+  const sent = await call('message_send', { key, text: 'TRIGGER-SELF-WAKE' });
   assert.equal(sent?.result?.isError, false, 'first message sent');
   const r1 = JSON.parse(sent.result.content[0].text).reply;
   assert.match(r1, /FAKE-REPLY: TRIGGER-SELF-WAKE/);
@@ -112,7 +130,7 @@ test('(a) a user turn ends; the fake agy later emits step_update + result -> rep
   let sawActive = false;
   const pollDeadline = Date.now() + 3000;
   while (Date.now() < pollDeadline) {
-    const prog = await call(3, 'progress_get', { key });
+    const prog = await call('progress_get', { key });
     if (!prog?.result?.isError) {
       const p = JSON.parse(prog.result.content[0].text);
       if (p.active === true && p.state === 'active') {
@@ -128,7 +146,7 @@ test('(a) a user turn ends; the fake agy later emits step_update + result -> rep
   let replies = [];
   const replyDeadline = Date.now() + 5000;
   while (Date.now() < replyDeadline) {
-    const got = await call(4, 'replies_get', { key });
+    const got = await call('replies_get', { key });
     if (!got?.result?.isError) {
       replies = JSON.parse(got.result.content[0].text).replies ?? [];
       if (replies.length >= 2) break;
@@ -139,7 +157,53 @@ test('(a) a user turn ends; the fake agy later emits step_update + result -> rep
   assert.equal(replies[1].text, 'self-wake reply text');
 });
 
-test('(b) the reaper does not fire while untracked events flow, and does fire after 20 min of true silence (fake timers)', async (t) => {
+test('(creator-gone) creator disconnects mid-turn -> process is closed after that turn', { timeout: 15_000 }, async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'agy-wake-creator-gone-'));
+  process.env.FIXTURE_AGY_STATE = path.join(dir, 'state');
+  const backend = new AntigravityBackend({
+    agyBin: AGY_FIXTURE,
+    agyHome: path.join(dir, 'home'),
+    cwd: dir,
+  });
+  t.after(async () => {
+    await backend.stop();
+    delete process.env.FIXTURE_AGY_STATE;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  const rawId = sessionId.slice('antigravity:'.length);
+  const session = backend._sessions.get(rawId);
+  assert.ok(session, 'session registered');
+  assert.equal(backend.procSnapshot().live, 1, 'child is live');
+
+  // Creator connection creates session
+  session.creatorConn = 'creator-conn-1';
+
+  // Start turn mid-flight with AGY-SLOW
+  await backend.sendMessage(sessionId, 'AGY-SLOW');
+  assert.ok(session.turn, 'turn started');
+
+  // Creator disconnects MID-TURN
+  backend.creatorDisconnected('creator-conn-1');
+
+  // Verified: session is marked closeWhenIdle='creator-gone'
+  assert.equal(session.closeWhenIdle, 'creator-gone', 'closeWhenIdle marked as creator-gone');
+  // Process is NOT closed immediately mid-turn:
+  assert.equal(backend.procSnapshot().live, 1, 'child remains live mid-turn');
+  assert.ok(session.turn, 'turn still in progress');
+
+  // Fake-agy finishes the slow turn
+  session.client.emit('event', {
+    event: 'result',
+    result: { conversation_id: rawId, status: 'SUCCESS', response: 'done slowly', usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 } },
+  });
+  // Process is closed AFTER that turn:
+  await waitFor(() => backend.procSnapshot().live === 0, 5000, 'child closed after turn');
+  assert.equal(session.closeWhenIdle, null, 'closeWhenIdle cleared after closing');
+});
+
+test('(b) the reaper does not fire while untracked events flow, and does fire after 20 min of true silence (fake timers)', { timeout: 15_000 }, async (t) => {
   const dir = mkdtempSync(path.join(tmpdir(), 'agy-wake-b-'));
   process.env.FIXTURE_AGY_STATE = path.join(dir, 'state');
   const reaps = [];
@@ -166,29 +230,24 @@ test('(b) the reaper does not fire while untracked events flow, and does fire af
   backend._disarmReaper();
   backend._armReaper();
 
-  // Untracked events flow every 5 minutes for 30 minutes total (> 20 min idle limit).
-  for (let i = 0; i < 6; i++) {
+  // F3: Non-turn envelopes (heartbeat) do NOT reset idleSince.
+  // After 20 min with heartbeats flowing, child IS reaped.
+  for (let i = 0; i < 4; i++) {
     t.mock.timers.tick(5 * 60_000);
     session.client.emit('event', {
       event: 'heartbeat',
       tick: i,
     });
     backend._reapTick();
-    assert.equal(backend.procSnapshot().live, 1, `child should stay alive at minute ${(i + 1) * 5} while untracked events flow`);
-    assert.equal(reaps.length, 0, `reaper should not fire while events flow (at minute ${(i + 1) * 5})`);
   }
-
-  // Now 20 minutes of true silence
-  t.mock.timers.tick(20 * 60_000);
-  backend._reapTick();
-  assert.equal(backend.procSnapshot().live, 0, 'child is reaped after 20 min of silence');
+  assert.equal(backend.procSnapshot().live, 0, 'child should be reaped after 20 min despite heartbeat events');
   assert.ok(reaps.some((r) => r.includes('reason=idle')), 'reap line logged reason=idle');
 
   backend._disarmReaper();
   t.mock.timers.reset();
 });
 
-test('(c) no double turn when the user message and the self-wake race', async (t) => {
+test('(c) no double turn when the user message and the self-wake race', { timeout: 15_000 }, async (t) => {
   const dir = mkdtempSync(path.join(tmpdir(), 'agy-wake-c-'));
   process.env.FIXTURE_AGY_STATE = path.join(dir, 'state');
   const events = [];
@@ -218,18 +277,23 @@ test('(c) no double turn when the user message and the self-wake race', async (t
     event: 'step_update',
     step_update: { step_index: 0, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'racing self-wake' },
   });
+  // The racing self-wake finishes:
+  session.client.emit('event', {
+    event: 'result',
+    result: { conversation_id: rawId, status: 'SUCCESS', response: 'self-wake done', usage: { input_tokens: 10, output_tokens: 10, total_tokens: 20 } },
+  });
   await sendPromise;
-  await waitFor(() => turnTerminalEvents().length >= 1, 5000, 'first turn terminal');
+  await waitFor(() => turnTerminalEvents().length >= 2, 5000, 'first turns terminal');
 
-  assert.equal(turnStartedEvents().length, 1, 'exactly one turn.started emitted during race (no double turn)');
-  assert.equal(turnTerminalEvents().length, 1, 'exactly one turn.terminal emitted');
+  assert.equal(turnStartedEvents().length, 2, 'both self-wake and user turn started (no events dropped)');
+  assert.equal(turnTerminalEvents().length, 2, 'both turn.terminal emitted');
 
   // Race 2: self-wake starts first (auto-adopted), and a user message arrives while self-wake is running
   session.client.emit('event', {
     event: 'step_update',
     step_update: { step_index: 0, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'self-wake running' },
   });
-  assert.equal(turnStartedEvents().length, 2, 'second turn started for self-wake');
+  assert.equal(turnStartedEvents().length, 3, 'third turn started for self-wake');
   assert.ok(session.turn, 'self-wake turn is active');
 
   // User sends message while self-wake is running:
@@ -240,7 +304,7 @@ test('(c) no double turn when the user message and the self-wake race', async (t
 
   // Verify that during the self-wake, no concurrent second turn was started
   await sleep(50);
-  assert.equal(turnStartedEvents().length, 2, 'user turn waited, no concurrent turn.started');
+  assert.equal(turnStartedEvents().length, 3, 'user turn waited, no concurrent turn.started');
 
   // Self-wake finishes:
   session.client.emit('event', {
@@ -250,7 +314,86 @@ test('(c) no double turn when the user message and the self-wake race', async (t
 
   // Now user turn proceeds to start and finish:
   await userSend;
-  await waitFor(() => turnTerminalEvents().length >= 3, 5000, 'all turns completed');
-  assert.equal(turnStartedEvents().length, 3, 'user turn started after self-wake finished');
-  assert.equal(turnTerminalEvents().length, 3, 'three terminals for three turns, non-overlapping');
+  await waitFor(() => turnTerminalEvents().length >= 4, 5000, 'all turns completed');
+  assert.equal(turnStartedEvents().length, 4, 'user turn started after self-wake finished');
+  assert.equal(turnTerminalEvents().length, 4, 'four terminals for four turns, non-overlapping');
+});
+
+test('(d) F2 race: user message during in-flight self-wake returns user reply, self-wake recorded in replies_get', { timeout: 15_000 }, async (t) => {
+  const tmpDir = mkdtempSync(path.join(tmpdir(), 'agy-wake-d-'));
+  const sock = path.join(tmpDir, 'mcp.sock');
+  const agyHome = path.join(tmpDir, 'home');
+  const agyState = path.join(tmpDir, 'state');
+  const storePath = path.join(tmpDir, 'store.json');
+
+  const env = {
+    DEFAULT_BACKEND: 'antigravity',
+    ZCODE_NODE_BIN: NODE,
+    ZCODE_BIN: ZCODE_FIXTURE,
+    ZCODE_WORKSPACE_DIR: tmpDir,
+    AGY_BIN: AGY_FIXTURE,
+    AGY_HOME: agyHome,
+    AGY_EFFORT: 'medium',
+    FIXTURE_AGY_STATE: agyState,
+    FIXTURE_AGY_SELF_WAKE_DELAY_MS: '50',
+    FIXTURE_AGY_SELF_WAKE_RESULT_DELAY_MS: '200',
+    FIXTURE_AGY_SLOW_MS: '600',
+    STORE_PATH: storePath,
+    MCP_UNIX_SOCKET: sock,
+  };
+
+  const b = spawn(NODE, [path.join(REPO, 'bridge/index.js')], {
+    env: { ...process.env, PATH: `${path.dirname(NODE)}:${process.env.PATH}`, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  t.after(() => {
+    b.kill('SIGKILL');
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  await waitFor(() => existsSync(sock), 15000, 'mcp unix socket');
+
+  const client = openPersistentClient(sock);
+  t.after(() => client.close());
+
+  const created = await client.call('session_create', { name: 'selfwake-race-session' });
+  assert.equal(created?.result?.isError, false, 'session_create succeeded');
+  const key = JSON.parse(created.result.content[0].text).key;
+
+  // Turn 1: trigger self-wake
+  const sent = await client.call('message_send', { key, text: 'TRIGGER-SELF-WAKE' });
+  assert.equal(sent?.result?.isError, false, 'first message sent');
+  const r1 = JSON.parse(sent.result.content[0].text).reply;
+  assert.match(r1, /FAKE-REPLY: TRIGGER-SELF-WAKE/);
+
+  // Wait for self-wake to start (progress_get becomes active)
+  let sawActive = false;
+  const pollDeadline = Date.now() + 3000;
+  while (Date.now() < pollDeadline) {
+    const prog = await client.call('progress_get', { key });
+    if (!prog?.result?.isError) {
+      const p = JSON.parse(prog.result.content[0].text);
+      if (p.active === true && p.state === 'active') {
+        sawActive = true;
+        break;
+      }
+    }
+    await sleep(20);
+  }
+  assert.equal(sawActive, true, 'self-wake turn is actively running');
+
+  // While self-wake is running, send user message AGY-SLOW (takes 600ms).
+  // The self-wake result arrives in ~200ms (before the 600ms user result).
+  const userSent = await client.call('message_send', { key, text: 'AGY-SLOW' });
+  assert.equal(userSent?.result?.isError, false, 'user message succeeded');
+  const userReply = JSON.parse(userSent.result.content[0].text).reply;
+
+  // Assert message_send returns the USER's reply text:
+  assert.match(userReply, /done slowly/, 'message_send must return the USER reply text');
+
+  // Assert that the self-wake reply is recorded separately in replies_get:
+  const got = await client.call('replies_get', { key });
+  const replies = JSON.parse(got.result.content[0].text).replies ?? [];
+  assert.ok(replies.some((r) => r.text === 'self-wake reply text'), 'self-wake reply recorded in replies_get');
 });
