@@ -119,6 +119,7 @@ export function buildConfig(env = process.env) {
     agyBin: env.AGY_BIN || 'agy',
     agyHome: env.AGY_HOME || '',
     agyEffort: env.AGY_EFFORT || 'medium',
+    agyConfigVerifier: env.AGY_CONFIG_VERIFIER || '',
     // agy's PRIVATE working directory -- never the workspace, which the
     // executor writes and agy would read project config from (see
     // antigravityClient.js). Made 0700 at spawn; empty = the backend's

@@ -73,17 +73,17 @@ async function waitFor(fn, what, ms = 10_000) {
 
 const resultOf = (events) => events.find((e) => e.event === 'result')?.result;
 
-test('buildArgv: the exact spawn contract (stream-json both sides, remote control, auto mode, bare slug + effort)', () => {
+test('buildArgv: the exact spawn contract (stream-json both sides, NO remote control, auto mode, bare slug + effort)', () => {
   const client = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-3.8-flash', effort: 'high' });
   assert.deepEqual(client.buildArgv(null), [
     '--input-format', 'stream-json', '--output-format', 'stream-json',
-    '--remote-control', '--dangerously-skip-permissions',
+    '--dangerously-skip-permissions',
     '--model', 'gemini-3.8-flash', '--effort', 'high',
   ]);
   // Resume appends --conversation; nothing else moves (the drivers' argv order).
   assert.deepEqual(client.buildArgv('abc-123'), [
     '--input-format', 'stream-json', '--output-format', 'stream-json',
-    '--remote-control', '--dangerously-skip-permissions',
+    '--dangerously-skip-permissions',
     '--model', 'gemini-3.8-flash', '--effort', 'high',
     '--conversation', 'abc-123',
   ]);
@@ -104,7 +104,9 @@ test('spawn: init event arrives with conversation id, always-proceed mode, and H
     assert.equal(init.init.model, 'gemini-3.8-flash'); // the BARE slug is echoed
     const m = JSON.parse(readFileSync(marker, 'utf8'));
     assert.equal(m.home, agyHome, 'the child ran with HOME=agyHome (the credential HOME)');
-    assert.ok(m.argv.includes('--remote-control'), 'argv carries --remote-control');
+    // Owner decision 2026-09-27: bridge sessions never register with the
+    // dashboard (scarce per-account slots; the fleet daemon is the one).
+    assert.ok(!m.argv.includes('--remote-control'), 'argv must NOT carry --remote-control');
     assert.ok(m.argv.includes('--dangerously-skip-permissions'), 'argv carries --dangerously-skip-permissions');
     assert.ok(!m.argv.includes('--conversation'), 'a fresh spawn does not resume');
   } finally {
@@ -322,8 +324,8 @@ test('ensureAgySettings: is idempotent and tolerates a corrupt file', (t) => {
 // workspace as an agy project -- with it, agy execs .agents/mcp_config.json's
 // servers directly as the agent account (measured, agy 1.2.9 under strace).
 test('buildArgv: never attaches the workspace (--add-dir or any dir-ish flag), on every path', () => {
-  for (const remoteControl of [true, false]) {
-    const client = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-3.8-flash', effort: 'high', remoteControl });
+  for (const skipPermissions of [true, false]) {
+    const client = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-3.8-flash', effort: 'high', skipPermissions });
     for (const id of [null, 'abc-123']) {
       const argv = client.buildArgv(id);
       assert.ok(!argv.some((a) => /^--(add-dir|include-directories|dir|workspace|project)\b/.test(a)), `argv attaches a directory: ${argv.join(' ')}`);

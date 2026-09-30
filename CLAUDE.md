@@ -54,11 +54,12 @@ regardless of which one a topic runs on.
   (the backend is a registry of children, not one long-lived subprocess),
   user turns on stdin, `init`/`step_update`/`result` events on stdout,
   resume = respawn with `--conversation`, cancel = SIGTERM (the conversation
-  survives). Every session starts with `--remote-control` (owner decision
-  2026-09-24: the same conversation is visible/drivable in the
-  antigravity.google dashboard — agy's own session-scoped feature, dies with
-  the process, NOT the Claude `remote-control --session-id` capacity trap
-  the workspace AGENTS.md warns about) and `--dangerously-skip-permissions`
+  survives). Sessions NEVER start with `--remote-control` (owner decision
+  2026-09-27, reversing 2026-09-24: each registered instance takes one of
+  the Google account's scarce dashboard slots — 429 RESOURCE_EXHAUSTED once
+  they run out — and the fleet's own `agy remote-control serve` daemon is
+  the single registered instance). Every session starts with
+  `--dangerously-skip-permissions`
   (auto mode; settings seeded `always-proceed`). Protocol facts carry
   evidence tiers like codex's (VERIFIED LIVE against agy 1.2.9 / FROM DOCS /
   INFERRED) — agy is unfree and closed, so the transcripts and drivers under

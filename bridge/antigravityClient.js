@@ -28,11 +28,15 @@
 //     $HOME/.gemini/antigravity-cli/antigravity-oauth-token (0600, the Linux
 //     keyring file-fallback). One login per bridge model account, agent-owned
 //     HOME -- the CODEX_HOME analogue, set per spawn below.
-//   - `--remote-control` on every session is the owner decision (2026-09-24):
-//     the session becomes visible and drivable from the antigravity.google
-//     dashboard. It is agy's own session-scoped feature and dies with the
-//     process -- it is NOT the Claude `remote-control --session-id`
-//     capacity-pinning trap described in the workspace AGENTS.md.
+//   - NO `--remote-control`, ever (owner decision 2026-09-27, reversing the
+//     2026-09-24 one). Every agy instance that registers with the
+//     antigravity.google dashboard takes one of the Google account's scarce
+//     remote-control slots, and Google refuses registration with 429
+//     RESOURCE_EXHAUSTED once they run out. The fleet's separately-supervised
+//     `agy remote-control serve` daemon (not in this repo) is the single
+//     registered instance; bridge sessions never register, and must work
+//     whether or not any dashboard registration succeeds. buildArgv has no
+//     way to emit the flag, deliberately.
 //   - `--effort` must always accompany the bare `--model` slug: bare slug
 //     without --effort, or an effort-suffixed slug together with --effort,
 //     are both hard-errors (verified live, battery (d)). This file always
@@ -60,8 +64,9 @@ import path from 'node:path';
 // plugins, GEMINI.md, AGENTS.md and .gemini/config.json there, and execs
 // the MCP servers listed directly as the agent. Print/stream-json mode with
 // cwd = workspace and no --add-dir opened nothing in cwd, but whether a
-// dashboard-driven turn on a --remote-control instance (every bridge
-// session is one) treats its cwd as a project is UNMEASURED. So the cwd is
+// dashboard-driven turn on a --remote-control instance treats its cwd as a
+// project is UNMEASURED (bridge sessions no longer register, but the
+// private cwd is kept as defence in depth). So the cwd is
 // a directory of the agent's own: 0700, outside the workspace, and checked
 // for exactly those names before every turn and every spawn (the backend's
 // pre-turn gate).
@@ -197,7 +202,7 @@ export function ensureAgySettings(agyHome, defaults = AGY_SETTINGS_DEFAULTS) {
 export const AGY_DELIVERY_FAILED = 'agy exited before the message could be delivered — retry';
 
 export class AntigravityClient extends EventEmitter {
-  constructor({ agyBin, agyHome, cwd, workspaceDir = null, model, effort, remoteControl = true, skipPermissions = true, env = {} }) {
+  constructor({ agyBin, agyHome, cwd, workspaceDir = null, model, effort, skipPermissions = true, env = {} }) {
     super();
     this.agyBin = agyBin; // 'agy' (resolved on PATH) or an absolute path
     this.agyHome = agyHome; // HOME for the child -- holds the OAuth token file
@@ -205,7 +210,6 @@ export class AntigravityClient extends EventEmitter {
     this.workspaceDir = workspaceDir; // the workspace the model works in -- CAGE_WORKSPACE for the executor shim
     this.model = model; // the BARE slug (e.g. 'gemini-3.8-flash'); effort travels separately
     this.effort = effort; // 'low' | 'medium' | 'high' -- always paired with the bare slug
-    this.remoteControl = remoteControl;
     this.skipPermissions = skipPermissions;
     this.env = env;
     this.proc = null;
@@ -234,7 +238,7 @@ export class AntigravityClient extends EventEmitter {
   // bypassing the executor shim. The workspace is executor-writable, so
   // attaching it hands the executor code execution as the account that
   // holds the credential. With cwd = workspace and no --add-dir, print mode
-  // opened nothing in cwd -- but a --remote-control session's
+  // opened nothing in cwd -- but a --remote-control instance's
   // dashboard-driven turns are unmeasured, so the cwd is agy's own private
   // 0700 directory (this.cwd; ensurePrivateCwd/projectConfigIn above, and
   // the backend's pre-turn gate) and the workspace reaches the model only
@@ -242,8 +246,8 @@ export class AntigravityClient extends EventEmitter {
   buildArgv(conversationId) {
     // FROM DOCS: stream-json input REQUIRES stream-json output (agy refuses
     // the combination otherwise -- --input-format's help text says so).
+    // Never `--remote-control` (see the header: the dashboard slot quota).
     const argv = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
-    if (this.remoteControl) argv.push('--remote-control');
     if (this.skipPermissions) argv.push('--dangerously-skip-permissions');
     argv.push('--model', this.model, '--effort', this.effort);
     // Resume: agy persists conversations under

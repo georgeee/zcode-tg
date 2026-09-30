@@ -477,13 +477,14 @@ Two properties are deliberate and owner-mandated:
   `AUTO_APPROVE_PERMISSIONS=false` the flag is withheld, but the backend is
   not otherwise usable that way yet (a mid-turn prompt would just stall the
   turn inside agy).
-- **`--remote-control` on every session.** Each session registers itself
-  with the antigravity.google Remote Control dashboard, so the same
-  conversation is visible and drivable from the owner's phone. This is
-  agy's own session-scoped feature — the tunnel lives and dies with the
-  session process, no OS service is installed, and it has nothing to do
-  with the Claude `remote-control --session-id` capacity trap described in
-  the workspace AGENTS.md.
+- **No `--remote-control`, ever.** Bridge sessions do not register with
+  the antigravity.google Remote Control dashboard. Every registered agy
+  instance takes one of the Google account's scarce remote-control slots,
+  and Google refuses registration with 429 `RESOURCE_EXHAUSTED` once they
+  run out; the fleet's separately-supervised `agy remote-control serve`
+  daemon (not in this repo) is the single registered instance. Bridge
+  (MCP) sessions work whether or not any dashboard registration succeeds.
+  (Owner decision 2026-09-27, reversing the 2026-09-24 one.)
 
 **The pre-turn config gate.** Measured live (agy 1.2.9): if the model uses
 its in-process file tool to write `$AGY_HOME/.gemini/config/mcp_config.json`
@@ -491,16 +492,19 @@ during a session, agy re-reads that file at the start of the NEXT turn and
 execs the listed MCP servers directly, as the account agy runs as — the
 agent account, the one that holds the session credential. Turn 1 writes,
 turn 2 fires; a fresh start fires too. So before every turn delivery and
-before every spawn or respawn, the backend checks that `mcp_config.json`
-and `plugins.json` are absent, 0 bytes (a fresh agy leaves a 0-byte
-`mcp_config.json`), or JSON with no servers/plugins, and that
-`config/plugins/` is absent or empty. On a violation the turn is never
-delivered: the offending file is renamed to `<name>.quarantined-<unix-ts>`
-(kept for forensics, never exec'd or parsed further), the session's agy
-child is stopped through the bounded close escalation, and the turn fails
-with a review-before-continuing message plus a loud warn and a
-`quarantine path=… key=…` log line. Every session of the same AGY_HOME
-shares the file, and each of their turns runs the same check.
+before every spawn or respawn, the backend checks configuration integrity.
+When `AGY_CONFIG_VERIFIER` is set, verification delegates to
+`<AGY_CONFIG_VERIFIER> agy-config-verify <AGY_HOME>`; otherwise the backend
+checks that `mcp_config.json` and `plugins.json` are absent, 0 bytes (a fresh
+agy leaves a 0-byte `mcp_config.json`), or JSON with no servers/plugins, and
+that `config/plugins/` is absent or empty. On a violation the turn is never
+delivered: if an offending file is identified, it is renamed to
+`<name>.quarantined-<unix-ts>` (kept for forensics, never exec'd or parsed
+further); on verifier failure without a path, nothing is renamed. In all refusal
+cases, the session's agy child is stopped through the bounded close
+escalation, and the turn fails with a message naming the failure plus a loud
+warn and (on quarantine) a `quarantine path=… key=…` log line. Every session of
+the same AGY_HOME shares the file, and each of their turns runs the same check.
 
 **agy's private working directory.** agy never runs with the workspace as
 its cwd: the workspace is the directory the executor writes, and agy reads
@@ -559,6 +563,11 @@ codex):
   (default) or `high`.
 - `AGY_BRIDGE_CWD` — agy's private working directory (see above); default
   `<AGY_HOME's parent>/.local/state/agent-cage/agy-bridge/cwd`.
+- `AGY_CONFIG_VERIFIER` — absolute path of the canonical cage binary used to
+  verify agy config (`<AGY_CONFIG_VERIFIER> agy-config-verify <AGY_HOME>`).
+  When set, delegates verification of `mcp_config.json`, `plugins.json`, and
+  `plugins/` to the cage binary. When unset or empty, the bridge uses its
+  built-in inert-only check.
 
 Process GC (2026-09-24). agy's stream-json mode has no multiplexing: every
 session IS a process, an idle one costs 93–181 MB of anonymous RSS, and

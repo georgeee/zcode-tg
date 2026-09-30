@@ -208,7 +208,7 @@ const BACKEND_FACTORIES = {
   // pays nothing for it. The knobs live in bridge/config.js (agyBin/agyHome/
   // agyEffort/agyBridgeCwd/agyIdleCloseMin/agyMaxProcs).
   antigravity: () => {
-    if (!cfg.agyHome) throw new Error("the 'antigravity' backend needs AGY_HOME set (see README)");
+    if (!cfg.agyHome) throw new Error("the 'antigravity' backend needs AGY_HOME set — this bridge was not started for antigravity; use the cage-antigravity MCP server instead (see README)");
     return new AntigravityBackend({
       agyBin: cfg.agyBin,
       agyHome: cfg.agyHome,
@@ -218,8 +218,9 @@ const BACKEND_FACTORIES = {
       privateCwd: cfg.agyBridgeCwd || null,
       effort: cfg.agyEffort,
       autoApprovePermissions: cfg.autoApprovePermissions,
-      // The GC knobs: minutes -> ms, 0 meaning disabled survives the
-      // translation.
+      configVerifier: cfg.agyConfigVerifier || null,
+      // The GC knobs (see cfg above): minutes -> ms, 0 meaning disabled
+      // survives the translation.
       idleCloseMs: cfg.agyIdleCloseMin > 0 ? cfg.agyIdleCloseMin * 60_000 : 0,
       maxProcs: cfg.agyMaxProcs,
       // The marker every agy child carries and the boot sweep matches.
@@ -3230,6 +3231,9 @@ async function main() {
         if (!telegramEnabled()) {
           if (chatIdNum != null) throw new Error('session_create: chat_id names a Telegram chat, but this bridge runs MCP-only (no Telegram transport configured)');
           const key = mintMcpOnlySessionKey();
+          if (store.isKeyRecorded(key)) {
+            throw new Error(`cannot create session: key "${key}" already has an existing record`);
+          }
           // `threadId: key` -- the store's threadId field holds the RAW
           // Telegram thread for real topics; for a topic-less session the
           // conversation key is the closest truth, and it is what
@@ -3261,6 +3265,9 @@ async function main() {
         store.noteChat(chatId, { lastSeenAt: Date.now() }); // a successful create is the strongest "we serve this chat"
         const threadId = created.message_thread_id;
         const key = keyFor(chatId, threadId);
+        if (store.isKeyRecorded(key, threadId)) {
+          throw new Error(`cannot create session: key "${key}" already has an existing record`);
+        }
         store.setTopic(key, { chatId, threadId, name, backend, model, mode: cfg.defaultSessionMode });
         await getOrCreateSession(key);
         const entry = store.getTopic(key);

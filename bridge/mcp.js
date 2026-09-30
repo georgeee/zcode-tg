@@ -219,7 +219,7 @@ export function createMcpGateway({
             type: 'string',
             enum: ['zcode', 'codex', 'antigravity', 'mock'],
             description:
-              "Which backend runs this session. Defaults to the bridge's own default backend (normally 'zcode'). 'codex' requires the bridge to have CODEX_HOME configured. 'antigravity' (Google Antigravity CLI) requires AGY_HOME; every session it starts carries --remote-control, so the same conversation is visible and drivable in the antigravity.google dashboard. 'mock' needs no configuration at all -- an in-process, zero-credential, zero-subprocess echo backend for exercising this MCP machinery without spending real API/credit usage; its reply is always a synthetic '[mock echo] <prompt>' echo, never a real model.",
+              "Which backend runs this session. Defaults to the bridge's own default backend (normally 'zcode'). 'codex' requires the bridge to have CODEX_HOME configured. 'antigravity' (Google Antigravity CLI) requires AGY_HOME; its sessions do not register with the antigravity.google dashboard (no --remote-control). 'mock' needs no configuration at all -- an in-process, zero-credential, zero-subprocess echo backend for exercising this MCP machinery without spending real API/credit usage; its reply is always a synthetic '[mock echo] <prompt>' echo, never a real model.",
           },
           model: {
             type: 'string',

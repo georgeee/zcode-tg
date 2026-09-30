@@ -1,12 +1,17 @@
 // Reader for agy's conversation SQLite store -- the one place turns typed in
 // the antigravity.google dashboard (Remote Control) are visible to this
 // bridge. MEASURED FACT (work/antigravity/experiments/conversation-db-notes.md,
-// 2026-09-24): a headless `agy --remote-control` session runs dashboard turns,
+// 2026-09-24): a headless `agy --remote-control` instance runs dashboard turns,
 // but neither those turns nor their replies ever appear on agy's stream-json
 // stdout -- they exist only in the conversation's
 // $AGY_HOME/.gemini/antigravity-cli/conversations/<conversation_id>.db
 // (SQLite, WAL). Without this reader, an MCP caller (and the bridge itself)
 // is blind to half the conversation its own agy child is having.
+//
+// Since 2026-09-27 the bridge's own agy children never start with
+// --remote-control (the dashboard slot quota -- see antigravityClient.js), so
+// for them this reader normally finds only turns the bridge itself wrote and
+// emits nothing. It stays because it is harmless and cheap.
 //
 // Every fact below is pinned against the live store; the notes file is the
 // evidence record. The schema of the one table that matters:
@@ -388,7 +393,7 @@ export class ConversationWatcher extends EventEmitter {
   // 'dashboard' | 'ours' -- for a USER row. The UA marker wins FIRST: a row
   // carrying a browser User-Agent is dashboard-origin even while one of our
   // turns runs (George typing from his phone mid-turn is exactly the
-  // cross-device case --remote-control exists for). A row arriving while OUR
+  // cross-device case the dashboard exists for). A row arriving while OUR
   // turn is in flight is ours (only this bridge writes agy's stdin); so is
   // a UA-less row matching a recent stdin text of ours -- the late-poll
   // case of the same thing. Model rows never reach here: their response

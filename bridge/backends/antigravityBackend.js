@@ -23,6 +23,7 @@
 // this class never re-emits 'exit' at backend level.
 
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, renameSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { Backend, makeSessionId, rawSessionId } from '../backend.js';
@@ -125,7 +126,7 @@ function declaresServersOrPlugins(text) {
 }
 
 export class AntigravityBackend extends Backend {
-  constructor({ agyBin, agyHome, cwd, privateCwd = null, effort = 'medium', autoApprovePermissions = true, remoteControl = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null }) {
+  constructor({ agyBin, agyHome, cwd, privateCwd = null, effort = 'medium', autoApprovePermissions = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null, configVerifier = null, configVerifierTimeoutMs = 10_000 }) {
     super('antigravity');
     this.agyBin = agyBin;
     this.agyHome = agyHome;
@@ -135,11 +136,13 @@ export class AntigravityBackend extends Backend {
     this.privateCwd = privateCwd || defaultAgyBridgeCwd(agyHome);
     this.effort = effort;
     this.autoApprovePermissions = autoApprovePermissions;
-    // Owner decision (2026-09-24): every session starts with --remote-control
-    // so the SAME conversation is visible and drivable from the
-    // antigravity.google dashboard. Session-scoped: the tunnel dies with the
-    // process (design doc §13). Not Claude's remote-control trap.
-    this.remoteControl = remoteControl;
+    this.configVerifier = configVerifier;
+    this.configVerifierTimeoutMs = configVerifierTimeoutMs;
+    // Owner decision (2026-09-27, reversing 2026-09-24): sessions NEVER
+    // start with --remote-control. Each registered instance takes one of the
+    // Google account's scarce dashboard slots (429 RESOURCE_EXHAUSTED once
+    // they run out); the fleet's own `agy remote-control serve` daemon is the
+    // single registered instance. There is deliberately no option for it.
     this.initTimeoutMs = initTimeoutMs; // cold first runs unpack skills (5-15s measured; 90s is generous)
     // Test seam for the conversation-store watcher (see _startWatcher):
     // where its cursor starts. null (production) = tail -- history is never
@@ -373,7 +376,8 @@ export class AntigravityBackend extends Backend {
     if (!parsed) throw this._badModelRefError(model);
     const session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort });
     const init = await session.initPromise;
-    return { sessionId: makeSessionId('antigravity', init.conversation_id), model: AGY_MODEL_REF };
+    const effectiveModel = parsed.effort ? `${AGY_MODEL_REF}:${parsed.effort}` : AGY_MODEL_REF;
+    return { sessionId: makeSessionId('antigravity', init.conversation_id), model: effectiveModel };
   }
 
   // Resume = respawn with --conversation (agy persists conversations as
@@ -408,25 +412,74 @@ export class AntigravityBackend extends Backend {
   // each of their turns re-checks -- whoever turns first while the file is
   // dirty gets refused and quarantines it; the rest find it gone.
   _configViolation() {
-    const configDir = path.join(this.agyHome, '.gemini', 'config');
-    for (const name of ['mcp_config.json', 'plugins.json']) {
-      const file = path.join(configDir, name);
-      let dirty;
-      try {
-        dirty = existsSync(file) && statSync(file).size > 0 && declaresServersOrPlugins(readFileSync(file, 'utf8'));
-      } catch {
-        dirty = true; // unreadable: not provably inert
+    const verifier = (this.configVerifier !== null ? this.configVerifier : process.env.AGY_CONFIG_VERIFIER) || '';
+    if (verifier.trim().length > 0) {
+      const verifierBin = verifier.trim();
+      const res = spawnSync(verifierBin, ['agy-config-verify', this.agyHome], {
+        timeout: this.configVerifierTimeoutMs,
+        encoding: 'utf8',
+        shell: false,
+      });
+      if (res.error) {
+        const isTimeout = res.error.code === 'ETIMEDOUT' || res.signal === 'SIGTERM';
+        const reason = isTimeout
+          ? `timed out after ${this.configVerifierTimeoutMs}ms`
+          : (res.error.message || String(res.error));
+        return {
+          noQuarantine: true,
+          message: `antigravity: config verifier (${verifierBin}) failed: ${reason}; session stopped.`,
+        };
       }
-      if (dirty) return { path: file };
+      if (res.status === 0) {
+        // Acceptable per Go verifier: fall through to private cwd check
+      } else if (res.status === 3) {
+        const firstLine = (res.stdout || '').split(/\r?\n/)[0].trim();
+        if (firstLine) {
+          return { path: firstLine };
+        }
+        return {
+          noQuarantine: true,
+          message: `antigravity: config verifier (${verifierBin}) reported violation (exit 3) without an offending path; session stopped.`,
+        };
+      } else if (res.status !== null) {
+        const stderr = (res.stderr || '').trim();
+        const detail = stderr ? `: ${stderr}` : '';
+        return {
+          noQuarantine: true,
+          message: `antigravity: config verifier (${verifierBin}) failed with exit code ${res.status}${detail}; session stopped.`,
+        };
+      } else if (res.signal) {
+        return {
+          noQuarantine: true,
+          message: `antigravity: config verifier (${verifierBin}) terminated by signal ${res.signal}; session stopped.`,
+        };
+      } else {
+        return {
+          noQuarantine: true,
+          message: `antigravity: config verifier (${verifierBin}) failed unexpectedly; session stopped.`,
+        };
+      }
+    } else {
+      const configDir = path.join(this.agyHome, '.gemini', 'config');
+      for (const name of ['mcp_config.json', 'plugins.json']) {
+        const file = path.join(configDir, name);
+        let dirty;
+        try {
+          dirty = existsSync(file) && statSync(file).size > 0 && declaresServersOrPlugins(readFileSync(file, 'utf8'));
+        } catch {
+          dirty = true; // unreadable: not provably inert
+        }
+        if (dirty) return { path: file };
+      }
+      const pluginsDir = path.join(configDir, 'plugins');
+      let dirtyDir;
+      try {
+        dirtyDir = existsSync(pluginsDir) && readdirSync(pluginsDir).length > 0;
+      } catch {
+        dirtyDir = true; // unreadable: not provably empty
+      }
+      if (dirtyDir) return { path: pluginsDir };
     }
-    const pluginsDir = path.join(configDir, 'plugins');
-    let dirtyDir;
-    try {
-      dirtyDir = existsSync(pluginsDir) && readdirSync(pluginsDir).length > 0;
-    } catch {
-      dirtyDir = true; // unreadable: not provably empty
-    }
-    if (dirtyDir) return { path: pluginsDir };
     // The private cwd: any project-config name at all is a violation.
     const project = projectConfigIn(this.privateCwd);
     if (project) return { path: project, inCwd: true };
@@ -439,6 +492,11 @@ export class AntigravityBackend extends Backend {
   // comes back for the failed turn. Stopping the session's child is the
   // caller's move (the spawn path has no child to stop).
   _quarantine(violation, key) {
+    if (violation.noQuarantine) {
+      const message = violation.message;
+      this.emit('warn', message);
+      return message;
+    }
     const stamp = Math.floor(Date.now() / 1000);
     let target = `${violation.path}.quarantined-${stamp}`;
     for (let n = 2; existsSync(target); n += 1) target = `${violation.path}.quarantined-${stamp}-${n}`; // same-second re-quarantine never overwrites forensics
@@ -651,7 +709,6 @@ export class AntigravityBackend extends Backend {
       workspaceDir,
       model: AGY_MODEL_REF,
       effort,
-      remoteControl: this.remoteControl,
       skipPermissions: this.autoApprovePermissions,
       // C4: the bridge marker. The orphan sweep at boot identifies OUR
       // bridge's leftover agy children by exactly this variable -- it is
@@ -725,9 +782,9 @@ export class AntigravityBackend extends Backend {
   }
 
   _onChildExit(session, info) {
-    // The watcher dies with the child too: the --remote-control tunnel is
-    // the child's, so nothing can journal new dashboard turns while it is
-    // down (a respawn starts a fresh watcher with a fresh tail cursor).
+    // The watcher dies with the child too: nothing can journal new turns
+    // into this conversation's store while the child is down (a respawn
+    // starts a fresh watcher with a fresh tail cursor).
     session.watcher?.stop();
     this._pending.delete(session); // died before init: its cap slot goes back
     session.lastExitAt = Date.now();
@@ -765,8 +822,12 @@ export class AntigravityBackend extends Backend {
   // Tails the session's conversation .db for turns typed in the
   // antigravity.google dashboard. MEASURED (conversation-db-notes.md): those
   // turns and their replies never appear on agy's stream-json stdout -- they
-  // are journalled only in the SQLite store, and --remote-control sessions
-  // run them while this bridge sits idle. Emitted as session/event payloads
+  // are journalled only in the SQLite store, and a --remote-control instance
+  // runs them while this bridge sits idle. Bridge sessions no longer start
+  // with --remote-control (2026-09-27), so in production the watcher only
+  // ever sees our own stdin turns, classifies them 'ours' and emits nothing:
+  // an inert 2s poll per live child, kept so a conversation that does get
+  // driven from the dashboard stays visible. Emitted as session/event payloads
   // of kind 'dashboard_message' ({role, origin:'dashboard', text}) which
   // index.js notes into the MCP reply log -- the session's reply stream.
   _startWatcher(session) {
