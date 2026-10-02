@@ -84,7 +84,7 @@ export function createMcpGateway({
     log.push(entry);
     while (log.length > REPLY_LOG_LIMIT) log.shift();
     replyLog.set(key, log);
-    if (!meta || meta.role !== 'user') {
+    if (!meta || (meta.role !== 'user' && !meta.adopted)) {
       for (const w of waiters.get(key) ?? []) w.resolve(entry);
       waiters.delete(key);
     }

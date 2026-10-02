@@ -510,6 +510,32 @@ export class AntigravityBackend extends Backend {
     return message;
   }
 
+  _waitForTurnEnd(session, timeoutMs = 600_000) {
+    if (!session.turn) return Promise.resolve();
+    return new Promise((resolve) => {
+      let timer = null;
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          this.off('event', onEvt);
+          resolve();
+        }, timeoutMs);
+      }
+      const onEnd = () => {
+        if (!session.turn) {
+          if (timer) clearTimeout(timer);
+          this.off('event', onEvt);
+          resolve();
+        }
+      };
+      const onEvt = (e) => {
+        if (e.method === 'v4/telemetry/event' && (e.params?.kind === 'turn.terminal' || !session.turn)) {
+          onEnd();
+        }
+      };
+      this.on('event', onEvt);
+    });
+  }
+
   // Fire-and-forget per the Backend contract: writes ONE user turn object to
   // the session's stdin; the reply streams back as 'event' emissions ending
   // in v4/telemetry/event turn.terminal.
@@ -535,39 +561,52 @@ export class AntigravityBackend extends Backend {
       this._emitTelemetry(makeSessionId('antigravity', rawId), turnId, 'turn.terminal', { status: 'failed', errorCode: message });
       return;
     }
-    const session = await this._runningSession(sessionId);
-    // The first turn this CHILD receives carries the workspace note: agy's
-    // cwd is its private directory, so the note is how the model learns
-    // where its workspace is (antigravityClient.js, workspaceNote).
-    const delivered = session.turnSeq === 0 ? workspaceNote(session.workspaceDir, session.client.cwd) + text : text;
-    const turnId = `${rawSessionId(sessionId)}:${++session.turnSeq}`;
-    session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0 };
-    session.turnStartedAt = Date.now();
-    // The watcher's late-poll guard needs our recent stdin texts: a poll
-    // landing after this turn finished would otherwise read its user row as
-    // dashboard-origin (no turn in flight any more). Capped -- it is a
-    // membership set, not a transcript. The DELIVERED text: that is what
-    // agy journals.
-    session.ownTurnTexts.add(delivered);
-    if (session.ownTurnTexts.size > 16) session.ownTurnTexts.delete(session.ownTurnTexts.values().next().value);
-    // turn.started FIRST: index.js correlates a turn's events on the turnId
-    // learned from this event, and adopts backend-initiated turns from it.
-    this._emitTelemetry(makeSessionId('antigravity', rawSessionId(sessionId)), turnId, 'turn.started');
+    let session;
     try {
-      await session.client.sendUserTurn(delivered);
-    } catch (err) {
-      // The child died between the respawn check in _runningSession and the
-      // write (crash, or a SIGTERM-cancel exit racing the next turn): the
-      // message never reached agy. End the turn HERE -- index.js's watchdog
-      // is off by default, so without this the topic would sit on its
-      // placeholder forever -- with the client's retryable delivery message.
-      // The conversation survives; the next send respawn-resumes.
-      session.turn = null;
-      session.ownTurnTexts.delete(delivered);
-      this._emitTelemetry(makeSessionId('antigravity', rawSessionId(sessionId)), turnId, 'turn.terminal', {
-        status: 'failed',
-        errorCode: err.message,
-      });
+      session = await this._runningSession(sessionId);
+      while (session.turn) {
+        await this._waitForTurnEnd(session);
+        if (session.cancelPending) return;
+      }
+      session.startingTurn = true;
+      while (session.turn) {
+        session.startingTurn = false;
+        await this._waitForTurnEnd(session);
+        if (session.cancelPending) return;
+        session.startingTurn = true;
+      }
+      // The first turn this CHILD receives carries the workspace note: agy's
+      // cwd is its private directory, so the note is how the model learns
+      // where its workspace is (antigravityClient.js, workspaceNote).
+      const delivered = session.turnSeq === 0 ? workspaceNote(session.workspaceDir, session.client.cwd) + text : text;
+      const turnId = `${rawSessionId(sessionId)}:${++session.turnSeq}`;
+      session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0 };
+      session.turnStartedAt = Date.now();
+      session.startingTurn = false;
+      // The watcher's late-poll guard needs our recent stdin texts: a poll
+      // landing after this turn finished would otherwise read its user row as
+      // dashboard-origin (no turn in flight any more). Capped -- it is a
+      // membership set, not a transcript. The DELIVERED text: that is what
+      // agy journals.
+      session.ownTurnTexts.add(delivered);
+      if (session.ownTurnTexts.size > 16) session.ownTurnTexts.delete(session.ownTurnTexts.values().next().value);
+      // turn.started FIRST: index.js correlates a turn's events on the turnId
+      // learned from this event, and adopts backend-initiated turns from it.
+      this._emitTelemetry(makeSessionId('antigravity', rawSessionId(sessionId)), turnId, 'turn.started');
+      try {
+        await session.client.sendUserTurn(delivered);
+      } catch (err) {
+        session.turn = null;
+        session.startingTurn = false;
+        session.ownTurnTexts.delete(delivered);
+        this._emitTelemetry(makeSessionId('antigravity', rawSessionId(sessionId)), turnId, 'turn.terminal', {
+          status: 'failed',
+          errorCode: err.message,
+        });
+      }
+    } catch (e) {
+      if (session) session.startingTurn = false;
+      throw e;
     }
   }
 
@@ -715,7 +754,7 @@ export class AntigravityBackend extends Backend {
       // the only thing that distinguishes them from any other process.
       env: { CAGE_AGY_BRIDGE: this.bridgeMarker },
     });
-    const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null, idleSince: Date.now(), turnStartedAt: null, creatorConn: null, closeWhenIdle: null, cancelPending: false, closing: false, closePromise: null, lastExitAt: null };
+    const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null, idleSince: Date.now(), turnStartedAt: null, creatorConn: null, closeWhenIdle: null, cancelPending: false, startingTurn: false, closing: false, closePromise: null, lastExitAt: null };
     this._pending.add(session);
     session.initPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`agy did not initialize within ${this.initTimeoutMs}ms (agyBin=${this.agyBin})`)), this.initTimeoutMs);
@@ -875,16 +914,33 @@ export class AntigravityBackend extends Backend {
       case 'init':
         return; // consumed by the spawn-time initPromise; nothing to stream
       case 'step_update':
+        session.idleSince = Date.now();
         return this._onStepUpdate(session, sessionId, msg.step_update ?? {});
       case 'result':
+        session.idleSince = Date.now();
         return this._onResult(session, sessionId, msg.result ?? {});
       default:
         return; // unknown event kinds are ignored deliberately (forward-compat)
     }
   }
 
+  _autoAdoptTurn(session, sessionId) {
+    const turnId = `${session.rawId}:${++session.turnSeq}`;
+    session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0, adopted: true };
+    session.turnStartedAt = Date.now();
+    this._emitTelemetry(sessionId, turnId, 'turn.started');
+    return session.turn;
+  }
+
+  _shouldAutoAdopt(session) {
+    return !session.turn && this._isLive(session) && !session.cancelPending;
+  }
+
   _onStepUpdate(session, sessionId, step) {
-    if (!session.turn) return; // a step for a turn we never started (or already ended) -- nothing to attach it to
+    if (!session.turn) {
+      if (!this._shouldAutoAdopt(session)) return;
+      this._autoAdoptTurn(session, sessionId);
+    } // auto-adopt self-wake turn when no turn is active
     const turnId = session.turn.id;
     // VERIFIED LIVE (battery (b)): tool steps come as
     // {step_type:"tool", tool_name, state ACTIVE->DONE, tool_info:{parameters:
@@ -917,6 +973,9 @@ export class AntigravityBackend extends Backend {
   }
 
   _onResult(session, sessionId, result) {
+    if (!session.turn && this._shouldAutoAdopt(session)) {
+      this._autoAdoptTurn(session, sessionId);
+    }
     const turn = session.turn;
     // THE CANCEL IS THE VERDICT: a SIGTERM was already requested for this
     // turn, so an envelope that races in after the signal -- a SUCCESS that

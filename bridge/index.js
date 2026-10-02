@@ -1145,7 +1145,7 @@ async function finalizeTurn(sessionId, terminalParams) {
       } else {
         const footer = terminalParams.status === 'success' ? usageFooter(turn, terminalParams) : '';
         const replyText = text.trim() ? text : '(no reply text)';
-        if (mcp && topic) mcp.noteReply(topic.threadId, replyText);
+        if (mcp && topic) mcp.noteReply(topic.threadId, replyText, { adopted: turn?.adopted });
         await deliverReply(replaceId, topic?.threadId, replyText, footer);
       }
     }

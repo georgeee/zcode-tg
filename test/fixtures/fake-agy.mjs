@@ -137,6 +137,29 @@ async function runTurn(content) {
   }
   emit({ event: 'result', result: { conversation_id: conversationId, status: 'SUCCESS', response, duration_seconds: 0.05, num_turns: seq, usage: USAGE(24886) } });
   currentTurn = null;
+
+  if (content.includes("TRIGGER-SELF-WAKE") || process.env.FIXTURE_AGY_SELF_WAKE_DELAY_MS) {
+    const delay = Number(process.env.FIXTURE_AGY_SELF_WAKE_DELAY_MS || 50);
+    const wakeSeq = ++turnSeq;
+    const wakeResponse = content.includes("EMPTY-REPLY") ? "" : "self-wake reply text";
+    setTimeout(() => {
+      step(0, "ACTIVE", "agent_response", { text_delta: "self-wake working" });
+      const resultDelay = Number(process.env.FIXTURE_AGY_SELF_WAKE_RESULT_DELAY_MS || 100);
+      setTimeout(() => {
+        emit({
+          event: "result",
+          result: {
+            conversation_id: conversationId,
+            status: "SUCCESS",
+            response: wakeResponse,
+            duration_seconds: 0.05,
+            num_turns: wakeSeq,
+            usage: USAGE(100),
+          },
+        });
+      }, resultDelay);
+    }, delay);
+  }
 }
 
 const initDelay = Number(process.env.FIXTURE_AGY_INIT_DELAY_MS || 10);
