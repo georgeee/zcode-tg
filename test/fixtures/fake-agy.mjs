@@ -35,7 +35,7 @@
 //   FIXTURE_AGY_CLOSE_STDIN    set: destroy the stdin READ end and stay
 //                              alive -- the parent's next write hits EPIPE
 //                              against a live child (client write-guard tests)
-import { appendFileSync, readFileSync, writeFileSync, mkdirSync, closeSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync, closeSync, existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 
 const STUBBORN = !!process.env.FIXTURE_AGY_STUBBORN;
@@ -71,6 +71,20 @@ if (process.env.FIXTURE_AGY_MARKER) {
 }
 if (process.env.FIXTURE_AGY_MARKER_LOG) {
   appendFileSync(process.env.FIXTURE_AGY_MARKER_LOG, JSON.stringify({ pid: process.pid, at: Date.now(), argv, home: process.env.HOME, cwd: process.cwd() }) + '\n');
+}
+
+if (process.env.FIXTURE_AGY_EXIT_BEFORE_INIT) {
+  const marker = process.env.FIXTURE_AGY_EXIT_BEFORE_INIT_MARKER;
+  if (process.env.FIXTURE_AGY_EXIT_BEFORE_INIT === "always") {
+    process.exit(1);
+  } else if (marker) {
+    if (!existsSync(marker)) {
+      writeFileSync(marker, "exited");
+      process.exit(1);
+    }
+  } else {
+    process.exit(1);
+  }
 }
 
 // The model-selection rule, reproduced from the real CLI (battery (d)):
@@ -120,7 +134,45 @@ async function runTurn(content) {
   }
   step(index, 'DONE', 'agent_response', { duration_seconds: 0.02, usage: USAGE() });
   let response = `FAKE-REPLY: ${content}`;
+  if (content === 'AGY-503-EMPTY' || content.includes('AGY-503-EMPTY')) {
+    process.stderr.write('AGY_ERROR: {"short_error":"API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.","status":"UNAVAILABLE","error_code":503,"code_kind":"http","retryable":true,"error_id":"fake"}\n');
+    await new Promise((r) => setTimeout(r, 30));
+    emit({ event: 'result', result: { conversation_id: conversationId, status: 'SUCCESS', response: '', duration_seconds: 0.05, num_turns: seq, usage: USAGE(0) } });
+    currentTurn = null;
+    return;
+  }
+  if (content.includes('AGY-503-ONCE')) {
+    const attempts = turns.filter((t) => t.includes('AGY-503-ONCE')).length;
+    if (attempts === 1) {
+      process.stderr.write('AGY_ERROR: {"short_error":"API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.","status":"UNAVAILABLE","error_code":503,"code_kind":"http","retryable":true,"error_id":"fake"}\n');
+      await new Promise((r) => setTimeout(r, 30));
+      emit({ event: 'result', result: { conversation_id: conversationId, status: 'SUCCESS', response: '', duration_seconds: 0.05, num_turns: seq, usage: USAGE(0) } });
+      currentTurn = null;
+      return;
+    }
+    response = 'recovered after 503';
+  }
+  if (content.includes('AGY-503-ALWAYS')) {
+    process.stderr.write('AGY_ERROR: {"short_error":"API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.","status":"UNAVAILABLE","error_code":503,"code_kind":"http","retryable":true,"error_id":"fake"}\n');
+    await new Promise((r) => setTimeout(r, 30));
+    emit({ event: 'result', result: { conversation_id: conversationId, status: 'SUCCESS', response: '', duration_seconds: 0.05, num_turns: seq, usage: USAGE(0) } });
+    currentTurn = null;
+    return;
+  }
+  if (content.includes('AGY-503-WITH-TOOL')) {
+    step(index, 'ACTIVE', 'tool', { tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'id -un' } } });
+    step(index++, 'DONE', 'tool', { tool_name: 'run_command', duration_seconds: 0.01, tool_info: { name: 'run_command', parameters: { CommandLine: 'id -un' }, output: 'fake-executor-uid\r\n' } });
+    process.stderr.write('AGY_ERROR: {"short_error":"API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.","status":"UNAVAILABLE","error_code":503,"code_kind":"http","retryable":true,"error_id":"fake"}\n');
+    await new Promise((r) => setTimeout(r, 30));
+    emit({ event: 'result', result: { conversation_id: conversationId, status: 'SUCCESS', response: '', duration_seconds: 0.05, num_turns: seq, usage: USAGE(0) } });
+    currentTurn = null;
+    return;
+  }
+  if (content === 'AGY-CRASH-MID-TURN') {
+    process.exit(1);
+  }
   if (content === 'AGY-QUOTA') {
+
     process.stderr.write('AGY_ERROR: {"short_error":"quota exceeded for gemini-3.8-flash","status":"RESOURCE_EXHAUSTED","error_code":429,"code_kind":"http","retryable":true,"error_id":"fake"}\n');
     emit({ event: 'result', result: { conversation_id: conversationId, status: 'ERROR', response: '', error: 'quota exceeded for gemini-3.8-flash', duration_seconds: 0.1, num_turns: 1, usage: USAGE(0) } });
     currentTurn = null;
