@@ -1291,11 +1291,21 @@ async function finalizeTurn(sessionId, terminalParams) {
       } else {
         const footer = terminalParams.status === 'success' ? usageFooter(turn, terminalParams) : '';
         const replyText = text.trim() ? text : '(no reply text)';
-        const isError = terminalParams.status !== 'success' || text.startsWith('⚠️ Turn failed:');
-        if (isError && topic) {
-          const at = new Date().toISOString();
-          topic.lastError = { at, message: replyText };
-          store.setTopic(topic.threadId, { ...topic, lastError: topic.lastError });
+        const isError = terminalParams.status !== 'success';
+        if (topic) {
+          if (isError) {
+            const at = new Date().toISOString();
+            topic.lastError = { at, message: replyText };
+            store.setTopic(topic.threadId, { ...topic, lastError: topic.lastError });
+          } else if (topic.lastError) {
+            delete topic.lastError;
+            const updated = { ...topic };
+            delete updated.lastError;
+            if (store.getTopic(topic.threadId)?.lastError) {
+              delete store.getTopic(topic.threadId).lastError;
+            }
+            store.setTopic(topic.threadId, updated);
+          }
         }
         if (mcp && topic) {
           mcp.noteReply(topic.threadId, replyText, {
@@ -1467,6 +1477,9 @@ setInterval(async () => {
       const topic = sessionToTopic.get(sessionId);
       await interruptTurn(sessionId, { killEverything: false }).catch(() => {});
       if (topic) {
+        if (turn?.waiterId) {
+          failOneWaiter(topic.threadId, turn.waiterId, `interrupted by circuit breaker after ${mins}m blocked on TaskOutput`);
+        }
         // Bookkeeping mirrors /stop: clear busy, label the live message,
         // drain the queue.
         busySessions.delete(sessionId);
@@ -1495,9 +1508,12 @@ setInterval(async () => {
     backendForSession(sessionId)
       .cancel(sessionId)
       .catch((e) => console.error(`[bridge] cancel on watchdog timeout failed for ${sessionId} (state is cleared locally regardless):`, e.message));
+    const topic = sessionToTopic.get(sessionId);
+    if (turn?.waiterId && topic) {
+      failOneWaiter(topic.threadId, turn.waiterId, `stopped by watchdog timeout after exceeding ${cfg.turnTimeoutMs}ms`);
+    }
     activeTurns.delete(sessionId);
     busySessions.delete(sessionId);
-    const topic = sessionToTopic.get(sessionId);
     tg
       .editMessageText({
         // Fixed: was chatOf(threadId), a bare undefined module-global -- see
@@ -2648,6 +2664,9 @@ async function handleMessage(message) {
     store.setQueue(threadId, []);
     refreshTopicStatusForQueue(threadId);
     for (const it of q) {
+      if (it.waiterId) {
+        failOneWaiter(threadId, it.waiterId, 'dropped by /clearqueue');
+      }
       await tg.editMessageText({ chatId: chatOf(threadId), messageId: it.placeholderMessageId, text: '🗑 Dropped from queue.' }).catch(() => {});
     }
     await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: q.length ? `🗑 Dropped ${q.length} queued message(s).` : 'Queue was already empty.' });
@@ -2735,6 +2754,13 @@ function stranded(key, reason) {
   if (n) console.error(`[bridge] told ${n} parked MCP caller(s) on ${key}: ${reason}`);
 }
 
+function failOneWaiter(key, waiterId, reason) {
+  if (!waiterId) return 0;
+  const n = mcp?.failWaiter(key, waiterId, reason) ?? 0;
+  if (n) console.error(`[bridge] told parked MCP caller (${waiterId}) on ${key}: ${reason}`);
+  return n;
+}
+
 async function enqueuePrompt(threadId, promptText, noticeText, waiterId = null) {
   const queue = store.getQueue(threadId);
   if (queue.length >= cfg.maxQueuePerTopic) {
@@ -2748,7 +2774,8 @@ async function enqueuePrompt(threadId, promptText, noticeText, waiterId = null) 
     return why;
   }
   const last = queue[queue.length - 1];
-  if (last && Date.now() - (last.at ?? 0) < cfg.inputMergeMs) {
+  const neitherHasWaiter = !waiterId && !last?.waiterId;
+  if (last && neitherHasWaiter && Date.now() - (last.at ?? 0) < cfg.inputMergeMs) {
     last.text += `\n\n${promptText}`;
     last.at = Date.now();
     store.setQueue(threadId, queue);
@@ -2833,6 +2860,9 @@ async function dispatchUserPrompt(threadId, promptText, command, { waiterId = nu
       // user-initiated stop means stop EVERYTHING.
       await interruptTurn(sessionId, { killEverything: true });
       const turn = activeTurns.get(sessionId);
+      if (turn?.waiterId) {
+        failOneWaiter(threadId, turn.waiterId, 'stopped by /stop');
+      }
       busySessions.delete(sessionId);
       activeTurns.delete(sessionId);
       turn?.streamer?.stop();
@@ -2966,6 +2996,7 @@ async function startTurn(threadId, session, text, placeholderMessageId, waiterId
           textBuffer: '',
           startedAt: Date.now(),
           toolNames: new Map(),
+          waiterId,
         };
         attachTurnView(freshTurn, { placeholderMessageId, threadId });
         activeTurns.set(freshSessionId, freshTurn);

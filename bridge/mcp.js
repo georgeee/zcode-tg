@@ -165,6 +165,18 @@ export function createMcpGateway({
     return list.length;
   }
 
+  function failWaiter(key, waiterId, reason) {
+    if (waiterId == null) return 0;
+    const list = waiters.get(key);
+    if (!list || !list.length) return 0;
+    const idx = list.findIndex((w) => w.waiterId === waiterId);
+    if (idx < 0) return 0;
+    const [w] = list.splice(idx, 1);
+    if (list.length === 0) waiters.delete(key);
+    w.reject(new Error(reason));
+    return 1;
+  }
+
   function repliesSince(key, afterSeq = 0) {
     return (replyLog.get(key) ?? []).filter((r) => r.seq > afterSeq);
   }
@@ -586,6 +598,7 @@ export function createMcpGateway({
     waitReply,
     failWaiters,
     failWaitersFor,
+    failWaiter,
     repliesSince,
     wire,
     address: () => server.address(),

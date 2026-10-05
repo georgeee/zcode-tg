@@ -236,6 +236,14 @@ export class AntigravityBackend extends Backend {
     this._disarmReaper();
     const jobs = [];
     for (const session of [...this._sessions.values()]) {
+      if (session.retryTimer) {
+        clearTimeout(session.retryTimer);
+        session.retryTimer = null;
+      }
+      if (session.turn?.retryTimer) {
+        clearTimeout(session.turn.retryTimer);
+        session.turn.retryTimer = null;
+      }
       session.watcher?.stop();
       if (this._isLive(session)) jobs.push(this._gcClose(session, null));
       else if (session.closePromise) jobs.push(session.closePromise);
@@ -269,6 +277,14 @@ export class AntigravityBackend extends Backend {
   // 'creator-gone' -- or null for shutdown, which is not a reap and logs
   // nothing (every redeploy would otherwise).
   _gcClose(session, reason) {
+    if (session.retryTimer) {
+      clearTimeout(session.retryTimer);
+      session.retryTimer = null;
+    }
+    if (session.turn?.retryTimer) {
+      clearTimeout(session.turn.retryTimer);
+      session.turn.retryTimer = null;
+    }
     if (session.closing || !this._isLive(session)) return session.closePromise ?? Promise.resolve();
     session.closing = true;
     session.closeWhenIdle = null; // the close in progress supersedes any pending one
@@ -644,9 +660,19 @@ export class AntigravityBackend extends Backend {
   // turns.
   async cancel(sessionId) {
     const session = this._sessions.get(rawSessionId(sessionId));
-    if (session && session.turn) {
-      session.cancelPending = true;
-      session.client.kill('SIGTERM');
+    if (session) {
+      if (session.retryTimer) {
+        clearTimeout(session.retryTimer);
+        session.retryTimer = null;
+      }
+      if (session.turn?.retryTimer) {
+        clearTimeout(session.turn.retryTimer);
+        session.turn.retryTimer = null;
+      }
+      if (session.turn) {
+        session.cancelPending = true;
+        session.client?.kill('SIGTERM');
+      }
     }
   }
 
@@ -666,6 +692,14 @@ export class AntigravityBackend extends Backend {
     const rawId = rawSessionId(sessionId);
     const session = this._sessions.get(rawId);
     if (session) {
+      if (session.retryTimer) {
+        clearTimeout(session.retryTimer);
+        session.retryTimer = null;
+      }
+      if (session.turn?.retryTimer) {
+        clearTimeout(session.turn.retryTimer);
+        session.turn.retryTimer = null;
+      }
       if (session.turn) session.cancelPending = true;
       session.watcher?.stop();
       this._gcClose(session, null);
@@ -1035,7 +1069,8 @@ export class AntigravityBackend extends Backend {
         toolName: label,
         toolCallId: `${turn.id}:retry${attempt}`,
       });
-      setTimeout(async () => {
+      session.retryTimer = turn.retryTimer = setTimeout(async () => {
+        session.retryTimer = turn.retryTimer = null;
         if (session.cancelPending) return;
         try {
           turn.lastAgyError = null;
