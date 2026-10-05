@@ -146,6 +146,11 @@ export class Store {
     this._save();
   }
 
+  deleteTopic(threadId) {
+    delete this.data.topics[threadId];
+    this._save();
+  }
+
   getTopics() {
     return this.data.topics || {};
   }
