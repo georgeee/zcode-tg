@@ -178,7 +178,7 @@ async function runTurn(content) {
     currentTurn = null;
     return;
   }
-  if (content === 'AGY-SLOW') {
+  if (content === 'AGY-SLOW' || content.startsWith('AGY-SLOW ')) {
     step(index++, 'ACTIVE', 'agent_response', { text_delta: 'working…' });
     await new Promise((r) => setTimeout(r, Number(process.env.FIXTURE_AGY_SLOW_MS || 60000)));
     response = 'done slowly';

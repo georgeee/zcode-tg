@@ -1297,14 +1297,13 @@ async function finalizeTurn(sessionId, terminalParams) {
             const at = new Date().toISOString();
             topic.lastError = { at, message: replyText };
             store.setTopic(topic.threadId, { ...topic, lastError: topic.lastError });
-          } else if (topic.lastError) {
+          } else if (store.getTopic(topic.threadId)?.lastError) {
+            // The stored topic is the source of truth: `topic` here is
+            // sessionToTopic's {threadId} handle, which a respawned session
+            // replaces, so it cannot tell whether an error is recorded.
             delete topic.lastError;
-            const updated = { ...topic };
-            delete updated.lastError;
-            if (store.getTopic(topic.threadId)?.lastError) {
-              delete store.getTopic(topic.threadId).lastError;
-            }
-            store.setTopic(topic.threadId, updated);
+            delete store.getTopic(topic.threadId).lastError;
+            store.setTopic(topic.threadId, {}); // persist the removal
           }
         }
         if (mcp && topic) {
