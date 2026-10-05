@@ -823,3 +823,105 @@ test('the integrity gate with AGY_CONFIG_VERIFIER: exit 0 still checks private c
   assert.match(terminal.params.errorCode, /quarantined as .*\.agents\.quarantined-\d+/);
   assert.ok(readdirSync(privateCwd).some((n) => /^\.agents\.quarantined-\d+$/.test(n)));
 });
+
+
+// --- Tests for H1, H3, b, c, d ---
+
+test("H1: turn ending SUCCESS with empty response after AGY_ERROR becomes failed with error text", async (t) => {
+  const dir = tmp("h1-503-empty");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { backend, events } = makeBackend(dir, { retryDelays: [20, 50] });
+  t.after(() => backend.stop());
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  const terminal = await runOneTurn(backend, events, sessionId, "AGY-503-EMPTY");
+  assert.equal(terminal.params.status, "failed");
+  assert.match(terminal.params.errorCode, /UNAVAILABLE/);
+});
+
+test("H3 / requirement b: usage_get counts failed turns and records non-quota lastError", async (t) => {
+  const dir = tmp("h3-usage-failed-turns");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { backend, events } = makeBackend(dir, { retryDelays: [20, 50] });
+  t.after(() => backend.stop());
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  assert.equal(backend.usageSnapshot().turns, 0);
+
+  // Turn fails due to 503 error
+  await runOneTurn(backend, events, sessionId, "AGY-503-ALWAYS");
+  const snap = backend.usageSnapshot();
+  assert.equal(snap.turns, 1, "failed turn must be counted in turns");
+  assert.ok(snap.lastError, "lastError must be recorded");
+  assert.equal(snap.lastError.status, "UNAVAILABLE");
+  assert.match(snap.lastError.error, /UNAVAILABLE/);
+  assert.equal(snap.lastQuotaError, null, "quota error is untouched for non-quota errors");
+});
+
+test("requirement c: session_create retries spawn once on exit before initializing", async (t) => {
+  const dir = tmp("spawn-retry-init");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "exit-marker");
+  process.env.FIXTURE_AGY_EXIT_BEFORE_INIT = "once";
+  process.env.FIXTURE_AGY_EXIT_BEFORE_INIT_MARKER = marker;
+  t.after(() => {
+    delete process.env.FIXTURE_AGY_EXIT_BEFORE_INIT;
+    delete process.env.FIXTURE_AGY_EXIT_BEFORE_INIT_MARKER;
+  });
+
+  const { backend } = makeBackend(dir, { initRetryBackoffMs: 50 });
+  t.after(() => backend.stop());
+  const res = await backend.createConversation({ workspaceDir: dir });
+  assert.ok(res.sessionId, "session created after retry");
+});
+
+test("requirement d: auto-retry on 5xx/UNAVAILABLE when zero tool activity, with progress label", async (t) => {
+  const dir = tmp("auto-retry-503");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { backend, events } = makeBackend(dir, { retryDelays: [20, 50] });
+  t.after(() => backend.stop());
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+
+  // AGY-503-ONCE fails on 1st attempt, succeeds on 2nd attempt
+  const terminal = await runOneTurn(backend, events, sessionId, "AGY-503-ONCE");
+  assert.equal(terminal.params.status, "success");
+  const sessionEvents = byMethod(events, "session/event");
+  const retryActivity = sessionEvents.find((e) => e.params.payload?.toolName?.includes("retry 1"));
+  assert.ok(retryActivity, "retry activity label must be emitted");
+
+  const resultEvt = sessionEvents.find((e) => e.params.payload?.response?.includes("recovered after 503"));
+  assert.ok(resultEvt, "recovered response delivered");
+});
+
+test("requirement d: never retry after tool activity", async (t) => {
+  const dir = tmp("no-retry-tool");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { backend, events } = makeBackend(dir, { retryDelays: [20, 50] });
+  t.after(() => backend.stop());
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+
+  // AGY-503-WITH-TOOL executes tool then fails with 503
+  const terminal = await runOneTurn(backend, events, sessionId, "AGY-503-WITH-TOOL");
+  assert.equal(terminal.params.status, "failed");
+  assert.match(terminal.params.errorCode, /UNAVAILABLE/);
+  const sessionEvents = byMethod(events, "session/event");
+  const retryActivity = sessionEvents.find((e) => e.params.payload?.toolName?.includes("retry"));
+  assert.equal(retryActivity, undefined, "must never retry when turn had tool activity");
+});
+
+test("requirement d: caps retries at 2 times (3 attempts total)", async (t) => {
+  const dir = tmp("retry-cap");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { backend, events } = makeBackend(dir, { retryDelays: [20, 50] });
+  t.after(() => backend.stop());
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+
+  // AGY-503-ALWAYS fails on every attempt
+  const terminal = await runOneTurn(backend, events, sessionId, "AGY-503-ALWAYS");
+  assert.equal(terminal.params.status, "failed");
+  const sessionEvents = byMethod(events, "session/event");
+  const retry1 = sessionEvents.find((e) => e.params.payload?.toolName?.includes("retry 1"));
+  const retry2 = sessionEvents.find((e) => e.params.payload?.toolName?.includes("retry 2"));
+  const retry3 = sessionEvents.find((e) => e.params.payload?.toolName?.includes("retry 3"));
+  assert.ok(retry1, "retry 1 emitted");
+  assert.ok(retry2, "retry 2 emitted");
+  assert.equal(retry3, undefined, "retry 3 must not be attempted (max 2 retries)");
+});

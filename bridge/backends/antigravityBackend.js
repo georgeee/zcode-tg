@@ -125,8 +125,14 @@ function declaresServersOrPlugins(text) {
   });
 }
 
+function is5xxOrUnavailable(status, errorText) {
+  if (status === "UNAVAILABLE" || (typeof status === "string" && /^5\d\d$/.test(status)) || (typeof status === "number" && status >= 500 && status < 600)) return true;
+  if (typeof errorText === "string" && /UNAVAILABLE|\b5\d{2}\b|service.*unavailable/i.test(errorText)) return true;
+  return false;
+}
+
 export class AntigravityBackend extends Backend {
-  constructor({ agyBin, agyHome, cwd, privateCwd = null, effort = 'medium', autoApprovePermissions = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null, configVerifier = null, configVerifierTimeoutMs = 10_000 }) {
+  constructor({ agyBin, agyHome, cwd, privateCwd = null, effort = 'medium', autoApprovePermissions = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null, configVerifier = null, configVerifierTimeoutMs = 10_000, retryDelays = [5000, 20000], initRetryBackoffMs = 1000 }) {
     super('antigravity');
     this.agyBin = agyBin;
     this.agyHome = agyHome;
@@ -190,7 +196,10 @@ export class AntigravityBackend extends Backend {
     // silently fall back to the bridge-default effort even though its topic
     // stored gemini-3.8-flash:high.
     this._sessions = new Map();
+    this._retryDelays = retryDelays;
+    this.initRetryBackoffMs = initRetryBackoffMs;
     this._usage = { since: Date.now(), turns: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+    this._lastError = null;
     this._lastQuotaError = null;
     this._reapTimer = null; // armed with the first child, disarmed in stop()
     // Children between spawn start and init (the conversation id, and the
@@ -374,10 +383,23 @@ export class AntigravityBackend extends Backend {
   async createConversation({ workspaceDir, model } = {}) {
     const parsed = parseAgyModelRef(model ?? AGY_MODEL_REF);
     if (!parsed) throw this._badModelRefError(model);
-    const session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort });
-    const init = await session.initPromise;
-    const effectiveModel = parsed.effort ? `${AGY_MODEL_REF}:${parsed.effort}` : AGY_MODEL_REF;
-    return { sessionId: makeSessionId('antigravity', init.conversation_id), model: effectiveModel };
+    let session;
+    try {
+      session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort });
+      const init = await session.initPromise;
+      const effectiveModel = parsed.effort ? `${AGY_MODEL_REF}:${parsed.effort}` : AGY_MODEL_REF;
+      return { sessionId: makeSessionId('antigravity', init.conversation_id), model: effectiveModel };
+    } catch (err) {
+      if (/before initializing/i.test(err?.message || '')) {
+        this.emit('warn', `agy exited before initializing; retrying spawn once: ${err.message}`);
+        await new Promise((r) => setTimeout(r, this.initRetryBackoffMs ?? 1000));
+        session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort });
+        const init = await session.initPromise;
+        const effectiveModel = parsed.effort ? `${AGY_MODEL_REF}:${parsed.effort}` : AGY_MODEL_REF;
+        return { sessionId: makeSessionId('antigravity', init.conversation_id), model: effectiveModel };
+      }
+      throw err;
+    }
   }
 
   // Resume = respawn with --conversation (agy persists conversations as
@@ -556,6 +578,7 @@ export class AntigravityBackend extends Backend {
       if (existing) this._gcClose(existing, null); // the bounded close escalation stops the session's child
       // The turn is refused, never delivered: started for correlation, then
       // the failed terminal -- index.js's event-driven path clears the turn.
+      this._usage.turns++;
       const turnId = `${rawId}:${existing ? ++existing.turnSeq : 0}`;
       this._emitTelemetry(makeSessionId('antigravity', rawId), turnId, 'turn.started');
       this._emitTelemetry(makeSessionId('antigravity', rawId), turnId, 'turn.terminal', { status: 'failed', errorCode: message });
@@ -580,7 +603,7 @@ export class AntigravityBackend extends Backend {
       // where its workspace is (antigravityClient.js, workspaceNote).
       const delivered = session.turnSeq === 0 ? workspaceNote(session.workspaceDir, session.client.cwd) + text : text;
       const turnId = `${rawSessionId(sessionId)}:${++session.turnSeq}`;
-      session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0 };
+      session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0, delivered, retryCount: 0, lastAgyError: null };
       session.turnStartedAt = Date.now();
       session.startingTurn = false;
       // The watcher's late-poll guard needs our recent stdin texts: a poll
@@ -596,6 +619,7 @@ export class AntigravityBackend extends Backend {
       try {
         await session.client.sendUserTurn(delivered);
       } catch (err) {
+        this._usage.turns++;
         session.turn = null;
         session.startingTurn = false;
         session.ownTurnTexts.delete(delivered);
@@ -795,7 +819,7 @@ export class AntigravityBackend extends Backend {
       client.on('event', (msg) => this._onEvent(session, msg));
       client.on('stderr', (text) => this.emit('stderr', text));
       client.on('parseError', (info) => this.emit('warn', `unparseable line from agy: ${info.error.message}: ${info.line.slice(0, 200)}`));
-      client.on('agyError', (err) => this._onAgyError(err));
+      client.on('agyError', (err) => this._onAgyError(err, session));
       client.start(conversationId);
     });
     return session;
@@ -835,6 +859,7 @@ export class AntigravityBackend extends Backend {
     // (SIGTERM cancel, stop()) produce a result envelope BEFORE exit; only
     // an exit with no terminal yet emits one here.
     if (session.turn && session.rawId) {
+      this._usage.turns++;
       const turnId = session.turn.id;
       session.turn = null;
       this._emitTelemetry(makeSessionId('antigravity', session.rawId), turnId, 'turn.terminal', {
@@ -849,8 +874,14 @@ export class AntigravityBackend extends Backend {
   // numeric remaining-quota surface exists headless (VERIFIED LIVE, battery
   // (e): quota state is server-side, /usage is TUI-only) -- this is the
   // "last quota error" half of the antigravity usage_get contract.
-  _onAgyError(err) {
-    if (err?.status === 'RESOURCE_EXHAUSTED' || /quota|resource.?exhaust/i.test(err?.short_error || '')) {
+  _onAgyError(err, session = null) {
+    const errorStr = err?.short_error || err?.message || String(err);
+    const status = err?.status ?? (err?.error_code ? String(err.error_code) : null);
+    this._lastError = { at: new Date().toISOString(), status, error: errorStr };
+    if (session?.turn) {
+      session.turn.lastAgyError = err;
+    }
+    if (err?.status === 'RESOURCE_EXHAUSTED' || /quota|resource.?exhaust/i.test(errorStr)) {
       this._lastQuotaError = { at: new Date().toISOString(), status: err.status ?? null, error: err.short_error };
       this.emit('warn', `agy quota error: ${err.short_error}`);
     }
@@ -926,7 +957,7 @@ export class AntigravityBackend extends Backend {
 
   _autoAdoptTurn(session, sessionId) {
     const turnId = `${session.rawId}:${++session.turnSeq}`;
-    session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0, adopted: true };
+    session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0, adopted: true, delivered: '', retryCount: 0, lastAgyError: null };
     session.turnStartedAt = Date.now();
     this._emitTelemetry(sessionId, turnId, 'turn.started');
     return session.turn;
@@ -977,20 +1008,51 @@ export class AntigravityBackend extends Backend {
       this._autoAdoptTurn(session, sessionId);
     }
     const turn = session.turn;
-    // THE CANCEL IS THE VERDICT: a SIGTERM was already requested for this
-    // turn, so an envelope that races in after the signal -- a SUCCESS that
-    // was already in the pipe when the cancel landed -- does not un-cancel
-    // it. The turn ends failed/interrupted exactly as the deliberate
-    // interrupt envelope would; usage is still accounted (the spend
-    // happened either way).
     const cancelled = turn != null && session.cancelPending === true;
+
+    // Per-turn error tap (H1): turn ending SUCCESS with empty response after AGY_ERROR
+    const h1Error = turn != null && !cancelled && result.status === 'SUCCESS' && (!result.response || !result.response.trim()) && turn.lastAgyError != null;
+    const errorStatus = h1Error ? (turn.lastAgyError.status ?? (turn.lastAgyError.error_code ? String(turn.lastAgyError.error_code) : 'UNAVAILABLE')) : (result.status !== 'SUCCESS' ? (result.status ?? 'ERROR') : null);
+    const errorMsg = h1Error ? (turn.lastAgyError.short_error || turn.lastAgyError.message || 'agy error') : (result.status !== 'SUCCESS' ? (result.error || result.status || 'agy error') : null);
+
+    if (errorStatus || errorMsg) {
+      this._lastError = { at: new Date().toISOString(), status: errorStatus, error: errorMsg };
+      if (/quota|resource.?exhaust/i.test(errorMsg)) {
+        this._lastQuotaError = { at: new Date().toISOString(), status: errorStatus, error: errorMsg };
+      }
+    }
+
+    // Auto-retry (requirement d): 5xx/UNAVAILABLE with zero tool activity, at most 2 times
+    const is5xx = is5xxOrUnavailable(errorStatus, errorMsg);
+    if (!cancelled && (h1Error || result.status !== 'SUCCESS') && is5xx && turn && turn.toolCallCount === 0 && (turn.retryCount || 0) < 2 && !session.cancelPending) {
+      turn.retryCount = (turn.retryCount || 0) + 1;
+      const attempt = turn.retryCount;
+      const delayMs = this._retryDelays[attempt - 1] ?? 20000;
+      const label = `🔄 retry ${attempt} (UNAVAILABLE)`;
+      console.log(`[antigravity] turn failed with 5xx/UNAVAILABLE on session ${sessionId}; retrying (attempt ${attempt}/2) in ${delayMs}ms...`);
+      this._emitSession(sessionId, turn.id, {
+        kind: 'started',
+        toolName: label,
+        toolCallId: `${turn.id}:retry${attempt}`,
+      });
+      setTimeout(async () => {
+        if (session.cancelPending) return;
+        try {
+          turn.lastAgyError = null;
+          let s = session;
+          if (!this._isLive(s)) {
+            s = await this._runningSession(sessionId);
+          }
+          await s.client.sendUserTurn(turn.delivered);
+        } catch (e) {
+          console.error(`[antigravity] retry send failed on session ${sessionId}:`, e.message);
+        }
+      }, delayMs);
+      return;
+    }
+
     session.turn = null;
-    // C1: the idle clock runs from the END of the last turn -- the result
-    // event -- not from the turn's start.
     session.idleSince = Date.now();
-    // VERIFIED LIVE (battery (a)): the final envelope carries the turn-total
-    // usage block: {input_tokens, output_tokens, thinking_tokens,
-    // cache_read_tokens, total_tokens}.
     const usage = {
       inputTokens: result.usage?.input_tokens ?? null,
       outputTokens: result.usage?.output_tokens ?? null,
@@ -1000,20 +1062,14 @@ export class AntigravityBackend extends Backend {
     this._usage.inputTokens += usage.inputTokens ?? 0;
     this._usage.outputTokens += usage.outputTokens ?? 0;
     this._usage.totalTokens += usage.totalTokens ?? 0;
-    // Quota exhaustion surfaces as an ERROR envelope (design doc §4); stash
-    // for usage_get the same way the stderr tap does.
-    if (result.status !== 'SUCCESS' && result.error && /quota|resource.?exhaust/i.test(result.error)) {
-      this._lastQuotaError = { at: new Date().toISOString(), status: result.status, error: result.error };
-    }
-    if (!turn) return; // terminal already emitted via _onChildExit; nothing to double-emit
-    const success = cancelled ? 'failed' : statusOf(result);
-    // The turn's final answer: {response, usage} together is the shared
-    // vocabulary's "authoritative full-turn text + cumulative usage" shape
-    // (backend.js; index.js reads exactly this pair).
+
+    if (!turn) return;
+
+    const success = cancelled || h1Error ? 'failed' : statusOf(result);
     if (success === 'success') {
       this._emitSession(sessionId, turn.id, { kind: 'result', response: result.response ?? '', usage });
     } else {
-      this._emitSession(sessionId, turn.id, { kind: 'result', error: { message: cancelled ? 'interrupted' : (result.error || result.status || 'agy error') } });
+      this._emitSession(sessionId, turn.id, { kind: 'result', error: { message: cancelled ? 'interrupted' : (errorMsg || 'agy error') } });
     }
     this._emitTelemetry(sessionId, turn.id, 'usage.delta', {
       requestId: turn.id,
@@ -1022,15 +1078,11 @@ export class AntigravityBackend extends Backend {
     });
     this._emitTelemetry(sessionId, turn.id, 'turn.terminal', {
       status: success,
-      errorCode: success === 'success' ? undefined : cancelled ? 'ERROR: interrupted' : [result.status, result.error].filter(Boolean).join(': '),
+      errorCode: success === 'success' ? undefined : cancelled ? 'ERROR: interrupted' : h1Error ? `ERROR: ${errorMsg}` : [result.status, result.error].filter(Boolean).join(': '),
       durationMs: Number.isFinite(result.duration_seconds) ? Math.round(result.duration_seconds * 1000) : undefined,
       tokenCount: usage.totalTokens ?? undefined,
       toolCallCount: turn.toolCallCount,
     });
-    // C2: a creator-gone close parked on this BUSY session fires here, the
-    // moment the turn ends. Synchronous on purpose: no turn can start in
-    // between (a queued message_send resolves only after this unwind), so
-    // the close cannot land on a turn that is already the next caller's.
     if (session.closeWhenIdle && this._isLive(session)) this._gcClose(session, session.closeWhenIdle);
   }
 
@@ -1042,7 +1094,7 @@ export class AntigravityBackend extends Backend {
   // percentages=null rather than an invented figure, and the description of
   // the usage_get tool says so.
   usageSnapshot() {
-    return { ...this._usage, lastQuotaError: this._lastQuotaError };
+    return { ...this._usage, lastQuotaError: this._lastQuotaError, lastError: this._lastError };
   }
 
   _emitSession(sessionId, turnId, payload) {
