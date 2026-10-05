@@ -5,6 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createMcpGateway, repliesForTopic } from '../bridge/mcp.js';
+import { progressForTopic } from '../bridge/progress.js';
 
 async function startGateway(t, impl) {
   const gw = createMcpGateway({ port: 0, log: () => {} });
@@ -15,8 +16,8 @@ async function startGateway(t, impl) {
   return {
     url,
     close: () => gw.close(),
-    noteReply: (k, text) => gw.noteReply(k, text),
-    waitReply: (k) => gw.waitReply(k),
+    noteReply: (k, text, meta) => gw.noteReply(k, text, meta),
+    waitReply: (k, id) => gw.waitReply(k, id),
     failAll: (why) => gw.failWaiters(why),
     failOne: (key, why) => gw.failWaitersFor(key, why),
     replies: (k) => gw.repliesSince(k),
@@ -481,4 +482,71 @@ test('over the gateway: replies_get wired the way index.js wires it refuses unkn
   const quiet = await rpc(h.url, { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'replies_get', arguments: { key: 'k-live', after_seq: 999 } } });
   assert.equal(quiet.body.result.isError, false, 'a live key past the end is a true empty, not an error');
   assert.deepEqual(JSON.parse(quiet.body.result.content[0].text), { replies: [] });
+});
+
+
+// --- Tests for H2, a, e ---
+
+test("requirement a: message_send and replies_get return error: true on turn failure", async (t) => {
+  const h = await startGateway(t, {
+    messageSend: async (key, text, wait) => {
+      const reply = await h.waitReply(key);
+      return { reply: reply.text, at: reply.at, ...(reply.error ? { error: true } : {}) };
+    },
+    repliesGet: (key, afterSeq) => ({
+      replies: h.replies(key).filter((r) => r.seq > afterSeq),
+    }),
+  });
+  t.after(() => h.close());
+
+  const callPromise = rpc(h.url, {
+    jsonrpc: "2.0", id: 10, method: "tools/call",
+    params: { name: "message_send", arguments: { key: "-100:1", text: "prompt" } },
+  });
+
+  await new Promise((r) => setTimeout(r, 30));
+  h.noteReply("-100:1", "⚠️ Turn failed: 503 UNAVAILABLE", { error: true });
+
+  const r = await callPromise;
+  assert.equal(r.status, 200);
+  assert.equal(r.body.result.isError, false);
+  const payload = JSON.parse(r.body.result.content[0].text);
+  assert.match(payload.reply, /⚠️ Turn failed:/);
+  assert.equal(payload.error, true, "message_send must include error: true on failed turn");
+
+  const rGet = await rpc(h.url, {
+    jsonrpc: "2.0", id: 11, method: "tools/call",
+    params: { name: "replies_get", arguments: { key: "-100:1" } },
+  });
+  const getPayload = JSON.parse(rGet.body.result.content[0].text);
+  assert.equal(getPayload.replies.length, 1);
+  assert.equal(getPayload.replies[0].error, true, "replies_get must include error: true");
+});
+
+test("H2 / requirement e: message_send reply attribution matches the message sent, not a prior turn", async (t) => {
+  const h = await startGateway(t, {});
+  t.after(() => h.close());
+
+  const waiter1 = h.waitReply("-100:1", "turn-1");
+  const waiter2 = h.waitReply("-100:1", "turn-2");
+
+  h.noteReply("-100:1", "reply for turn 1", { waiterId: "turn-1" });
+
+  const res1 = await waiter1;
+  assert.equal(res1.text, "reply for turn 1");
+
+  let waiter2Resolved = false;
+  waiter2.then(() => { waiter2Resolved = true; });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(waiter2Resolved, false, "waiter 2 must NOT resolve with turn 1 reply");
+
+  h.noteReply("-100:1", "reply for turn 2", { waiterId: "turn-2" });
+  const res2 = await waiter2;
+  assert.equal(res2.text, "reply for turn 2");
+});
+
+test("requirement a: progress_get includes lastError when turn failed", () => {
+  const topics = new Map([["k-fail", { sessionId: "s1", lastError: { at: "2026-10-05T20:00:00Z", message: "⚠️ Turn failed: 503 UNAVAILABLE" } }]]);
+  const out = progressForTopic({ getTopic: (k) => topics.get(k), activeTurns: new Map(), key: "k-fail" });
+  assert.deepEqual(out.lastError, { at: "2026-10-05T20:00:00Z", message: "⚠️ Turn failed: 503 UNAVAILABLE" });
 });

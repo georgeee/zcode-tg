@@ -85,12 +85,27 @@ export function createMcpGateway({
     while (log.length > REPLY_LOG_LIMIT) log.shift();
     replyLog.set(key, log);
     if (!meta || (meta.role !== 'user' && !meta.adopted)) {
-      for (const w of waiters.get(key) ?? []) w.resolve(entry);
-      waiters.delete(key);
+      const list = waiters.get(key);
+      if (list && list.length) {
+        if (meta?.waiterId != null) {
+          const idx = list.findIndex((w) => w.waiterId === meta.waiterId);
+          if (idx >= 0) {
+            const [w] = list.splice(idx, 1);
+            w.resolve(entry);
+          }
+        } else {
+          const untargeted = list.filter((w) => !w.waiterId);
+          if (untargeted.length) {
+            waiters.set(key, list.filter((w) => w.waiterId));
+            for (const w of untargeted) w.resolve(entry);
+          }
+        }
+        if (waiters.get(key)?.length === 0) waiters.delete(key);
+      }
     }
   }
 
-  function waitReply(key) {
+  function waitReply(key, waiterId = null) {
     return new Promise((resolve, reject) => {
       const list = waiters.get(key) ?? [];
       const timer = setTimeout(() => {
@@ -99,6 +114,7 @@ export function createMcpGateway({
         reject(new Error(`no reply within ${waitTimeoutMs / 1000}s -- the turn may still be running; use replies_get`));
       }, waitTimeoutMs);
       const entry = {
+        waiterId,
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
         timer,

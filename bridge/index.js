@@ -52,7 +52,7 @@
 // phase). Run this as a long-lived process (see README.md for the systemd
 // unit); it does not daemonize itself.
 
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes, createHash, randomUUID } from 'node:crypto';
 import { createMcpGateway, raceReply, repliesForTopic } from './mcp.js';
 import { pickForumChat } from './chatpick.js';
 import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises';
@@ -1207,14 +1207,8 @@ function onBackendEvent(msg) {
       return;
     }
     if (kind === 'turn.terminal') {
-      // Straggler guard: a terminal for a turn that never saw ITS turnId
-      // started (turn.turnId unset), when that turn began after a recent
-      // interrupt of the same session, is the INTERRUPTED turn's death
-      // rattle -- finalizing on it would kill the brand-new turn (seen
-      // live: the post-breaker follow-up reply never arrived).
-      const interruptedAt = lastInterruptedAt.get(sessionId) ?? 0;
-      if (turn && !turn.turnId && turn.startedAt > interruptedAt && Date.now() - interruptedAt < 30_000) {
-        console.log(`[bridge] ignoring terminal straggler from the interrupted turn on session ${sessionId}`);
+      if (turn && !turn.turnId) {
+        console.log(`[bridge] ignoring terminal straggler on session ${sessionId} (turnId unset)`);
         return;
       }
       void finalizeTurn(sessionId, msg.params);
@@ -1297,7 +1291,19 @@ async function finalizeTurn(sessionId, terminalParams) {
       } else {
         const footer = terminalParams.status === 'success' ? usageFooter(turn, terminalParams) : '';
         const replyText = text.trim() ? text : '(no reply text)';
-        if (mcp && topic) mcp.noteReply(topic.threadId, replyText, { adopted: turn?.adopted });
+        const isError = terminalParams.status !== 'success' || text.startsWith('⚠️ Turn failed:');
+        if (isError && topic) {
+          const at = new Date().toISOString();
+          topic.lastError = { at, message: replyText };
+          store.setTopic(topic.threadId, { ...topic, lastError: topic.lastError });
+        }
+        if (mcp && topic) {
+          mcp.noteReply(topic.threadId, replyText, {
+            adopted: turn?.adopted,
+            waiterId: turn?.waiterId,
+            ...(isError ? { error: true } : {}),
+          });
+        }
         await deliverReply(replaceId, topic?.threadId, replyText, footer);
       }
     }
@@ -1735,6 +1741,7 @@ function antigravityUsageGetForMcp() {
     ],
     cachedAt: new Date().toISOString(),
   };
+  if (u.lastError) snap.lastError = u.lastError;
   if (u.lastQuotaError) snap.quotaError = u.lastQuotaError;
   // C6: the live-process picture (children hold 93-181 MB each; the cap and
   // the reaper manage it -- this says what they are managing right now).
@@ -2728,7 +2735,7 @@ function stranded(key, reason) {
   if (n) console.error(`[bridge] told ${n} parked MCP caller(s) on ${key}: ${reason}`);
 }
 
-async function enqueuePrompt(threadId, promptText, noticeText) {
+async function enqueuePrompt(threadId, promptText, noticeText, waiterId = null) {
   const queue = store.getQueue(threadId);
   if (queue.length >= cfg.maxQueuePerTopic) {
     await tg.sendMessage({
@@ -2749,7 +2756,7 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
     return null;
   }
   const notice = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: noticeText });
-  store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id, at: Date.now() }]);
+  store.setQueue(threadId, [...queue, { text: promptText, placeholderMessageId: notice.message_id, at: Date.now(), waiterId }]);
   refreshTopicStatusForQueue(threadId);
   return null;
 }
@@ -2766,7 +2773,7 @@ async function enqueuePrompt(threadId, promptText, noticeText) {
 // message_send can fail its caller instead of acking a prompt it dropped.
 // Callers that don't care (handleMessage, the merge window, and drainQueue
 // via startTurn) ignore the value.
-async function dispatchUserPrompt(threadId, promptText, command) {
+async function dispatchUserPrompt(threadId, promptText, command, { waiterId = null } = {}) {
   // A closed topic is final (MCP session_close or /close): refuse BEFORE
   // getOrCreateSession, whose resume path would otherwise spawn a fresh
   // child for the released session and put it straight back into the
@@ -2796,7 +2803,7 @@ async function dispatchUserPrompt(threadId, promptText, command) {
       stranded(threadId, why);
       return why;
     }
-    return enqueuePrompt(threadId, promptText, `📥 Queued (position ${queue.length + 1}) — the bridge is deploying an update and will run this once it's back (usually a few seconds).`);
+    return enqueuePrompt(threadId, promptText, `📥 Queued (position ${queue.length + 1}) — the bridge is deploying an update and will run this once it's back (usually a few seconds).`, waiterId);
   }
 
   let session;
@@ -2847,7 +2854,7 @@ async function dispatchUserPrompt(threadId, promptText, command) {
     // the message the user already saw accepted. Rapid consecutive parts
     // merge into the newest entry (Telegram split-message defense). The
     // reason-or-null contract carries a full-queue drop back to the caller.
-    return enqueuePrompt(threadId, promptText, `📥 Queued (position ${store.getQueue(threadId).length + 1}) — runs when the current message finishes. /clearqueue to drop.`);
+    return enqueuePrompt(threadId, promptText, `📥 Queued (position ${store.getQueue(threadId).length + 1}) — runs when the current message finishes. /clearqueue to drop.`, waiterId);
   }
 
   if (command === 'stop' || command === 'cancel') {
@@ -2856,7 +2863,7 @@ async function dispatchUserPrompt(threadId, promptText, command) {
   }
 
   const placeholder = await tg.sendMessage({ chatId: chatOf(threadId), messageThreadId: threadOf(threadId), text: '⌛ …' });
-  return startTurn(threadId, session, promptText, placeholder.message_id);
+  return startTurn(threadId, session, promptText, placeholder.message_id, waiterId);
 }
 
 // Attaches the turn's progress view, per cfg.streamProgress: the milestone
@@ -2901,7 +2908,7 @@ function turnLiveMessageId(turn) {
 // Same reason-or-null contract as dispatchUserPrompt: null once session/send
 // has accepted the prompt (the turn owns delivery from here), the reason
 // when the prompt was never handed to the model.
-async function startTurn(threadId, session, text, placeholderMessageId) {
+async function startTurn(threadId, session, text, placeholderMessageId, waiterId = null) {
   const sessionId = session.sessionId;
   busySessions.add(sessionId);
   const turn = {
@@ -2909,6 +2916,7 @@ async function startTurn(threadId, session, text, placeholderMessageId) {
     textBuffer: '',
     startedAt: Date.now(),
     toolNames: new Map(), // toolCallId -> toolName (result events don't repeat the name)
+    waiterId,
   };
   attachTurnView(turn, { placeholderMessageId, threadId });
   activeTurns.set(sessionId, turn);
@@ -3046,7 +3054,7 @@ async function drainQueue(threadId) {
   await tg
     .editMessageText({ chatId: chatOf(threadId), messageId: next.placeholderMessageId, text: '⌛ …' })
     .catch((e) => console.error('[bridge] failed to promote queued notice to placeholder:', e.message));
-  await startTurn(threadId, session, next.text, next.placeholderMessageId);
+  await startTurn(threadId, session, next.text, next.placeholderMessageId, next.waiterId);
 }
 
 async function handleCallbackQuery(cq) {
@@ -3178,7 +3186,13 @@ async function main() {
           throw new Error(`cannot create session: key "${key}" already has an existing record`);
         }
         store.setTopic(key, { chatId, threadId, name, backend, model, mode: cfg.defaultSessionMode });
-        await getOrCreateSession(key);
+        try {
+          await getOrCreateSession(key);
+        } catch (e) {
+          store.deleteTopic(key);
+          await tg.closeForumTopic({ chatId: chatOf(key), messageThreadId: Number(threadId) }).catch(() => {});
+          throw e;
+        }
         const entry = store.getTopic(key);
         // C2: record WHICH connection created this session, so its
         // disappearance closes the session (idle now, busy after its turn).
@@ -3230,7 +3244,8 @@ async function main() {
         // Register the waiter BEFORE dispatching: finalizeTurn's noteReply
         // fires the moment the turn lands, which can beat a waiter
         // registered only after dispatch resolves.
-        const pending = mcp.waitReply(key);
+        const waiterId = randomUUID();
+        const pending = mcp.waitReply(key, waiterId);
         try {
           // RACED, NOT SEQUENCED -- see raceReply. Awaiting the dispatch first
           // and the waiter second means a waiter FAILED by failWaiters (the
@@ -3238,8 +3253,8 @@ async function main() {
           // the dispatch has finished unwinding, which on that exact path
           // includes a Telegram round trip while the process is already
           // counting down to exit.
-          const reply = await raceReply(pending, dispatchUserPrompt(key, text));
-          return { reply: reply.text, at: reply.at };
+          const reply = await raceReply(pending, dispatchUserPrompt(key, text, null, { waiterId }));
+          return { reply: reply.text, at: reply.at, ...(reply.error ? { error: true } : {}) };
         } catch (e) {
           pending.catch(() => {}); // an abandoned waiter must not go unhandled
           throw e;

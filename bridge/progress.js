@@ -322,7 +322,7 @@ export function noteActivity(turn, label, { toolCallId, done = false, now = Date
 // as stuck depends on the model and the tool, so the payload carries the
 // raw evidence (activityCount, lastActivityAt, lastActivityAgeMs,
 // recentActivity) and the caller compares two polls.
-export function progressSnapshot({ key, turn, now = Date.now() }) {
+export function progressSnapshot({ key, turn, lastError, now = Date.now() }) {
   if (!turn) {
     return {
       key,
@@ -334,6 +334,7 @@ export function progressSnapshot({ key, turn, now = Date.now() }) {
       lastActivityAt: null,
       lastActivityAgeMs: null,
       recentActivity: [],
+      ...(lastError !== undefined ? { lastError } : {}),
     };
   }
   const a = turn.activity;
@@ -350,6 +351,7 @@ export function progressSnapshot({ key, turn, now = Date.now() }) {
     lastActivityAt: iso(lastAt),
     lastActivityAgeMs: lastAt != null ? Math.max(0, now - lastAt) : null,
     recentActivity: (a?.labels ?? []).map((x) => ({ at: iso(x.at), label: x.label })),
+    ...(lastError !== undefined ? { lastError } : {}),
   };
 }
 
@@ -364,5 +366,6 @@ export function progressForTopic({ getTopic, activeTurns, key, now = Date.now() 
   if (!topic) throw new Error(`unknown session: ${key}`);
   if (topic.closed) throw new Error(`session ${key} is closed`);
   const turn = topic.sessionId ? activeTurns.get(topic.sessionId) : undefined;
-  return progressSnapshot({ key, turn, now });
+  const lastError = topic.lastError ?? null;
+  return progressSnapshot({ key, turn, lastError, now });
 }
