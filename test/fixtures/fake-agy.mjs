@@ -132,6 +132,30 @@ async function runTurn(content) {
     step(index, 'ACTIVE', 'tool', { tool_name: 'run_command', tool_info: { name: 'run_command', parameters: { CommandLine: 'id -un' } } });
     step(index++, 'DONE', 'tool', { tool_name: 'run_command', duration_seconds: 0.01, tool_info: { name: 'run_command', parameters: { CommandLine: 'id -un' }, output: 'fake-executor-uid\r\n' } });
   }
+  if (content.includes('write_to_file')) {
+    const match = content.match(/write_to_file:([^\s]+)/);
+    const targetFile = match ? match[1] : (process.env.FIXTURE_AGY_WRITE_TARGET || 'created-file.txt');
+    const isFail = content.includes('FAIL_STEP');
+    step(index, 'ACTIVE', 'tool', { tool_name: 'write_to_file', tool_info: { name: 'write_to_file', parameters: { TargetFile: targetFile, CodeContent: 'file content' } } });
+    step(index++, 'DONE', 'tool', {
+      tool_name: 'write_to_file',
+      duration_seconds: 0.01,
+      ...(isFail ? { status: 'FAILED', error: 'simulated failure' } : {}),
+      tool_info: { name: 'write_to_file', parameters: { TargetFile: targetFile, CodeContent: 'file content' }, output: isFail ? 'failed' : 'Created file' },
+    });
+  }
+  if (content.includes('replace_file_content')) {
+    const match = content.match(/replace_file_content:([^\s]+)/);
+    const targetFile = match ? match[1] : (process.env.FIXTURE_AGY_WRITE_TARGET || 'edited-file.txt');
+    step(index, 'ACTIVE', 'tool', { tool_name: 'replace_file_content', tool_info: { name: 'replace_file_content', parameters: { TargetFile: targetFile, ReplacementContent: 'new content' } } });
+    step(index++, 'DONE', 'tool', { tool_name: 'replace_file_content', duration_seconds: 0.01, tool_info: { name: 'replace_file_content', parameters: { TargetFile: targetFile, ReplacementContent: 'new content' }, output: 'Replaced content' } });
+  }
+  if (content.includes('multi_replace_file_content')) {
+    const match = content.match(/multi_replace_file_content:([^\s]+)/);
+    const targetFile = match ? match[1] : (process.env.FIXTURE_AGY_WRITE_TARGET || 'multi-edited-file.txt');
+    step(index, 'ACTIVE', 'tool', { tool_name: 'multi_replace_file_content', tool_info: { name: 'multi_replace_file_content', parameters: { TargetFile: targetFile, ReplacementChunks: [] } } });
+    step(index++, 'DONE', 'tool', { tool_name: 'multi_replace_file_content', duration_seconds: 0.01, tool_info: { name: 'multi_replace_file_content', parameters: { TargetFile: targetFile, ReplacementChunks: [] }, output: 'Replaced chunks' } });
+  }
   step(index, 'DONE', 'agent_response', { duration_seconds: 0.02, usage: USAGE() });
   let response = `FAKE-REPLY: ${content}`;
   if (content === 'AGY-503-EMPTY' || content.includes('AGY-503-EMPTY')) {
@@ -222,7 +246,7 @@ setTimeout(() => {
     init: {
       model: BARE, // the init echoes the BARE slug when --effort is used (battery (d))
       cwd: process.cwd(),
-      tools: ['run_command', 'write_to_file', 'finish'],
+      tools: ['run_command', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'finish'],
       permission_mode: skipPermissions ? 'always-proceed' : 'request-review',
       remote_control: remoteControl,
     },

@@ -23,7 +23,7 @@
 // this class never re-emits 'exit' at backend level.
 
 import { createHash } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, renameSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { Backend, makeSessionId, rawSessionId } from '../backend.js';
@@ -132,7 +132,7 @@ function is5xxOrUnavailable(status, errorText) {
 }
 
 export class AntigravityBackend extends Backend {
-  constructor({ agyBin, agyHome, cwd, privateCwd = null, effort = 'medium', autoApprovePermissions = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null, configVerifier = null, configVerifierTimeoutMs = 10_000, retryDelays = [5000, 20000], initRetryBackoffMs = 1000 }) {
+  constructor({ agyBin, agyHome, cwd, privateCwd = null, effort = 'medium', autoApprovePermissions = true, initTimeoutMs = 90_000, watchStartCursor = null, idleCloseMs = 20 * 60_000, maxProcs = 4, closeEofGraceMs = 10_000, closeTermGraceMs = 5_000, bridgeMarker = null, sessionKeyOf = null, configVerifier = null, configVerifierTimeoutMs = 10_000, retryDelays = [5000, 20000], initRetryBackoffMs = 1000, healHookArgv = null }) {
     super('antigravity');
     this.agyBin = agyBin;
     this.agyHome = agyHome;
@@ -144,6 +144,11 @@ export class AntigravityBackend extends Backend {
     this.autoApprovePermissions = autoApprovePermissions;
     this.configVerifier = configVerifier;
     this.configVerifierTimeoutMs = configVerifierTimeoutMs;
+    this.healHookArgv = healHookArgv;
+    this._healHookArgv = this._parseHealHookArgv(healHookArgv !== null ? healHookArgv : process.env.AGY_HEAL_HOOK_ARGV);
+    this._activeHealPaths = new Set();
+    this._failedHealPaths = new Set();
+    this._activeHookProcs = new Set();
     // Owner decision (2026-09-27, reversing 2026-09-24): sessions NEVER
     // start with --remote-control. Each registered instance takes one of the
     // Google account's scarce dashboard slots (429 RESOURCE_EXHAUSTED once
@@ -234,6 +239,12 @@ export class AntigravityBackend extends Backend {
   // cannot hang a redeploy past its bound.
   async stop() {
     this._disarmReaper();
+    if (this._activeHookProcs) {
+      for (const proc of this._activeHookProcs) {
+        try { proc.kill('SIGTERM'); } catch {}
+      }
+      this._activeHookProcs.clear();
+    }
     const jobs = [];
     for (const session of [...this._sessions.values()]) {
       if (session.retryTimer) {
@@ -619,7 +630,7 @@ export class AntigravityBackend extends Backend {
       // where its workspace is (antigravityClient.js, workspaceNote).
       const delivered = session.turnSeq === 0 ? workspaceNote(session.workspaceDir, session.client.cwd) + text : text;
       const turnId = `${rawSessionId(sessionId)}:${++session.turnSeq}`;
-      session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0, delivered, retryCount: 0, lastAgyError: null };
+      session.turn = { id: turnId, toolCallIds: new Map(), toolParams: new Map(), toolCallCount: 0, delivered, retryCount: 0, lastAgyError: null };
       session.turnStartedAt = Date.now();
       session.startingTurn = false;
       // The watcher's late-poll guard needs our recent stdin texts: a poll
@@ -991,10 +1002,121 @@ export class AntigravityBackend extends Backend {
 
   _autoAdoptTurn(session, sessionId) {
     const turnId = `${session.rawId}:${++session.turnSeq}`;
-    session.turn = { id: turnId, toolCallIds: new Map(), toolCallCount: 0, adopted: true, delivered: '', retryCount: 0, lastAgyError: null };
+    session.turn = { id: turnId, toolCallIds: new Map(), toolParams: new Map(), toolCallCount: 0, adopted: true, delivered: '', retryCount: 0, lastAgyError: null };
     session.turnStartedAt = Date.now();
     this._emitTelemetry(sessionId, turnId, 'turn.started');
     return session.turn;
+  }
+
+
+  _parseHealHookArgv(raw) {
+    if (raw === undefined || raw === null) return null;
+    if (Array.isArray(raw)) {
+      if (raw.length > 0 && raw.every((x) => typeof x === 'string')) {
+        return raw;
+      }
+      console.warn('[antigravity] invalid AGY_HEAL_HOOK_ARGV: expected non-empty array of strings');
+      return null;
+    }
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim();
+      if (!trimmed) return null;
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          if (parsed.length === 0) return null;
+          if (parsed.every((x) => typeof x === 'string')) {
+            return parsed;
+          }
+        }
+        console.warn('[antigravity] invalid AGY_HEAL_HOOK_ARGV: expected JSON array of strings');
+        return null;
+      } catch (e) {
+        console.warn(`[antigravity] invalid AGY_HEAL_HOOK_ARGV JSON: ${e.message}`);
+        return null;
+      }
+    }
+    console.warn('[antigravity] invalid AGY_HEAL_HOOK_ARGV: expected array or JSON string');
+    return null;
+  }
+
+  _isWriteTool(toolName) {
+    return toolName === 'write_to_file' ||
+           toolName === 'replace_file_content' ||
+           toolName === 'multi_replace_file_content';
+  }
+
+  _maybeRunHealHook(session, step) {
+    if (!this._healHookArgv || !this._isWriteTool(step.tool_name)) return;
+    if (session.cancelPending) return;
+    if (step.status && step.status !== 'SUCCESS') return;
+    if (step.error || step.tool_info?.error || step.is_error) return;
+    if (step.tool_info?.status && step.tool_info.status !== 'SUCCESS') return;
+
+    const params = step.tool_info?.parameters ?? session.turn?.toolParams?.get(step.step_index) ?? step.parameters;
+    const target = params?.TargetFile ?? params?.target_file ?? params?.targetFile;
+    if (!target || typeof target !== 'string') return;
+
+    const baseDir = session.workspaceDir || this.cwd || process.cwd();
+    const resolvedPath = path.isAbsolute(target) ? path.resolve(target) : path.resolve(baseDir, target);
+
+    if (this._activeHealPaths.has(resolvedPath)) return;
+    this._activeHealPaths.add(resolvedPath);
+
+    const [cmd, ...args] = this._healHookArgv;
+    try {
+      const proc = spawn(cmd, args, { stdio: ['pipe', 'ignore', 'pipe'] });
+      this._activeHookProcs.add(proc);
+      let stderr = '';
+      if (proc.stderr) {
+        proc.stderr.on('data', (chunk) => {
+          stderr += chunk;
+        });
+      }
+      const timer = setTimeout(() => {
+        try {
+          proc.kill('SIGTERM');
+        } catch {}
+        const killTimer = setTimeout(() => {
+          try {
+            if (!proc.killed) proc.kill('SIGKILL');
+          } catch {}
+        }, 1000);
+        killTimer.unref();
+      }, 10_000);
+      timer.unref();
+
+      const cleanup = (failed, err) => {
+        clearTimeout(timer);
+        this._activeHookProcs.delete(proc);
+        this._activeHealPaths.delete(resolvedPath);
+        if (failed && !this._failedHealPaths.has(resolvedPath)) {
+          this._failedHealPaths.add(resolvedPath);
+          console.error(`[antigravity] heal hook failed for ${resolvedPath}:`, err || stderr.trim() || 'exit non-zero');
+        }
+      };
+
+      proc.on('error', (err) => {
+        cleanup(true, err.message);
+      });
+
+      proc.on('exit', (code, signal) => {
+        const failed = code !== 0 || signal != null;
+        cleanup(failed, signal ? `signal ${signal}` : (code !== 0 ? `code ${code}` : null));
+      });
+
+      proc.stdin.on('error', () => {});
+      proc.stdin.end(JSON.stringify({ tool_input: { file_path: resolvedPath } }));
+      try { proc.stdin?.unref?.(); } catch {}
+      try { proc.stderr?.unref?.(); } catch {}
+      proc.unref();
+    } catch (err) {
+      this._activeHealPaths.delete(resolvedPath);
+      if (!this._failedHealPaths.has(resolvedPath)) {
+        this._failedHealPaths.add(resolvedPath);
+        console.error(`[antigravity] heal hook spawn failed for ${resolvedPath}:`, err.message);
+      }
+    }
   }
 
   _shouldAutoAdopt(session) {
@@ -1015,6 +1137,10 @@ export class AntigravityBackend extends Backend {
       const toolCallId = `${turnId}:step${step.step_index}`;
       session.turn.toolCallIds.set(step.step_index, toolCallId);
       session.turn.toolCallCount++;
+      if (step.tool_info?.parameters) {
+        if (!session.turn.toolParams) session.turn.toolParams = new Map();
+        session.turn.toolParams.set(step.step_index, step.tool_info.parameters);
+      }
       const command = step.tool_info?.parameters?.CommandLine;
       this._emitSession(sessionId, turnId, {
         kind: 'started',
@@ -1027,6 +1153,7 @@ export class AntigravityBackend extends Backend {
     if (step.step_type === 'tool' && step.state === 'DONE') {
       const toolCallId = session.turn.toolCallIds.get(step.step_index) ?? `${turnId}:step${step.step_index}`;
       this._emitSession(sessionId, turnId, { kind: 'result', toolCallId, toolName: step.tool_name ?? 'tool' });
+      this._maybeRunHealHook(session, step);
       return;
     }
     if (step.step_type === 'agent_response' && typeof step.text_delta === 'string') {
