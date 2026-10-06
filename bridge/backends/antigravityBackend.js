@@ -1057,7 +1057,7 @@ export class AntigravityBackend extends Backend {
     const target = params?.TargetFile ?? params?.target_file ?? params?.targetFile;
     if (!target || typeof target !== 'string') return;
 
-    const baseDir = session.workspaceDir || this.cwd || process.cwd();
+    const baseDir = session.client?.cwd || session.workspaceDir || this.cwd || process.cwd();
     const resolvedPath = path.isAbsolute(target) ? path.resolve(target) : path.resolve(baseDir, target);
 
     if (this._activeHealPaths.has(resolvedPath)) return;
@@ -1069,15 +1069,17 @@ export class AntigravityBackend extends Backend {
       this._activeHookProcs.add(proc);
       let stderr = '';
       if (proc.stderr) {
+        proc.stderr.on('error', () => {});
         proc.stderr.on('data', (chunk) => {
           stderr += chunk;
         });
       }
+      let killTimer = null;
       const timer = setTimeout(() => {
         try {
           proc.kill('SIGTERM');
         } catch {}
-        const killTimer = setTimeout(() => {
+        killTimer = setTimeout(() => {
           try {
             if (!proc.killed) proc.kill('SIGKILL');
           } catch {}
@@ -1088,9 +1090,13 @@ export class AntigravityBackend extends Backend {
 
       const cleanup = (failed, err) => {
         clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
         this._activeHookProcs.delete(proc);
         this._activeHealPaths.delete(resolvedPath);
         if (failed && !this._failedHealPaths.has(resolvedPath)) {
+          if (this._failedHealPaths.size >= 512) {
+            this._failedHealPaths.delete(this._failedHealPaths.values().next().value);
+          }
           this._failedHealPaths.add(resolvedPath);
           console.error(`[antigravity] heal hook failed for ${resolvedPath}:`, err || stderr.trim() || 'exit non-zero');
         }
@@ -1113,6 +1119,9 @@ export class AntigravityBackend extends Backend {
     } catch (err) {
       this._activeHealPaths.delete(resolvedPath);
       if (!this._failedHealPaths.has(resolvedPath)) {
+        if (this._failedHealPaths.size >= 512) {
+          this._failedHealPaths.delete(this._failedHealPaths.values().next().value);
+        }
         this._failedHealPaths.add(resolvedPath);
         console.error(`[antigravity] heal hook spawn failed for ${resolvedPath}:`, err.message);
       }

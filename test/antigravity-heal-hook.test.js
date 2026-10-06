@@ -101,26 +101,28 @@ test('heal hook fires once with the right payload for each measured write tool (
 
   const { sessionId } = await backend.createConversation({ workspaceDir: dir });
 
-  // 1. write_to_file with relative path
-  await backend.sendMessage(sessionId, 'write_to_file:sub/created.txt');
+  // 1. write_to_file with absolute path
+  const file1 = path.join(dir, 'sub', 'created.txt');
+  await backend.sendMessage(sessionId, `write_to_file:${file1}`);
   await waitFor(() => terminals(events).length >= 1, 'terminal 1');
   await waitFor(() => readPayloads(logFile).length >= 1, 'hook payload 1');
 
   let payloads = readPayloads(logFile);
   assert.equal(payloads.length, 1);
   assert.deepEqual(payloads[0], {
-    tool_input: { file_path: path.resolve(dir, 'sub/created.txt') },
+    tool_input: { file_path: file1 },
   });
 
-  // 2. replace_file_content with relative path
-  await backend.sendMessage(sessionId, 'replace_file_content:sub/edited.txt');
+  // 2. replace_file_content with absolute path
+  const file2 = path.join(dir, 'sub', 'edited.txt');
+  await backend.sendMessage(sessionId, `replace_file_content:${file2}`);
   await waitFor(() => terminals(events).length >= 2, 'terminal 2');
   await waitFor(() => readPayloads(logFile).length >= 2, 'hook payload 2');
 
   payloads = readPayloads(logFile);
   assert.equal(payloads.length, 2);
   assert.deepEqual(payloads[1], {
-    tool_input: { file_path: path.resolve(dir, 'sub/edited.txt') },
+    tool_input: { file_path: file2 },
   });
 
   // 3. multi_replace_file_content with absolute path
@@ -333,4 +335,36 @@ test('at most one concurrent hook per path', async (t) => {
 
   const payloads = readPayloads(logFile);
   assert.equal(payloads.length, 1, 'expected exactly 1 hook execution due to concurrent deduplication');
+});
+
+test('relative TargetFile resolves against agy child cwd', async (t) => {
+  const dir = tmp('relative-cwd');
+  const { hookScript, logFile } = makeRecorderHook(dir);
+  const hookArgv = [process.execPath, hookScript];
+
+  const prevEnv = process.env.AGY_HEAL_HOOK_ARGV;
+  process.env.AGY_HEAL_HOOK_ARGV = JSON.stringify(hookArgv);
+  const { backend, events } = makeBackend(dir);
+  t.after(async () => {
+    if (prevEnv !== undefined) process.env.AGY_HEAL_HOOK_ARGV = prevEnv;
+    else delete process.env.AGY_HEAL_HOOK_ARGV;
+    await backend.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  const rawId = sessionId.replace(/^antigravity:/, '');
+  const session = backend._sessions.get(rawId);
+  const clientCwd = session.client?.cwd;
+  assert.ok(clientCwd, 'expected session.client.cwd to be defined');
+
+  await backend.sendMessage(sessionId, 'write_to_file:nested/rel_file.txt');
+  await waitFor(() => terminals(events).length >= 1, 'terminal 1');
+  await waitFor(() => readPayloads(logFile).length >= 1, 'hook payload 1');
+
+  const payloads = readPayloads(logFile);
+  assert.equal(payloads.length, 1);
+  assert.deepEqual(payloads[0], {
+    tool_input: { file_path: path.resolve(clientCwd, 'nested/rel_file.txt') },
+  });
 });
