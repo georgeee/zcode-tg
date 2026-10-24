@@ -807,7 +807,7 @@ export class AntigravityBackend extends Backend {
   _badModelRefError(model) {
     return new Error(
       `model "${model}" is not supported by the antigravity backend: supported models are ${AGY_MODELS.join(', ')}; ` +
-      `effort variants are ${AGY_MODELS.map((m) => `${m}:low|medium|high`).join(', ')}`,
+      `effort variants are ${AGY_MODELS.map((m) => `${m}:${AGY_MODEL_EFFORTS[m].join('|')}`).join(', ')}`,
     );
   }
 
