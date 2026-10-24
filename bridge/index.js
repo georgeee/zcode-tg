@@ -61,7 +61,7 @@ import { loadEnv, resolveEnvPath } from './env.js';
 import { existsSync } from 'node:fs';
 import { ZcodeBackend } from './backends/zcodeBackend.js';
 import { CodexBackend } from './backends/codexBackend.js';
-import { AntigravityBackend, AGY_MODEL_REF, parseAgyModelRef } from './backends/antigravityBackend.js';
+import { AntigravityBackend, AGY_MODEL_REF, AGY_MODELS, parseAgyModelRef } from './backends/antigravityBackend.js';
 import { reapOrphanAgyChildren } from './agyProcesses.js';
 import { MockBackend, MOCK_MODEL_REF } from './backends/mockBackend.js';
 import { makeSessionId, backendNameOf, rawSessionId } from './backend.js';
@@ -2082,10 +2082,8 @@ const codexMcpModelsFromEnv = (process.env.CODEX_MCP_MODELS || '')
 const CODEX_MCP_MODELS = codexMcpModelsFromEnv.length ? codexMcpModelsFromEnv : ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'];
 
 // The antigravity MCP refs, derived from the backend's own constant so the
-// schema, validateMcpModel, and parseAgyModelRef cannot drift apart. No env
-// knob: there is exactly one model per George's decision, and the effort
-// suffixes are the whole surface.
-const AGY_MCP_MODELS = [AGY_MODEL_REF, `${AGY_MODEL_REF}:low`, `${AGY_MODEL_REF}:medium`, `${AGY_MODEL_REF}:high`];
+// schema, validateMcpModel, and parseAgyModelRef cannot drift apart.
+const AGY_MCP_MODELS = AGY_MODELS.flatMap((m) => [m, `${m}:low`, `${m}:medium`, `${m}:high`]);
 
 // validateMcpModel enforces the MCP model policy for both session_create and
 // model_set, in one place, so the two can't drift: zcode and mock both
@@ -2108,7 +2106,7 @@ function validateMcpModel(backend, model) {
   if (model == null) return undefined;
   if (backend === 'antigravity') {
     if (!parseAgyModelRef(model)) {
-      throw new Error(`model "${model}" is not offered for the antigravity backend; choose ${AGY_MODEL_REF} or an effort variant (${AGY_MODEL_REF}:low, ${AGY_MODEL_REF}:medium, ${AGY_MODEL_REF}:high)`);
+      throw new Error(`model "${model}" is not offered for the antigravity backend; choose one of ${AGY_MCP_MODELS.join(', ')}`);
     }
     return model;
   }

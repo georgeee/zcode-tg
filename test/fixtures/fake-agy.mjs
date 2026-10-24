@@ -91,12 +91,12 @@ if (process.env.FIXTURE_AGY_EXIT_BEFORE_INIT) {
 // bare slug + --effort is the only valid form; an effort-suffixed slug, or
 // the bare slug without --effort, is a hard startup error -- a `result`
 // envelope with status ERROR, NO init event, exit 1.
-const BARE = 'gemini-3.8-flash';
-if (model !== BARE || !['low', 'medium', 'high'].includes(effort)) {
+const BARE_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-3.1-pro'];
+if (!BARE_MODELS.includes(model) || !['low', 'medium', 'high'].includes(effort)) {
   const why =
-    model !== BARE
+    !BARE_MODELS.includes(model)
       ? `invalid model selection: unsupported model "${model ?? ''}"`
-      : `invalid model selection (--model "${model}" --effort "${effort ?? ''}"): --model ${BARE} requires --effort (available: low, medium, high)`;
+      : `invalid model selection (--model "${model}" --effort "${effort ?? ''}"): --model ${model} requires --effort (available: low, medium, high)`;
   process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: '', status: 'ERROR', response: '', error: why, duration_seconds: 0, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 } } }) + '\n');
   process.stderr.write(`error: ${why}\n`);
   process.exit(1);
@@ -244,7 +244,7 @@ setTimeout(() => {
     event: 'init',
     conversation_id: conversationId,
     init: {
-      model: BARE, // the init echoes the BARE slug when --effort is used (battery (d))
+      model, // the init echoes the BARE slug when --effort is used (battery (d))
       cwd: process.cwd(),
       tools: ['run_command', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'finish'],
       permission_mode: skipPermissions ? 'always-proceed' : 'request-review',

@@ -50,23 +50,29 @@ function formatAge(ms) {
   return m > 0 ? `${m}m${s}s` : `${s}s`;
 }
 
-// THE SINGLE MODEL REF, per George (2026-09-24): the antigravity family
-// exposes exactly one model; reasoning effort is a KNOB on that ref, mapped
-// to agy's `--effort low|medium|high` (bridge default: medium, AGY_EFFORT).
-// Arg rule (VERIFIED LIVE, battery (d)): always the bare slug + --effort,
-// never an effort-suffixed slug, never the bare slug without --effort.
+export const AGY_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-3.1-pro'];
+export const AGY_MODEL_LABELS = {
+  'gemini-3.8-flash': 'Gemini 3.8 Flash',
+  'gemini-4-argon': 'Gemini 4 Argon',
+  'gemini-3.1-pro': 'Gemini 3.1 Pro',
+};
 export const AGY_MODEL_REF = 'gemini-3.8-flash';
-export const AGY_MODEL_LABEL = 'Gemini 3.8 Flash';
+export const AGY_MODEL_LABEL = AGY_MODEL_LABELS[AGY_MODEL_REF];
 export const AGY_EFFORTS = ['low', 'medium', 'high'];
 
-// parseAgyModelRef: 'gemini-3.8-flash' -> {model, effort: null} (backend
-// default effort); 'gemini-3.8-flash:high' -> {model, effort: 'high'};
-// anything else -> null (caller refuses with a clear error). The suffix form
-// is the ONLY switch there is on this backend -- see setModel().
+// parseAgyModelRef: <model> -> {model, effort: null} (backend
+// default effort); <model>:<effort> -> {model, effort};
+// anything else -> null (caller refuses with a clear error).
 export function parseAgyModelRef(ref) {
-  if (ref === AGY_MODEL_REF) return { model: AGY_MODEL_REF, effort: null };
-  const m = String(ref ?? '').match(/^gemini-3\.8-flash:(low|medium|high)$/);
-  if (m) return { model: AGY_MODEL_REF, effort: m[1] };
+  if (typeof ref !== 'string' || !ref) return null;
+  for (const m of AGY_MODELS) {
+    if (ref === m) return { model: m, effort: null };
+    if (ref.startsWith(`${m}:`)) {
+      const eff = ref.slice(m.length + 1);
+      if (AGY_EFFORTS.includes(eff)) return { model: m, effort: eff };
+      return null;
+    }
+  }
   return null;
 }
 
@@ -140,6 +146,7 @@ export class AntigravityBackend extends Backend {
     // agy's OWN working directory (never the workspace): made 0700 at each
     // spawn, and checked by the pre-turn gate. AGY_BRIDGE_CWD in index.js.
     this.privateCwd = privateCwd || defaultAgyBridgeCwd(agyHome);
+    this.model = AGY_MODEL_REF;
     this.effort = effort;
     this.autoApprovePermissions = autoApprovePermissions;
     this.configVerifier = configVerifier;
@@ -412,17 +419,17 @@ export class AntigravityBackend extends Backend {
     if (!parsed) throw this._badModelRefError(model);
     let session;
     try {
-      session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort });
+      session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort, model: parsed.model });
       const init = await session.initPromise;
-      const effectiveModel = parsed.effort ? `${AGY_MODEL_REF}:${parsed.effort}` : AGY_MODEL_REF;
+      const effectiveModel = parsed.effort ? `${parsed.model}:${parsed.effort}` : parsed.model;
       return { sessionId: makeSessionId('antigravity', init.conversation_id), model: effectiveModel };
     } catch (err) {
       if (/before initializing/i.test(err?.message || '')) {
         this.emit('warn', `agy exited before initializing; retrying spawn once: ${err.message}`);
         await new Promise((r) => setTimeout(r, this.initRetryBackoffMs ?? 1000));
-        session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort });
+        session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort, model: parsed.model });
         const init = await session.initPromise;
-        const effectiveModel = parsed.effort ? `${AGY_MODEL_REF}:${parsed.effort}` : AGY_MODEL_REF;
+        const effectiveModel = parsed.effort ? `${parsed.model}:${parsed.effort}` : parsed.model;
         return { sessionId: makeSessionId('antigravity', init.conversation_id), model: effectiveModel };
       }
       throw err;
@@ -437,12 +444,13 @@ export class AntigravityBackend extends Backend {
     const rawId = rawSessionId(sessionId);
     const existing = this._sessions.get(rawId);
     if (existing && this._isLive(existing)) return { sessionId };
-    const parsed = parseAgyModelRef(model ?? AGY_MODEL_REF);
+    const parsed = parseAgyModelRef(model ?? existing?.model ?? AGY_MODEL_REF);
     if (!parsed) throw this._badModelRefError(model);
     const session = await this._spawn({
-      workspaceDir: workspaceDir ?? this.cwd,
-      effort: parsed.effort ?? this.effort,
+      workspaceDir: workspaceDir ?? existing?.workspaceDir ?? this.cwd,
+      effort: parsed.effort ?? existing?.effort ?? this.effort,
       conversationId: rawId,
+      model: parsed.model,
     });
     await session.initPromise;
     return { sessionId: makeSessionId('antigravity', rawId) };
@@ -733,10 +741,11 @@ export class AntigravityBackend extends Backend {
   async setModel(sessionId, model) {
     const parsed = parseAgyModelRef(model);
     if (!parsed) throw this._badModelRefError(model);
-    if (!parsed.effort) return; // bare ref: nothing to change
     const rawId = rawSessionId(sessionId);
     const session = this._sessions.get(rawId);
-    if (session && session.effort === parsed.effort) return;
+    const targetModel = parsed.model;
+    const targetEffort = parsed.effort ?? session?.effort ?? this.effort;
+    if (session && session.model === targetModel && session.effort === targetEffort) return;
     const workspaceDir = session?.workspaceDir ?? this.cwd;
     if (session) {
       // Marked closing before the replacement spawns so the cap's live
@@ -745,14 +754,14 @@ export class AntigravityBackend extends Backend {
       this._gcClose(session, null);
       this._sessions.delete(rawId);
     }
-    const fresh = await this._spawn({ workspaceDir, effort: parsed.effort, conversationId: rawId });
+    const fresh = await this._spawn({ workspaceDir, effort: targetEffort, conversationId: rawId, model: targetModel });
     // Eager, so a bad resume surfaces HERE (model_set's caller) rather than
     // as a surprise on the next turn.
     await fresh.initPromise;
   }
 
   async listModels() {
-    return [{ ref: AGY_MODEL_REF, label: AGY_MODEL_LABEL }];
+    return AGY_MODELS.map((ref) => ({ ref, label: AGY_MODEL_LABELS[ref] }));
   }
 
   listModes() {
@@ -782,8 +791,8 @@ export class AntigravityBackend extends Backend {
 
   _badModelRefError(model) {
     return new Error(
-      `model "${model}" is not supported by the antigravity backend: it runs exactly one model (${AGY_MODEL_REF}); ` +
-      `effort variants are ${AGY_MODEL_REF}:low|medium|high`,
+      `model "${model}" is not supported by the antigravity backend: supported models are ${AGY_MODELS.join(', ')}; ` +
+      `effort variants are ${AGY_MODELS.map((m) => `${m}:low|medium|high`).join(', ')}`,
     );
   }
 
@@ -795,7 +804,7 @@ export class AntigravityBackend extends Backend {
   // Async because of the cap (C3): a new child at the cap first evicts an
   // idle one (awaited to a full exit -- never exceed the cap at the process
   // level) or refuses.
-  async _spawn({ workspaceDir, effort, conversationId = null }) {
+  async _spawn({ workspaceDir, effort, conversationId = null, model = this.model ?? AGY_MODEL_REF }) {
     // THE GATE, spawn half: a fresh or resumed child reads the config at its
     // first turn -- never start one against a dirty AGY_HOME. Nothing to
     // stop here (no child exists yet); the throw carries the quarantine
@@ -815,7 +824,7 @@ export class AntigravityBackend extends Backend {
       agyHome: this.agyHome,
       cwd: this.privateCwd,
       workspaceDir,
-      model: AGY_MODEL_REF,
+      model,
       effort,
       skipPermissions: this.autoApprovePermissions,
       // C4: the bridge marker. The orphan sweep at boot identifies OUR
@@ -823,7 +832,7 @@ export class AntigravityBackend extends Backend {
       // the only thing that distinguishes them from any other process.
       env: { CAGE_AGY_BRIDGE: this.bridgeMarker },
     });
-    const session = { client, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null, idleSince: Date.now(), turnStartedAt: null, creatorConn: null, closeWhenIdle: null, cancelPending: false, startingTurn: false, closing: false, closePromise: null, lastExitAt: null };
+    const session = { client, model, effort, turnSeq: 0, turn: null, workspaceDir, rawId: conversationId, initPromise: null, ownTurnTexts: new Set(), watcher: null, idleSince: Date.now(), turnStartedAt: null, creatorConn: null, closeWhenIdle: null, cancelPending: false, startingTurn: false, closing: false, closePromise: null, lastExitAt: null };
     this._pending.add(session);
     session.initPromise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`agy did not initialize within ${this.initTimeoutMs}ms (agyBin=${this.agyBin})`)), this.initTimeoutMs);
@@ -883,7 +892,7 @@ export class AntigravityBackend extends Backend {
       // be in flight, so a "live" hit here would write the next turn into a
       // child on its way out (an EPIPE, or a message swallowed by its
       // death). Respawn instead; the dying entry is replaced at init.
-      session = await this._spawn({ workspaceDir: session?.workspaceDir ?? this.cwd, effort: session?.effort ?? this.effort, conversationId: rawId });
+      session = await this._spawn({ workspaceDir: session?.workspaceDir ?? this.cwd, effort: session?.effort ?? this.effort, conversationId: rawId, model: session?.model ?? this.model ?? AGY_MODEL_REF });
       await session.initPromise;
     }
     return session;

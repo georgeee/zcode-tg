@@ -87,6 +87,19 @@ test('buildArgv: the exact spawn contract (stream-json both sides, NO remote con
     '--model', 'gemini-3.8-flash', '--effort', 'high',
     '--conversation', 'abc-123',
   ]);
+
+  const clientArgon = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-4-argon', effort: 'high' });
+  assert.deepEqual(clientArgon.buildArgv(null), [
+    '--input-format', 'stream-json', '--output-format', 'stream-json',
+    '--dangerously-skip-permissions',
+    '--model', 'gemini-4-argon', '--effort', 'high',
+  ]);
+  assert.deepEqual(clientArgon.buildArgv('abc-123'), [
+    '--input-format', 'stream-json', '--output-format', 'stream-json',
+    '--dangerously-skip-permissions',
+    '--model', 'gemini-4-argon', '--effort', 'high',
+    '--conversation', 'abc-123',
+  ]);
 });
 
 test('spawn: init event arrives with conversation id, always-proceed mode, and HOME=agyHome in the child env', async (t) => {

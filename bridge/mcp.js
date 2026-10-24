@@ -23,6 +23,7 @@ import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
+import { AGY_MODELS } from './backends/antigravityBackend.js';
 
 const PROTOCOL_VERSION = '2024-11-05';
 const MAX_BODY = 1 << 20; // 1 MiB of JSON-RPC is far beyond any tool call
@@ -48,9 +49,8 @@ export function createMcpGateway({
   // fed from one source so they cannot drift.
   codexMcpModels = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'],
   // The antigravity family's refs over MCP (the bridge passes its own list,
-  // derived from parseAgyModelRef): one model plus its effort variants --
-  // effort is the only switch that backend has.
-  agyMcpModels = ['gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high'],
+  // derived from parseAgyModelRef): three models plus their effort variants.
+  agyMcpModels = AGY_MODELS.flatMap((m) => [m, `${m}:low`, `${m}:medium`, `${m}:high`]),
 }) {
   // Two listeners, one JSON-RPC core:
   // - unixSocket: a per-fleet unix domain socket speaking LINE-delimited
@@ -253,7 +253,7 @@ export function createMcpGateway({
             type: 'string',
             enum: [...codexMcpModels, ...agyMcpModels],
             description:
-              "Codex only (except where noted): picks which of this bridge's configured Codex MCP models the session runs -- exactly the enum advertised here; anything else is refused. The default when omitted is the bridge's CODEX_DEFAULT_MODEL. Codex's own server-side default (gpt-6-astra, its newest and most expensive model) is deliberately NOT offered: MCP is not a channel for reaching it. For backend 'antigravity' the enum's gemini-3.8-flash entries apply instead: the bare ref keeps the bridge's AGY_EFFORT default (medium), the :low/:medium/:high suffixes pick reasoning effort -- that backend has exactly one model and effort is its only switch.",
+              "Codex only (except where noted): picks which of this bridge's configured Codex MCP models the session runs -- exactly the enum advertised here; anything else is refused. The default when omitted is the bridge's CODEX_DEFAULT_MODEL. Codex's own server-side default (gpt-6-astra, its newest and most expensive model) is deliberately NOT offered: MCP is not a channel for reaching it. For backend 'antigravity' the enum's gemini-3.8-flash, gemini-4-argon, and gemini-3.1-pro entries apply instead: the bare ref keeps the bridge's AGY_EFFORT default (medium), the :low/:medium/:high suffixes pick reasoning effort.",
           },
         },
         required: ['name'],
@@ -324,7 +324,7 @@ export function createMcpGateway({
     {
       name: 'model_set',
       description:
-        "Switch a session's model. Codex accepts only this bridge's configured Codex MCP models -- the same list session_create's model argument offers (exactly the enum advertised here). Antigravity accepts its one model or an effort variant (gemini-3.8-flash:low|medium|high) -- effort applies from the session's next turn (it is a spawn-time flag; the session resumes with the new effort). zcode and mock sessions, and anything outside the list, all refuse with a clear error, not a silent no-op.",
+        "Switch a session's model. Codex accepts only this bridge's configured Codex MCP models -- the same list session_create's model argument offers (exactly the enum advertised here). Antigravity accepts any of its three models (gemini-3.8-flash, gemini-4-argon, gemini-3.1-pro) or an effort variant (:low|:medium|:high) -- model and effort apply from the session's next turn (they are spawn-time flags; the session resumes with the new model and effort). zcode and mock sessions, and anything outside the list, all refuse with a clear error, not a silent no-op.",
       inputSchema: {
         type: 'object',
         properties: {
