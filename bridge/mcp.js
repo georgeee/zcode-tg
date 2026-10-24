@@ -23,7 +23,7 @@ import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { createServer } from 'node:http';
 import { createServer as createNetServer } from 'node:net';
-import { AGY_MODELS } from './backends/antigravityBackend.js';
+import { AGY_MODELS, AGY_MODEL_EFFORTS } from './backends/antigravityBackend.js';
 
 const PROTOCOL_VERSION = '2024-11-05';
 const MAX_BODY = 1 << 20; // 1 MiB of JSON-RPC is far beyond any tool call
@@ -50,7 +50,7 @@ export function createMcpGateway({
   codexMcpModels = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'],
   // The antigravity family's refs over MCP (the bridge passes its own list,
   // derived from parseAgyModelRef): three models plus their effort variants.
-  agyMcpModels = AGY_MODELS.flatMap((m) => [m, `${m}:low`, `${m}:medium`, `${m}:high`]),
+  agyMcpModels = AGY_MODELS.flatMap((m) => [m, ...(AGY_MODEL_EFFORTS[m] ?? ['low', 'medium', 'high']).map((eff) => `${m}:${eff}`)]),
 }) {
   // Two listeners, one JSON-RPC core:
   // - unixSocket: a per-fleet unix domain socket speaking LINE-delimited

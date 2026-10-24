@@ -50,6 +50,9 @@ function formatAge(ms) {
   return m > 0 ? `${m}m${s}s` : `${s}s`;
 }
 
+// Arg rule (VERIFIED LIVE, battery (d)): always the bare slug + --effort,
+// never an effort-suffixed slug, never the bare slug without --effort.
+// This now applies to every model in the antigravity family.
 export const AGY_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-3.1-pro'];
 export const AGY_MODEL_LABELS = {
   'gemini-3.8-flash': 'Gemini 3.8 Flash',
@@ -60,6 +63,18 @@ export const AGY_MODEL_REF = 'gemini-3.8-flash';
 export const AGY_MODEL_LABEL = AGY_MODEL_LABELS[AGY_MODEL_REF];
 export const AGY_EFFORTS = ['low', 'medium', 'high'];
 
+export const AGY_MODEL_EFFORTS = {
+  'gemini-3.8-flash': ['low', 'medium', 'high'],
+  'gemini-4-argon': ['low', 'medium', 'high'],
+  'gemini-3.1-pro': ['low', 'high'],
+};
+
+export const AGY_MODEL_DEFAULT_EFFORT = {
+  'gemini-3.8-flash': null,
+  'gemini-4-argon': null,
+  'gemini-3.1-pro': 'high',
+};
+
 // parseAgyModelRef: <model> -> {model, effort: null} (backend
 // default effort); <model>:<effort> -> {model, effort};
 // anything else -> null (caller refuses with a clear error).
@@ -69,7 +84,8 @@ export function parseAgyModelRef(ref) {
     if (ref === m) return { model: m, effort: null };
     if (ref.startsWith(`${m}:`)) {
       const eff = ref.slice(m.length + 1);
-      if (AGY_EFFORTS.includes(eff)) return { model: m, effort: eff };
+      const allowed = AGY_MODEL_EFFORTS[m] ?? AGY_EFFORTS;
+      if (allowed.includes(eff)) return { model: m, effort: eff };
       return null;
     }
   }
@@ -417,9 +433,10 @@ export class AntigravityBackend extends Backend {
   async createConversation({ workspaceDir, model } = {}) {
     const parsed = parseAgyModelRef(model ?? AGY_MODEL_REF);
     if (!parsed) throw this._badModelRefError(model);
+    const targetEffort = parsed.effort ?? AGY_MODEL_DEFAULT_EFFORT[parsed.model] ?? this.effort;
     let session;
     try {
-      session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort, model: parsed.model });
+      session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: targetEffort, model: parsed.model });
       const init = await session.initPromise;
       const effectiveModel = parsed.effort ? `${parsed.model}:${parsed.effort}` : parsed.model;
       return { sessionId: makeSessionId('antigravity', init.conversation_id), model: effectiveModel };
@@ -427,7 +444,7 @@ export class AntigravityBackend extends Backend {
       if (/before initializing/i.test(err?.message || '')) {
         this.emit('warn', `agy exited before initializing; retrying spawn once: ${err.message}`);
         await new Promise((r) => setTimeout(r, this.initRetryBackoffMs ?? 1000));
-        session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: parsed.effort ?? this.effort, model: parsed.model });
+        session = await this._spawn({ workspaceDir: workspaceDir ?? this.cwd, effort: targetEffort, model: parsed.model });
         const init = await session.initPromise;
         const effectiveModel = parsed.effort ? `${parsed.model}:${parsed.effort}` : parsed.model;
         return { sessionId: makeSessionId('antigravity', init.conversation_id), model: effectiveModel };
@@ -446,9 +463,11 @@ export class AntigravityBackend extends Backend {
     if (existing && this._isLive(existing)) return { sessionId };
     const parsed = parseAgyModelRef(model ?? existing?.model ?? AGY_MODEL_REF);
     if (!parsed) throw this._badModelRefError(model);
+    const defaultEffort = AGY_MODEL_DEFAULT_EFFORT[parsed.model] ?? this.effort;
+    const targetEffort = parsed.effort ?? (existing?.model === parsed.model ? existing.effort : null) ?? defaultEffort;
     const session = await this._spawn({
       workspaceDir: workspaceDir ?? existing?.workspaceDir ?? this.cwd,
-      effort: parsed.effort ?? existing?.effort ?? this.effort,
+      effort: targetEffort,
       conversationId: rawId,
       model: parsed.model,
     });
@@ -743,17 +762,13 @@ export class AntigravityBackend extends Backend {
     if (!parsed) throw this._badModelRefError(model);
     const rawId = rawSessionId(sessionId);
     const session = this._sessions.get(rawId);
+    if (!session) return;
     const targetModel = parsed.model;
-    const targetEffort = parsed.effort ?? session?.effort ?? this.effort;
-    if (session && session.model === targetModel && session.effort === targetEffort) return;
-    const workspaceDir = session?.workspaceDir ?? this.cwd;
-    if (session) {
-      // Marked closing before the replacement spawns so the cap's live
-      // count never sees the dying child; the entry is deleted because the
-      // respawn below re-registers with the new effort.
-      this._gcClose(session, null);
-      this._sessions.delete(rawId);
-    }
+    const defaultEffort = AGY_MODEL_DEFAULT_EFFORT[targetModel] ?? this.effort;
+    const targetEffort = parsed.effort ?? (session.model === targetModel ? session.effort : null) ?? defaultEffort;
+    if (session.model === targetModel && session.effort === targetEffort) return;
+    const workspaceDir = session.workspaceDir ?? this.cwd;
+    this._gcClose(session, null);
     const fresh = await this._spawn({ workspaceDir, effort: targetEffort, conversationId: rawId, model: targetModel });
     // Eager, so a bad resume surfaces HERE (model_set's caller) rather than
     // as a surprise on the next turn.
@@ -892,7 +907,10 @@ export class AntigravityBackend extends Backend {
       // be in flight, so a "live" hit here would write the next turn into a
       // child on its way out (an EPIPE, or a message swallowed by its
       // death). Respawn instead; the dying entry is replaced at init.
-      session = await this._spawn({ workspaceDir: session?.workspaceDir ?? this.cwd, effort: session?.effort ?? this.effort, conversationId: rawId, model: session?.model ?? this.model ?? AGY_MODEL_REF });
+      const model = session?.model ?? this.model ?? AGY_MODEL_REF;
+      const defaultEffort = AGY_MODEL_DEFAULT_EFFORT[model] ?? this.effort;
+      const effort = session?.effort ?? defaultEffort;
+      session = await this._spawn({ workspaceDir: session?.workspaceDir ?? this.cwd, effort, conversationId: rawId, model });
       await session.initPromise;
     }
     return session;

@@ -13,7 +13,10 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { AntigravityBackend, AGY_MODEL_REF, AGY_MODELS, parseAgyModelRef } from '../bridge/backends/antigravityBackend.js';
+import { spawnSync } from 'node:child_process';
+import { Store } from '../bridge/store.js';
+import { makeSessionId } from '../bridge/backend.js';
+import { AntigravityBackend, AGY_MODEL_REF, AGY_MODELS, AGY_MODEL_EFFORTS, AGY_MODEL_DEFAULT_EFFORT, parseAgyModelRef } from '../bridge/backends/antigravityBackend.js';
 import { AGY_DELIVERY_FAILED } from '../bridge/antigravityClient.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -73,10 +76,11 @@ test('parseAgyModelRef: the whole model surface is one ref plus effort variants'
   assert.equal(parseAgyModelRef('gemini-3.8-flash-high'), null); // slug-suffix form is agy's hard-error trap
   for (const m of AGY_MODELS) {
     assert.deepEqual(parseAgyModelRef(m), { model: m, effort: null });
-    for (const eff of ['low', 'medium', 'high']) {
+    for (const eff of AGY_MODEL_EFFORTS[m]) {
       assert.deepEqual(parseAgyModelRef(`${m}:${eff}`), { model: m, effort: eff });
     }
   }
+  assert.equal(parseAgyModelRef('gemini-3.1-pro:medium'), null);
   assert.equal(parseAgyModelRef('gemini-4-argon-high'), null);
   assert.equal(parseAgyModelRef('gemini-4-argon:max'), null);
 });
@@ -975,4 +979,113 @@ test("requirement d: caps retries at 2 times (3 attempts total)", async (t) => {
   assert.ok(retry1, "retry 1 emitted");
   assert.ok(retry2, "retry 2 emitted");
   assert.equal(retry3, undefined, "retry 3 must not be attempted (max 2 retries)");
+});
+
+test("B1: parseAgyModelRef per-model allowed efforts", () => {
+  assert.equal(parseAgyModelRef("gemini-3.1-pro:medium"), null);
+  assert.deepEqual(parseAgyModelRef("gemini-3.1-pro"), { model: "gemini-3.1-pro", effort: null });
+  assert.deepEqual(parseAgyModelRef("gemini-3.1-pro:low"), { model: "gemini-3.1-pro", effort: "low" });
+  assert.deepEqual(parseAgyModelRef("gemini-3.1-pro:high"), { model: "gemini-3.1-pro", effort: "high" });
+  assert.deepEqual(parseAgyModelRef("gemini-3.8-flash:medium"), { model: "gemini-3.8-flash", effort: "medium" });
+  assert.deepEqual(parseAgyModelRef("gemini-4-argon:medium"), { model: "gemini-4-argon", effort: "medium" });
+});
+
+test("B1: bare gemini-3.1-pro defaults to high effort and spawns with --effort high", async (t) => {
+  const dir = tmp("bare-pro-effort");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const markerLog = path.join(dir, "spawns.jsonl");
+  process.env.FIXTURE_AGY_MARKER_LOG = markerLog;
+  t.after(() => { delete process.env.FIXTURE_AGY_MARKER_LOG; });
+  const { backend } = makeBackend(dir);
+  t.after(() => backend.stop());
+
+  assert.equal(AGY_MODEL_DEFAULT_EFFORT["gemini-3.1-pro"], "high");
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir, model: "gemini-3.1-pro" });
+  assert.ok(sessionId);
+  const spawns = readFileSync(markerLog, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const lastSpawn = spawns.at(-1);
+  assert.equal(lastSpawn.argv[lastSpawn.argv.indexOf("--model") + 1], "gemini-3.1-pro");
+  assert.equal(lastSpawn.argv[lastSpawn.argv.indexOf("--effort") + 1], "high");
+});
+
+test("B1: fake-agy rejects gemini-3.1-pro with --effort medium with exit 1", () => {
+  const res = spawnSync(process.execPath, [
+    FIXTURE,
+    "--input-format", "stream-json",
+    "--output-format", "stream-json",
+    "--dangerously-skip-permissions",
+    "--model", "gemini-3.1-pro",
+    "--effort", "medium",
+  ], { encoding: "utf8" });
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /requires --effort \(available: low, high\)/);
+  const out = JSON.parse(res.stdout.trim());
+  assert.equal(out.event, "result");
+  assert.equal(out.result.status, "ERROR");
+});
+
+test("A1: setModel on unloaded session does not spawn", async (t) => {
+  const dir = tmp("unloaded-setmodel");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const markerLog = path.join(dir, "spawns.jsonl");
+  process.env.FIXTURE_AGY_MARKER_LOG = markerLog;
+  t.after(() => { delete process.env.FIXTURE_AGY_MARKER_LOG; });
+  const { backend } = makeBackend(dir);
+  t.after(() => backend.stop());
+
+  const unloadedId = makeSessionId("antigravity", "unloaded-session-123");
+  await backend.setModel(unloadedId, "gemini-4-argon:high");
+  assert.equal(existsSync(markerLog), false, "no spawn happens on unloaded session setModel");
+});
+
+test("B3 + A3: setModel failure rejects, preserves previous model/effort for next turn, store rolled back", async (t) => {
+  const dir = tmp("failed-switch");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const markerLog = path.join(dir, "spawns.jsonl");
+  process.env.FIXTURE_AGY_MARKER_LOG = markerLog;
+  t.after(() => { delete process.env.FIXTURE_AGY_MARKER_LOG; });
+  const { backend, events } = makeBackend(dir);
+  t.after(() => backend.stop());
+
+  const storePath = path.join(dir, "store.json");
+  const store = new Store(storePath);
+
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir, model: "gemini-4-argon:high" });
+  const key = "test-topic";
+  store.setTopic(key, { threadId: 1, backend: "antigravity", sessionId, model: "gemini-4-argon:high" });
+
+  const terminal1 = await runOneTurn(backend, events, sessionId, "first turn argon");
+  assert.equal(terminal1.params.status, "success");
+
+  // Cause fake to reject gemini-3.1-pro
+  process.env.FIXTURE_AGY_REJECT_MODEL = "gemini-3.1-pro";
+  t.after(() => { delete process.env.FIXTURE_AGY_REJECT_MODEL; });
+
+  // Simulate modelSet store flow with rollback
+  const entry = store.getTopic(key);
+  const previousModel = entry.model;
+  store.setTopic(key, { ...entry, model: "gemini-3.1-pro:high" });
+
+  await assert.rejects(async () => {
+    try {
+      await backend.setModel(sessionId, "gemini-3.1-pro:high");
+    } catch (e) {
+      store.setTopic(key, { ...entry, model: previousModel });
+      throw e;
+    }
+  }, /rejected|before initializing/);
+
+  // Store still holds the previous ref
+  assert.equal(store.getTopic(key).model, "gemini-4-argon:high");
+
+  // Next turn respawns using the previous model/effort
+  delete process.env.FIXTURE_AGY_REJECT_MODEL;
+  const spawnsBefore = readFileSync(markerLog, "utf8").trim().split("\n").length;
+  const terminal2 = await runOneTurn(backend, events, sessionId, "next turn after failed switch");
+  assert.equal(terminal2.params.status, "success");
+
+  const spawns = readFileSync(markerLog, "utf8").trim().split("\n").slice(spawnsBefore).map((l) => JSON.parse(l));
+  const respawn = spawns.at(-1);
+  assert.equal(respawn.argv[respawn.argv.indexOf("--model") + 1], "gemini-4-argon");
+  assert.equal(respawn.argv[respawn.argv.indexOf("--effort") + 1], "high");
 });

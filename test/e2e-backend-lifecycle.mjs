@@ -767,12 +767,12 @@ async function scenario9() {
     const ms = tools.find((t) => t.name === 'model_set');
     check(
       'tools/list: session_create\u2019s model enum is the configured codex list plus the antigravity family',
-      JSON.stringify(sc?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-3.1-pro', 'gemini-3.1-pro:low', 'gemini-3.1-pro:medium', 'gemini-3.1-pro:high']),
+      JSON.stringify(sc?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-3.1-pro', 'gemini-3.1-pro:low', 'gemini-3.1-pro:high']),
       JSON.stringify(sc?.inputSchema?.properties?.model),
     );
     check(
       'tools/list: model_set\u2019s model enum is the configured codex list plus the antigravity family',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-3.1-pro', 'gemini-3.1-pro:low', 'gemini-3.1-pro:medium', 'gemini-3.1-pro:high']),
+      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-3.1-pro', 'gemini-3.1-pro:low', 'gemini-3.1-pro:high']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {
@@ -802,7 +802,7 @@ async function scenario9() {
     const ms = (lines[0]?.result?.tools ?? []).find((t) => t.name === 'model_set');
     check(
       'with CODEX_MCP_MODELS unset the enum is today\u2019s three tiers plus the antigravity family',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-3.1-pro', 'gemini-3.1-pro:low', 'gemini-3.1-pro:medium', 'gemini-3.1-pro:high']),
+      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-3.1-pro', 'gemini-3.1-pro:low', 'gemini-3.1-pro:high']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {

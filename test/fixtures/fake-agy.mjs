@@ -92,11 +92,24 @@ if (process.env.FIXTURE_AGY_EXIT_BEFORE_INIT) {
 // the bare slug without --effort, is a hard startup error -- a `result`
 // envelope with status ERROR, NO init event, exit 1.
 const BARE_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-3.1-pro'];
-if (!BARE_MODELS.includes(model) || !['low', 'medium', 'high'].includes(effort)) {
+const ALLOWED_EFFORTS = {
+  'gemini-3.8-flash': ['low', 'medium', 'high'],
+  'gemini-4-argon': ['low', 'medium', 'high'],
+  'gemini-3.1-pro': ['low', 'high'],
+};
+const allowed = ALLOWED_EFFORTS[model] ?? ['low', 'medium', 'high'];
+if (!BARE_MODELS.includes(model) || !allowed.includes(effort)) {
   const why =
     !BARE_MODELS.includes(model)
       ? `invalid model selection: unsupported model "${model ?? ''}"`
-      : `invalid model selection (--model "${model}" --effort "${effort ?? ''}"): --model ${model} requires --effort (available: low, medium, high)`;
+      : `invalid model selection (--model "${model}" --effort "${effort ?? ''}"): --model ${model} requires --effort (available: ${allowed.join(', ')})`;
+  process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: '', status: 'ERROR', response: '', error: why, duration_seconds: 0, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 } } }) + '\n');
+  process.stderr.write(`error: ${why}\n`);
+  process.exit(1);
+}
+
+if (process.env.FIXTURE_AGY_REJECT_MODEL && (model === process.env.FIXTURE_AGY_REJECT_MODEL || `${model}:${effort}` === process.env.FIXTURE_AGY_REJECT_MODEL)) {
+  const why = `invalid model selection: model "${model}" rejected`;
   process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: '', status: 'ERROR', response: '', error: why, duration_seconds: 0, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 } } }) + '\n');
   process.stderr.write(`error: ${why}\n`);
   process.exit(1);

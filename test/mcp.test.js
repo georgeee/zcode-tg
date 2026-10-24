@@ -551,18 +551,18 @@ test("requirement a: progress_get includes lastError when turn failed", () => {
   assert.deepEqual(out.lastError, { at: "2026-10-05T20:00:00Z", message: "⚠️ Turn failed: 503 UNAVAILABLE" });
 });
 
-test('tools/list: session_create and model_set advertise 12 antigravity model enum entries', async (t) => {
+test('tools/list: session_create and model_set advertise 11 antigravity model enum entries', async (t) => {
   const h = await startGateway(t, {});
   t.after(() => h.close());
   const r = await rpc(h.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const sc = r.body.result.tools.find((x) => x.name === 'session_create');
   const ms = r.body.result.tools.find((x) => x.name === 'model_set');
   const agyEntries = sc.inputSchema.properties.model.enum.filter((m) => m.startsWith('gemini-'));
-  assert.equal(agyEntries.length, 12);
+  assert.equal(agyEntries.length, 11);
   const expectedAgy = [
     'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high',
     'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high',
-    'gemini-3.1-pro', 'gemini-3.1-pro:low', 'gemini-3.1-pro:medium', 'gemini-3.1-pro:high',
+    'gemini-3.1-pro', 'gemini-3.1-pro:low', 'gemini-3.1-pro:high',
   ];
   assert.deepEqual(agyEntries, expectedAgy);
   assert.deepEqual(ms.inputSchema.properties.model.enum.filter((m) => m.startsWith('gemini-')), expectedAgy);

@@ -61,7 +61,7 @@ import { loadEnv, resolveEnvPath } from './env.js';
 import { existsSync } from 'node:fs';
 import { ZcodeBackend } from './backends/zcodeBackend.js';
 import { CodexBackend } from './backends/codexBackend.js';
-import { AntigravityBackend, AGY_MODEL_REF, AGY_MODELS, parseAgyModelRef } from './backends/antigravityBackend.js';
+import { AntigravityBackend, AGY_MODEL_REF, AGY_MODELS, AGY_MODEL_EFFORTS, parseAgyModelRef } from './backends/antigravityBackend.js';
 import { reapOrphanAgyChildren } from './agyProcesses.js';
 import { MockBackend, MOCK_MODEL_REF } from './backends/mockBackend.js';
 import { makeSessionId, backendNameOf, rawSessionId } from './backend.js';
@@ -1600,7 +1600,16 @@ async function getOrCreateSession(threadId, { forceFresh = false } = {}) {
     // shipped (caught live: Codex's own API rejected it outright -- "not
     // supported when using Codex with a ChatGPT account"). defaultModelFor()
     // picks the right per-backend default instead (see its definition above).
-    const model = stored?.model || defaultModelFor(backendName);
+    let model = stored?.model;
+    if (model) {
+      const valid = backendName === 'antigravity' ? parseAgyModelRef(model) !== null : true;
+      if (!valid) {
+        console.warn(`[bridge] topic ${threadId}: stored model "${model}" is not valid for ${backendName}; falling back to default`);
+        model = defaultModelFor(backendName);
+      }
+    } else {
+      model = defaultModelFor(backendName);
+    }
     const mode = stored?.mode || cfg.defaultSessionMode;
     const created = await backend.createConversation({ workspaceDir: cfg.workspaceDir, workspaceKey, model, mode });
     entry = { sessionId: created.sessionId, model: created.model ?? model, mode: created.mode ?? mode, backend: backendName };
@@ -2083,7 +2092,7 @@ const CODEX_MCP_MODELS = codexMcpModelsFromEnv.length ? codexMcpModelsFromEnv : 
 
 // The antigravity MCP refs, derived from the backend's own constant so the
 // schema, validateMcpModel, and parseAgyModelRef cannot drift apart.
-const AGY_MCP_MODELS = AGY_MODELS.flatMap((m) => [m, `${m}:low`, `${m}:medium`, `${m}:high`]);
+const AGY_MCP_MODELS = AGY_MODELS.flatMap((m) => [m, ...(AGY_MODEL_EFFORTS[m] ?? ['low', 'medium', 'high']).map((eff) => `${m}:${eff}`)]);
 
 // validateMcpModel enforces the MCP model policy for both session_create and
 // model_set, in one place, so the two can't drift: zcode and mock both
@@ -3322,6 +3331,7 @@ async function main() {
         const backend = entry.backend || cfg.defaultBackend;
         const model = validateMcpModel(backend, modelArg);
         if (model === undefined) throw new Error('model is required for model_set');
+        const previousModel = entry.model;
         store.setTopic(key, { ...entry, model });
         const b = getBackend(backend);
         // Same workspaceKey shape /model's own switch path uses (see its
@@ -3329,7 +3339,12 @@ async function main() {
         // is a different string (keyFor's composite chat/thread encoding).
         b.invalidateModelCache?.(`tg-topic-${entry.threadId}`);
         if (entry.sessionId && subscribedSessions.has(entry.sessionId)) {
-          await b.setModel(entry.sessionId, model);
+          try {
+            await b.setModel(entry.sessionId, model);
+          } catch (e) {
+            store.setTopic(key, { ...entry, model: previousModel });
+            throw e;
+          }
         }
         return { backend, model, switchable: true };
       },
