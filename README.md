@@ -453,8 +453,8 @@ candidate saying why; an explicit `chat_id` always wins.
 
 The fourth backend runs **Google's Antigravity CLI** (`agy`, the gemini-cli
 successor on a Google AI Pro subscription) in its headless **stream-json**
-mode, offering three models — `gemini-3.8-flash` (default), `gemini-4-argon`,
-and `gemini-3.1-pro` — with reasoning effort as an optional knob (`--effort
+mode, offering two models — `gemini-3.8-flash` (default) and `gemini-4-argon`
+— with reasoning effort as an optional knob (`--effort
 low|medium|high`, default `medium`). Where codex multiplexes every thread over one `codex app-server`
 process, agy's protocol has no multiplexing: this backend keeps **one `agy`
 process per conversation**, writing user turns to its stdin and reading
@@ -532,8 +532,8 @@ usual config-file pointer. The Telegram path is unchanged when configured.
 
 **Model policy over MCP** (written up with the others in CLAUDE.md):
 `model_get` reports `switchable: true`, and `model_set` / `session_create`'s
-`model` argument accept any of the three models (`gemini-3.8-flash`,
-`gemini-4-argon`, `gemini-3.1-pro`) as a bare ref (keeps the current effort)
+`model` argument accept either of the two models (`gemini-3.8-flash`,
+`gemini-4-argon`) as a bare ref (keeps the current effort)
 or an effort variant — e.g. `gemini-3.8-flash:low|medium|high`. Model and
 effort are spawn-time flags, so a switch stops the session's process and the
 next turn resumes the SAME conversation with the new flags; anything else is

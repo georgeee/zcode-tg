@@ -53,11 +53,10 @@ function formatAge(ms) {
 // Arg rule (VERIFIED LIVE, battery (d)): always the bare slug + --effort,
 // never an effort-suffixed slug, never the bare slug without --effort.
 // This now applies to every model in the antigravity family.
-export const AGY_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-3.1-pro'];
+export const AGY_MODELS = ['gemini-3.8-flash', 'gemini-4-argon'];
 export const AGY_MODEL_LABELS = {
   'gemini-3.8-flash': 'Gemini 3.8 Flash',
   'gemini-4-argon': 'Gemini 4 Argon',
-  'gemini-3.1-pro': 'Gemini 3.1 Pro',
 };
 export const AGY_MODEL_REF = 'gemini-3.8-flash';
 export const AGY_MODEL_LABEL = AGY_MODEL_LABELS[AGY_MODEL_REF];
@@ -66,13 +65,11 @@ export const AGY_EFFORTS = ['low', 'medium', 'high'];
 export const AGY_MODEL_EFFORTS = {
   'gemini-3.8-flash': ['low', 'medium', 'high'],
   'gemini-4-argon': ['low', 'medium', 'high'],
-  'gemini-3.1-pro': ['low', 'high'],
 };
 
 export const AGY_MODEL_DEFAULT_EFFORT = {
   'gemini-3.8-flash': null,
   'gemini-4-argon': null,
-  'gemini-3.1-pro': 'high',
 };
 
 // parseAgyModelRef: <model> -> {model, effort: null} (backend
