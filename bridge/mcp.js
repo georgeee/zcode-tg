@@ -253,7 +253,7 @@ export function createMcpGateway({
             type: 'string',
             enum: [...codexMcpModels, ...agyMcpModels],
             description:
-              "Codex only (except where noted): picks which of this bridge's configured Codex MCP models the session runs -- exactly the enum advertised here; anything else is refused. The default when omitted is the bridge's CODEX_DEFAULT_MODEL. Codex's own server-side default (gpt-6-astra, its newest and most expensive model) is deliberately NOT offered: MCP is not a channel for reaching it. For backend 'antigravity' the enum's gemini-3.8-flash and gemini-4-argon entries apply instead: the bare ref keeps the bridge's AGY_EFFORT default (medium), the :low/:medium/:high suffixes pick reasoning effort.",
+              "Codex only (except where noted): picks which of this bridge's configured Codex MCP models the session runs -- exactly the enum advertised here; anything else is refused. The default when omitted is the bridge's CODEX_DEFAULT_MODEL. Codex's own server-side default (gpt-6-astra, its newest and most expensive model) is deliberately NOT offered: MCP is not a channel for reaching it. For backend 'antigravity' the enum's gemini-3.8-flash, gemini-4-argon and gemini-4-carbon entries apply instead: the bare ref keeps the bridge's AGY_EFFORT default (medium), the :low/:medium/:high suffixes pick reasoning effort.",
           },
         },
         required: ['name'],
@@ -309,7 +309,7 @@ export function createMcpGateway({
     {
       name: 'model_get',
       description:
-        "Return the backend and model a session runs, and whether model_set can change it (true for codex -- three tiers -- and antigravity -- one model, effort-switchable; always false for zcode and mock, both single-model/no-switching backends, for different reasons: zcode's own MCP contract never offered a switch, mock has only ever had the one synthetic model). The backend itself is still only chosen at session_create time. Omit `key` to get the bridge's own defaults instead of a specific session's.",
+        "Return the backend and model a session runs, and whether model_set can change it (true for codex -- three tiers -- and antigravity -- three models, each effort-switchable; always false for zcode and mock, both single-model/no-switching backends, for different reasons: zcode's own MCP contract never offered a switch, mock has only ever had the one synthetic model). The backend itself is still only chosen at session_create time. Omit `key` to get the bridge's own defaults instead of a specific session's.",
       inputSchema: {
         type: 'object',
         properties: { key: { type: 'string', description: 'Conversation key from session_create. Omit for the bridge-wide default backend/model.' } },
@@ -324,7 +324,7 @@ export function createMcpGateway({
     {
       name: 'model_set',
       description:
-        "Switch a session's model. Codex accepts only this bridge's configured Codex MCP models -- the same list session_create's model argument offers (exactly the enum advertised here). Antigravity accepts either of its two models (gemini-3.8-flash, gemini-4-argon) or an effort variant (:low|:medium|:high) -- model and effort apply from the session's next turn (they are spawn-time flags; the session resumes with the new model and effort). zcode and mock sessions, and anything outside the list, all refuse with a clear error, not a silent no-op.",
+        "Switch a session's model. Codex accepts only this bridge's configured Codex MCP models -- the same list session_create's model argument offers (exactly the enum advertised here). Antigravity accepts any of its three models (gemini-3.8-flash, gemini-4-argon, gemini-4-carbon) or an effort variant (:low|:medium|:high) -- model and effort apply from the session's next turn (they are spawn-time flags; the session resumes with the new model and effort). zcode and mock sessions, and anything outside the list, all refuse with a clear error, not a silent no-op.",
       inputSchema: {
         type: 'object',
         properties: {

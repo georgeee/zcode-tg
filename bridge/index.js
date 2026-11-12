@@ -2115,7 +2115,7 @@ function validateMcpModel(backend, model) {
   if (model == null) return undefined;
   if (backend === 'antigravity') {
     if (!parseAgyModelRef(model)) {
-      throw new Error(`model "${model}" is not offered for the antigravity backend; choose one of ${AGY_MCP_MODELS.join(', ')}`);
+      throw new Error(`model "${model}" is not offered for the antigravity backend; choose a model or an effort variant (<model>:low|medium|high): ${AGY_MCP_MODELS.join(', ')}`);
     }
     return model;
   }

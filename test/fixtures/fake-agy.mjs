@@ -91,10 +91,11 @@ if (process.env.FIXTURE_AGY_EXIT_BEFORE_INIT) {
 // bare slug + --effort is the only valid form; an effort-suffixed slug, or
 // the bare slug without --effort, is a hard startup error -- a `result`
 // envelope with status ERROR, NO init event, exit 1.
-const BARE_MODELS = ['gemini-3.8-flash', 'gemini-4-argon'];
+const BARE_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon'];
 const ALLOWED_EFFORTS = {
   'gemini-3.8-flash': ['low', 'medium', 'high'],
   'gemini-4-argon': ['low', 'medium', 'high'],
+  'gemini-4-carbon': ['low', 'medium', 'high'],
 };
 const allowed = ALLOWED_EFFORTS[model] ?? ['low', 'medium', 'high'];
 if (!BARE_MODELS.includes(model) || !allowed.includes(effort)) {

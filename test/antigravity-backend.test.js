@@ -82,6 +82,8 @@ test('parseAgyModelRef: the whole model surface is one ref plus effort variants'
   assert.equal(parseAgyModelRef('gemini-3.1-pro'), null);
   assert.equal(parseAgyModelRef('gemini-4-argon-high'), null);
   assert.equal(parseAgyModelRef('gemini-4-argon:max'), null);
+  assert.equal(parseAgyModelRef('gemini-4-carbon-high'), null);
+  assert.equal(parseAgyModelRef('gemini-4-carbon:max'), null);
 });
 
 test('createConversation: prefixed session id, the one model, settings seeded on start()', async (t) => {
@@ -621,10 +623,11 @@ test('listModels: exactly one ref -- the single-model decision', async (t) => {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const { backend } = makeBackend(dir);
   const models = await backend.listModels();
-  assert.equal(models.length, 2);
+  assert.equal(models.length, 3);
   assert.deepEqual(models, [
     { ref: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
     { ref: 'gemini-4-argon', label: 'Gemini 4 Argon' },
+    { ref: 'gemini-4-carbon', label: 'Gemini 4 Carbon' },
   ]);
   assert.deepEqual(backend.listModes(), []);
 });
@@ -979,11 +982,13 @@ test("requirement d: caps retries at 2 times (3 attempts total)", async (t) => {
   assert.equal(retry3, undefined, "retry 3 must not be attempted (max 2 retries)");
 });
 
-test("B1: parseAgyModelRef accepts only the two offered models", () => {
+test("B1: parseAgyModelRef accepts only the three offered models", () => {
   assert.equal(parseAgyModelRef("gemini-3.1-pro"), null);
   assert.equal(parseAgyModelRef("gemini-3.1-pro:high"), null);
   assert.deepEqual(parseAgyModelRef("gemini-3.8-flash:medium"), { model: "gemini-3.8-flash", effort: "medium" });
   assert.deepEqual(parseAgyModelRef("gemini-4-argon:medium"), { model: "gemini-4-argon", effort: "medium" });
+  assert.deepEqual(parseAgyModelRef("gemini-4-carbon:medium"), { model: "gemini-4-carbon", effort: "medium" });
+  assert.deepEqual(parseAgyModelRef("gemini-4-carbon"), { model: "gemini-4-carbon", effort: null });
 });
 
 test("A1: setModel on unloaded session does not spawn", async (t) => {
