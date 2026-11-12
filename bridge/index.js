@@ -452,7 +452,7 @@ for (const name of modelBackends) {
 function defaultModelFor(backendName) {
   if (backendName === 'codex') return cfg.codexDefaultModel || undefined;
   if (backendName === 'mock') return MOCK_MODEL_REF;
-  if (backendName === 'antigravity') return AGY_MODEL_REF; // the one model; effort comes from AGY_EFFORT
+  if (backendName === 'antigravity') return AGY_MODEL_REF; // the default model; effort comes from AGY_EFFORT
   return cfg.defaultModel;
 }
 
@@ -2117,7 +2117,7 @@ function validateMcpModel(backend, model) {
   if (model == null) return undefined;
   if (backend === 'antigravity') {
     if (!parseAgyModelRef(model)) {
-      throw new Error(`model "${model}" is not a valid model ref for the antigravity backend; choose a model or an effort variant (<model>:low|medium|high), where <model> is an advertised model or any agy model id (lowercase letters, digits, dots and dashes, no -low/-medium/-high suffix): ${AGY_MCP_MODELS.join(', ')}`);
+      throw new Error(`model "${model}" is not a valid model ref for the antigravity backend; choose a model or an effort variant (<model>:low|medium|high), where <model> is an advertised model or any agy model id (lowercase letters, digits, dots and dashes, starting with a letter or digit, at most 64 characters, no -low/-medium/-high suffix): ${AGY_MCP_MODELS.join(', ')}`);
     }
     return model;
   }
@@ -3319,8 +3319,8 @@ async function main() {
         if (key && !entry) throw new Error(`unknown session: ${key}`);
         const backend = entry?.backend || cfg.defaultBackend;
         const model = entry?.model || defaultModelFor(backend);
-        // switchable: codex (three tiers) and antigravity (one model, the
-        // effort knob) both accept model_set; zcode and mock refuse it.
+        // switchable: codex (three tiers) and antigravity (any agy model id
+        // plus the effort knob) both accept model_set; zcode and mock refuse it.
         return { backend, model, switchable: backend === 'codex' || backend === 'antigravity' };
       },
       // Mirrors the Telegram /model command's own switch path (store the new

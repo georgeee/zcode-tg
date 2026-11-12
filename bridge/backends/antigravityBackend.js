@@ -54,27 +54,30 @@ function formatAge(ms) {
 // never an effort-suffixed slug, never the bare slug without --effort.
 // This now applies to every model in the antigravity family.
 export const AGY_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon'];
-export const AGY_MODEL_LABELS = {
+export const AGY_MODEL_LABELS = Object.freeze(Object.assign(Object.create(null), {
   'gemini-3.8-flash': 'Gemini 3.8 Flash',
   'gemini-4-argon': 'Gemini 4 Argon',
   'gemini-4-carbon': 'Gemini 4 Carbon',
-};
+}));
 export const AGY_MODEL_REF = 'gemini-3.8-flash';
 export const AGY_MODEL_LABEL = AGY_MODEL_LABELS[AGY_MODEL_REF];
 export const AGY_EFFORTS = ['low', 'medium', 'high'];
 
-export const AGY_MODEL_EFFORTS = {
+export const AGY_MODEL_EFFORTS = Object.freeze(Object.assign(Object.create(null), {
   'gemini-3.8-flash': ['low', 'medium', 'high'],
   'gemini-4-argon': ['low', 'medium', 'high'],
   'gemini-4-carbon': ['low', 'medium', 'high'],
-};
+}));
 
-export const AGY_MODEL_DEFAULT_EFFORT = {
+export const AGY_MODEL_DEFAULT_EFFORT = Object.freeze(Object.assign(Object.create(null), {
   'gemini-3.8-flash': null,
   'gemini-4-argon': null,
   'gemini-4-carbon': null,
-};
+}));
 
+// The three per-model tables have NO prototype: with open ids an unlisted
+// model such as "constructor" must look up as undefined, not Object.prototype's.
+//
 // OPEN MODEL IDS (George, 2026-11-12): AGY_MODELS is the ADVERTISED list
 // (the MCP schema's suggestions, listModels, the default), not a gate. Any
 // other id that is well formed is passed to agy as is, and agy judges it: a
@@ -767,8 +770,8 @@ export class AntigravityBackend extends Backend {
     // from here; the turn's own cancel covers the session.
   }
 
-  // Model switching = the effort knob. A bare ref is a no-op success (it is
-  // the only model); `gemini-3.8-flash:<effort>` changes effort from the NEXT
+  // Model switching = model + effort knob. A bare ref of the session's own
+  // model is a no-op success; another model, or `<model>:<effort>`, changes from the NEXT
   // turn: the flag is spawn-time-only (VERIFIED LIVE (d) -- no in-stream
   // override is documented), so a live child is stopped and the session
   // respawn-resumes with --conversation + the new --effort. History survives

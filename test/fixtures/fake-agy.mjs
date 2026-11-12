@@ -100,7 +100,7 @@ const ALLOWED_EFFORTS = {
   'gemini-4-argon': ['low', 'medium', 'high'],
   'gemini-4-carbon': ['low', 'medium', 'high'],
 };
-const allowed = ALLOWED_EFFORTS[model] ?? ['low', 'medium', 'high'];
+const allowed = (Object.hasOwn(ALLOWED_EFFORTS, model ?? '') ? ALLOWED_EFFORTS[model] : null) ?? ['low', 'medium', 'high'];
 if (!BARE_MODELS.includes(model) || !allowed.includes(effort)) {
   const why =
     !BARE_MODELS.includes(model)

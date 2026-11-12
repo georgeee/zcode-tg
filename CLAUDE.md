@@ -171,7 +171,7 @@ bridge now advertises three models (`AGY_MODELS`: gemini-3.8-flash,
 gemini-4-argon, gemini-4-carbon), and that list is suggestions plus the
 default, NOT a gate: any well-formed agy id (`isAgyModelId` — lowercase
 letters, digits, dots, dashes, leading letter/digit, ≤64 chars, no
-`-low|-medium|-high` suffix) passes to agy as is, so a model Google adds
+`-low|-medium|-high` suffix) passes to agy as is over MCP (Telegram's `/model` still lists the advertised ones), so a model Google adds
 server-side needs no release. agy judges the id; a wrong one fails at the
 next turn with agy's error. The arg rule (bare slug + `--effort`) is unchanged.
 

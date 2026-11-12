@@ -603,7 +603,7 @@ test('setModel: an unlisted model id reaches agy as is, and agy judges it', asyn
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const markerLog = path.join(dir, 'spawns.jsonl');
   process.env.FIXTURE_AGY_MARKER_LOG = markerLog;
-  process.env.FIXTURE_AGY_EXTRA_MODELS = 'gemini-4-hydrogen';
+  process.env.FIXTURE_AGY_EXTRA_MODELS = 'gemini-4-hydrogen,constructor';
   t.after(() => { delete process.env.FIXTURE_AGY_MARKER_LOG; delete process.env.FIXTURE_AGY_EXTRA_MODELS; });
   const { backend, events } = makeBackend(dir);
   t.after(() => backend.stop()); // even when an assertion fails, so no agy child outlives the test
@@ -622,6 +622,14 @@ test('setModel: an unlisted model id reaches agy as is, and agy judges it', asyn
   // The account does not serve it: agy's own refusal surfaces at model_set
   // (setModel awaits the respawn's init), not as a silent fallback.
   await assert.rejects(() => backend.setModel(sessionId, 'gemini-9-nonesuch:low'), /unsupported model|did not initialize|exited/);
+
+  // A bare unlisted id takes the backend's default effort -- never a value
+  // looked up through Object.prototype (an id like "constructor").
+  const beforeBare = readFileSync(markerLog, 'utf8').trim().split('\n').length;
+  await backend.setModel(sessionId, 'constructor');
+  const bare = readFileSync(markerLog, 'utf8').trim().split('\n').slice(beforeBare).map((l) => JSON.parse(l)).at(-1);
+  assert.equal(bare.argv[bare.argv.indexOf('--model') + 1], 'constructor');
+  assert.equal(bare.argv[bare.argv.indexOf('--effort') + 1], backend.effort);
 });
 
 test('usageSnapshot: local accounting accumulates across turns and sessions, quota error stashed', async (t) => {
@@ -1014,6 +1022,10 @@ test("B1: parseAgyModelRef accepts the three advertised models and any well-form
   assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen"), { model: "gemini-4-hydrogen", effort: null });
   assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen:high"), { model: "gemini-4-hydrogen", effort: "high" });
   assert.deepEqual(parseAgyModelRef("a".repeat(64)), { model: "a".repeat(64), effort: null });
+  // An id that names an Object.prototype property is just an id (the tables have no prototype).
+  assert.deepEqual(parseAgyModelRef("constructor"), { model: "constructor", effort: null });
+  assert.deepEqual(parseAgyModelRef("constructor:high"), { model: "constructor", effort: "high" });
+  assert.equal(parseAgyModelRef("constructor:bogus"), null);
   // ...and everything malformed is still refused.
   for (const bad of ["", "a".repeat(65), "-gemini", ".gemini", "Gemini-4-hydrogen", "gemini 4", "gemini_4", "gemini/4",
     "gemini-4-hydrogen:max", "gemini-4-hydrogen:", ":high", "gemini-4-hydrogen:high:low", "gemini-4-hydrogen-high",
