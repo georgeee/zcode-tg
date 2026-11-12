@@ -101,7 +101,8 @@ const ALLOWED_EFFORTS = {
   'gemini-4-argon': ['low', 'medium', 'high'],
   'gemini-4-carbon': ['low', 'medium', 'high'],
 };
-const allowed = (Object.hasOwn(ALLOWED_EFFORTS, model ?? '') ? ALLOWED_EFFORTS[model] : null) ?? ['low', 'medium', 'high'];
+// An extra (FIXTURE_AGY_EXTRA_MODELS) model takes all four efforts.
+const allowed = (Object.hasOwn(ALLOWED_EFFORTS, model ?? '') ? ALLOWED_EFFORTS[model] : null) ?? ['low', 'medium', 'high', 'xhigh'];
 if (!BARE_MODELS.includes(model) || !allowed.includes(effort)) {
   const why =
     !BARE_MODELS.includes(model)

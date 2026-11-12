@@ -150,7 +150,9 @@ const cfg = {
   // it holds .gemini/antigravity-cli/antigravity-oauth-token, 0600, one
   // login per bridge model account -- never a path under the workspace);
   // agyEffort is the reasoning-effort default for new sessions
-  // (low|medium|high, per George's single-model decision 2026-09-24).
+  // (low|medium|high, per George's single-model decision 2026-09-24; xhigh
+  // exists for gemini-4-hydrogen but is per-session via model_set, since
+  // gemini-4-argon/-carbon refuse it).
   agyBin: process.env.AGY_BIN || 'agy',
   agyHome: process.env.AGY_HOME || '',
   agyEffort: process.env.AGY_EFFORT || 'medium',

@@ -456,7 +456,7 @@ successor on a Google AI Pro subscription) in its headless **stream-json**
 mode, offering three models — `gemini-4-hydrogen` (default; it replaced `gemini-3.8-flash` on 2026-11-12), `gemini-4-argon`
 and `gemini-4-carbon`, plus any other agy model id over MCP
 — with reasoning effort as an optional knob (`--effort
-low|medium|high`, default `medium`). Where codex multiplexes every thread over one `codex app-server`
+low|medium|high`, plus `xhigh` for `gemini-4-hydrogen`; default `medium`). Where codex multiplexes every thread over one `codex app-server`
 process, agy's protocol has no multiplexing: this backend keeps **one `agy`
 process per conversation**, writing user turns to its stdin and reading
 `init` / `step_update` / `result` NDJSON events from its stdout. Resume is a

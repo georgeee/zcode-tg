@@ -209,7 +209,7 @@ export class AntigravityClient extends EventEmitter {
     this.cwd = cwd; // agy's PRIVATE working directory -- never the workspace (see AGY_PROJECT_CONFIG_NAMES's block)
     this.workspaceDir = workspaceDir; // the workspace the model works in -- CAGE_WORKSPACE for the executor shim
     this.model = model; // the BARE slug (e.g. 'gemini-4-hydrogen'); effort travels separately
-    this.effort = effort; // 'low' | 'medium' | 'high' -- always paired with the bare slug
+    this.effort = effort; // 'low' | 'medium' | 'high' | 'xhigh' -- always paired with the bare slug
     this.skipPermissions = skipPermissions;
     this.env = env;
     this.proc = null;

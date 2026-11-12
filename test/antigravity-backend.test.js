@@ -603,7 +603,7 @@ test('setModel: an unlisted model id reaches agy as is, and agy judges it', asyn
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const markerLog = path.join(dir, 'spawns.jsonl');
   process.env.FIXTURE_AGY_MARKER_LOG = markerLog;
-  process.env.FIXTURE_AGY_EXTRA_MODELS = 'gemini-4-hydrogen,constructor';
+  process.env.FIXTURE_AGY_EXTRA_MODELS = 'gemini-5-helium,constructor';
   t.after(() => { delete process.env.FIXTURE_AGY_MARKER_LOG; delete process.env.FIXTURE_AGY_EXTRA_MODELS; });
   const { backend, events } = makeBackend(dir);
   t.after(() => backend.stop()); // even when an assertion fails, so no agy child outlives the test
@@ -611,12 +611,13 @@ test('setModel: an unlisted model id reaches agy as is, and agy judges it', asyn
 
   // The account serves it: the respawn carries the bare slug plus --effort.
   const before = readFileSync(markerLog, 'utf8').trim().split('\n').length;
-  await backend.setModel(sessionId, 'gemini-4-hydrogen:high');
-  const terminal = await runOneTurn(backend, events, sessionId, 'hello hydrogen');
+  await backend.setModel(sessionId, 'gemini-5-helium:xhigh');
+  const terminal = await runOneTurn(backend, events, sessionId, 'hello helium');
   assert.equal(terminal.params.status, 'success');
   const respawn = readFileSync(markerLog, 'utf8').trim().split('\n').slice(before).map((l) => JSON.parse(l)).at(-1);
-  assert.equal(respawn.argv[respawn.argv.indexOf('--model') + 1], 'gemini-4-hydrogen');
-  assert.equal(respawn.argv[respawn.argv.indexOf('--effort') + 1], 'high');
+  assert.ok(!AGY_MODELS.includes('gemini-5-helium'), 'the id under test is NOT an advertised one');
+  assert.equal(respawn.argv[respawn.argv.indexOf('--model') + 1], 'gemini-5-helium');
+  assert.equal(respawn.argv[respawn.argv.indexOf('--effort') + 1], 'xhigh');
   assert.ok(respawn.argv.includes('--conversation'), 'the respawn resumed the SAME conversation');
 
   // The account does not serve it: agy's own refusal surfaces at model_set
