@@ -767,12 +767,12 @@ async function scenario9() {
     const ms = tools.find((t) => t.name === 'model_set');
     check(
       'tools/list: session_create\u2019s model enum is the configured codex list plus the antigravity family',
-      JSON.stringify(sc?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
+      JSON.stringify(sc?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
       JSON.stringify(sc?.inputSchema?.properties?.model),
     );
     check(
       'tools/list: model_set\u2019s model enum is the configured codex list plus the antigravity family',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
+      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {
@@ -802,7 +802,7 @@ async function scenario9() {
     const ms = (lines[0]?.result?.tools ?? []).find((t) => t.name === 'model_set');
     check(
       'with CODEX_MCP_MODELS unset the enum is today\u2019s three tiers plus the antigravity family',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
+      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {
@@ -1027,7 +1027,7 @@ async function scenario11() {
     const createdOk = created?.result?.isError === false;
     check('(b) session_create on the antigravity backend completes', createdOk, JSON.stringify(created).slice(0, 400));
     const key = createdOk ? JSON.parse(created.result.content[0].text).key : null;
-    check('(b) the session reports model gemini-3.8-flash', createdOk && JSON.parse(created.result.content[0].text).model === 'gemini-3.8-flash', created.result?.content?.[0]?.text);
+    check('(b) the session reports model gemini-4-hydrogen', createdOk && JSON.parse(created.result.content[0].text).model === 'gemini-4-hydrogen', created.result?.content?.[0]?.text);
 
     const sent = await call(3, 'message_send', { key, text: 'hello antigravity' });
     const reply = sent?.result?.isError === false ? JSON.parse(sent.result.content[0].text).reply : null;
@@ -1037,15 +1037,15 @@ async function scenario11() {
     check('(b) the spawn contract: the child ran with HOME=AGY_HOME', spawn1.home === agyHome, spawn1.home);
     // No AGY_BRIDGE_CWD here: the default beside the agy HOME, never the workspace (TMP).
     check('(b) the spawn contract: agy ran in the default private cwd, not the workspace', spawn1.cwd === path.join(TMP, '.local', 'state', 'agent-cage', 'agy-bridge', 'cwd'), spawn1.cwd);
-    check('(b) the spawn contract: bare slug + effort, no effort-suffixed slug', spawn1.argv[spawn1.argv.indexOf('--model') + 1] === 'gemini-3.8-flash' && spawn1.argv[spawn1.argv.indexOf('--effort') + 1] === 'medium', JSON.stringify(spawn1.argv));
+    check('(b) the spawn contract: bare slug + effort, no effort-suffixed slug', spawn1.argv[spawn1.argv.indexOf('--model') + 1] === 'gemini-4-hydrogen' && spawn1.argv[spawn1.argv.indexOf('--effort') + 1] === 'medium', JSON.stringify(spawn1.argv));
 
     const mg = await call(4, 'model_get', { key });
     const got = mg?.result?.isError === false ? JSON.parse(mg.result.content[0].text) : null;
     check('(c) model_get: antigravity is switchable (the effort knob)', got?.switchable === true && got?.backend === 'antigravity', JSON.stringify(got));
     const refused = await call(5, 'model_set', { key, model: 'GPT-5.6-terra' });
     check('(c) model_set to a malformed ref is REFUSED with the effort-variant hint', refused?.result?.isError === true && /effort variant/.test(refused.result.content?.[0]?.text || ''), JSON.stringify(refused).slice(0, 300));
-    const high = await call(6, 'model_set', { key, model: 'gemini-3.8-flash:high' });
-    check('(c) model_set to :high is accepted', high?.result?.isError === false && JSON.parse(high.result.content[0].text).model === 'gemini-3.8-flash:high', JSON.stringify(high).slice(0, 300));
+    const high = await call(6, 'model_set', { key, model: 'gemini-4-hydrogen:high' });
+    check('(c) model_set to :high is accepted', high?.result?.isError === false && JSON.parse(high.result.content[0].text).model === 'gemini-4-hydrogen:high', JSON.stringify(high).slice(0, 300));
     await call(7, 'message_send', { key, text: 'after the effort switch' });
     const spawn2 = JSON.parse(readFileSync(markerLog, 'utf8').trim().split('\n').at(-1));
     check('(c) the next turn respawned with --effort high on the SAME conversation', spawn2.argv[spawn2.argv.indexOf('--effort') + 1] === 'high' && spawn2.argv.includes('--conversation'), JSON.stringify(spawn2.argv));

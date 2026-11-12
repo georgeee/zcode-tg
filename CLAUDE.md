@@ -167,11 +167,11 @@ SLUG (agy hard-errors on slug-suffix + `--effort` together, verified live).
 Telegram's `/model` lists only the bare ref — a human gets the effort
 default (`AGY_EFFORT`, medium) and the MCP allowlist does the rest.
 **Superseded in part (2026-11-12, owner decision): open model ids.** The
-bridge now advertises three models (`AGY_MODELS`: gemini-3.8-flash,
+bridge now advertises three models (`AGY_MODELS`: gemini-4-hydrogen — the default, replacing gemini-3.8-flash, with efforts low|medium|high|xhigh —
 gemini-4-argon, gemini-4-carbon), and that list is suggestions plus the
 default, NOT a gate: any well-formed agy id (`isAgyModelId` — lowercase
 letters, digits, dots, dashes, leading letter/digit, ≤64 chars, no
-`-low|-medium|-high` suffix) passes to agy as is over MCP (Telegram's `/model` still lists the advertised ones), so a model Google adds
+`-low|-medium|-high|-xhigh` suffix) passes to agy as is over MCP (Telegram's `/model` still lists the advertised ones), so a model Google adds
 server-side needs no release. agy judges the id; a wrong one fails at the
 next turn with agy's error. The arg rule (bare slug + `--effort`) is unchanged.
 

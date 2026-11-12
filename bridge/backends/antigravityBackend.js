@@ -53,24 +53,24 @@ function formatAge(ms) {
 // Arg rule (VERIFIED LIVE, battery (d)): always the bare slug + --effort,
 // never an effort-suffixed slug, never the bare slug without --effort.
 // This now applies to every model in the antigravity family.
-export const AGY_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon'];
+export const AGY_MODELS = ['gemini-4-hydrogen', 'gemini-4-argon', 'gemini-4-carbon'];
 export const AGY_MODEL_LABELS = Object.freeze(Object.assign(Object.create(null), {
-  'gemini-3.8-flash': 'Gemini 3.8 Flash',
+  'gemini-4-hydrogen': 'Gemini 4 Hydrogen',
   'gemini-4-argon': 'Gemini 4 Argon',
   'gemini-4-carbon': 'Gemini 4 Carbon',
 }));
-export const AGY_MODEL_REF = 'gemini-3.8-flash';
+export const AGY_MODEL_REF = 'gemini-4-hydrogen';
 export const AGY_MODEL_LABEL = AGY_MODEL_LABELS[AGY_MODEL_REF];
-export const AGY_EFFORTS = ['low', 'medium', 'high'];
+export const AGY_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 
 export const AGY_MODEL_EFFORTS = Object.freeze(Object.assign(Object.create(null), {
-  'gemini-3.8-flash': ['low', 'medium', 'high'],
+  'gemini-4-hydrogen': ['low', 'medium', 'high', 'xhigh'],
   'gemini-4-argon': ['low', 'medium', 'high'],
   'gemini-4-carbon': ['low', 'medium', 'high'],
 }));
 
 export const AGY_MODEL_DEFAULT_EFFORT = Object.freeze(Object.assign(Object.create(null), {
-  'gemini-3.8-flash': null,
+  'gemini-4-hydrogen': null,
   'gemini-4-argon': null,
   'gemini-4-carbon': null,
 }));
@@ -84,13 +84,13 @@ export const AGY_MODEL_DEFAULT_EFFORT = Object.freeze(Object.assign(Object.creat
 // wrong id fails at the first turn with agy's own error. Well formed =
 // lowercase letters, digits, dots and dashes, starting with a letter or
 // digit (so never an option to agy), at most 64 characters, and NOT ending
-// in -low/-medium/-high: that is how `agy models` prints effort variants,
+// in -low/-medium/-high/-xhigh: that is how `agy models` prints effort variants,
 // and the slug-suffix form is agy's hard-error trap (see the arg rule).
 export const AGY_MODEL_ID_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
-const AGY_EFFORT_SUFFIX_RE = /-(low|medium|high)$/;
+const AGY_EFFORT_SUFFIX_RE = /-(low|medium|high|xhigh)$/;
 // The MCP schema's form of the same rule (advisory: parseAgyModelRef, which
-// also refuses the -low/-medium/-high suffix, is the gate).
-export const AGY_MCP_MODEL_PATTERN = '^[a-z0-9][a-z0-9.-]{0,63}(:(low|medium|high))?$';
+// also refuses the -low/-medium/-high/-xhigh suffix, is the gate).
+export const AGY_MCP_MODEL_PATTERN = '^[a-z0-9][a-z0-9.-]{0,63}(:(low|medium|high|xhigh))?$';
 
 export function isAgyModelId(id) {
   return typeof id === 'string' && AGY_MODEL_ID_RE.test(id) && !AGY_EFFORT_SUFFIX_RE.test(id);
@@ -241,7 +241,7 @@ export class AntigravityBackend extends Backend {
     // ownTurnTexts is dropped): the effort and workspaceDir on it are what
     // the next respawn restores -- without that, a reaped session would
     // silently fall back to the bridge-default effort even though its topic
-    // stored gemini-3.8-flash:high.
+    // stored gemini-4-hydrogen:high.
     this._sessions = new Map();
     this._retryDelays = retryDelays;
     this.initRetryBackoffMs = initRetryBackoffMs;
@@ -826,7 +826,7 @@ export class AntigravityBackend extends Backend {
   _badModelRefError(model) {
     return new Error(
       `model "${model}" is not supported by the antigravity backend: a model ref is <model> or one of its effort variants ` +
-      '<model>:low|medium|high, where <model> ' +
+      '<model>:low|medium|high|xhigh, where <model> ' +
       'is an agy model id (lowercase letters, digits, dots and dashes, starting with a letter or digit, at most 64 ' +
       'characters, without an effort suffix such as -high); ' +
       `the advertised models are ${AGY_MODELS.join(', ')}`,

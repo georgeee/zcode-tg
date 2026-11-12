@@ -125,7 +125,7 @@ test('Bug 1: (a) persist closed and open sessions, simulate a restart, create ke
   }
 });
 
-test('Bug 2: (b) create with :low: response model and model_get = "gemini-3.8-flash:low" and spawn argv/effort is low', async () => {
+test('Bug 2: (b) create with :low: response model and model_get = "gemini-4-hydrogen:low" and spawn argv/effort is low', async () => {
   const dir = tmp('effort-low');
   const markerLog = path.join(dir, 'spawns.jsonl');
   process.env.FIXTURE_AGY_MARKER_LOG = markerLog;
@@ -145,23 +145,23 @@ test('Bug 2: (b) create with :low: response model and model_get = "gemini-3.8-fl
       try {
         const tg = makeNullTelegram(store, -100);
 
-        // 1. Create conversation with model "gemini-3.8-flash:low"
+        // 1. Create conversation with model "gemini-4-hydrogen:low"
         const topic = await tg.createForumTopic({ chatId: -100, name: 'low-effort-session' });
         const key = String(topic.message_thread_id);
-        const reqModel = 'gemini-3.8-flash:low';
+        const reqModel = 'gemini-4-hydrogen:low';
 
         store.setTopic(key, { chatId: -100, threadId: topic.message_thread_id, name: 'low-effort-session', backend: 'antigravity', model: reqModel, mode: 'yolo' });
 
         const created = await backend.createConversation({ workspaceDir: dir, model: reqModel });
 
-        // (b) Requirement: create response model is "gemini-3.8-flash:low"
-        assert.equal(created.model, 'gemini-3.8-flash:low');
+        // (b) Requirement: create response model is "gemini-4-hydrogen:low"
+        assert.equal(created.model, 'gemini-4-hydrogen:low');
 
         store.setTopic(key, { sessionId: created.sessionId, model: created.model });
 
-        // (b) Requirement: model_get returns "gemini-3.8-flash:low"
+        // (b) Requirement: model_get returns "gemini-4-hydrogen:low"
         const entry = store.getTopic(key);
-        assert.equal(entry.model, 'gemini-3.8-flash:low');
+        assert.equal(entry.model, 'gemini-4-hydrogen:low');
 
         // (b) Requirement: spawn argv/effort is low
         const spawns = readFileSync(markerLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
@@ -236,14 +236,14 @@ test('session_create with MCP gateway: model :low returns effective model in res
           method: 'tools/call',
           params: {
             name: 'session_create',
-            arguments: { name: 'test-low', backend: 'antigravity', model: 'gemini-3.8-flash:low' },
+            arguments: { name: 'test-low', backend: 'antigravity', model: 'gemini-4-hydrogen:low' },
           },
         }),
       });
       const data = await res.json();
       assert.equal(data.result.isError, false);
       const parsedRes = JSON.parse(data.result.content[0].text);
-      assert.equal(parsedRes.model, 'gemini-3.8-flash:low');
+      assert.equal(parsedRes.model, 'gemini-4-hydrogen:low');
 
       const mgRes = await fetch(url, {
         method: 'POST',
@@ -258,7 +258,7 @@ test('session_create with MCP gateway: model :low returns effective model in res
       const mgData = await mgRes.json();
       assert.equal(mgData.result.isError, false);
       const parsedMg = JSON.parse(mgData.result.content[0].text);
-      assert.equal(parsedMg.model, 'gemini-3.8-flash:low');
+      assert.equal(parsedMg.model, 'gemini-4-hydrogen:low');
     } finally {
       gw.close();
       store.close();

@@ -2104,9 +2104,9 @@ const AGY_MCP_MODELS = AGY_MODELS.flatMap((m) => [m, ...(AGY_MODEL_EFFORTS[m] ??
 //
 // ANTIGRAVITY (fourth backend, policy decided 2026-09-24 per George's
 // single-model decision, written up in CLAUDE.md's "Model policy" section):
-// exactly one model (gemini-3.8-flash) whose reasoning effort is the only
+// exactly one model (then gemini-3.8-flash; the default is gemini-4-hydrogen since 2026-11-12) whose reasoning effort was the only
 // switch. MCP callers express it as an effort-suffixed ref --
-// gemini-3.8-flash:low|medium|high (default medium via AGY_EFFORT) -- or the
+// <model>:low|medium|high (xhigh where the model offers it; default medium via AGY_EFFORT) -- or the
 // bare ref, which keeps the session's current effort. This is the form
 // parseAgyModelRef accepts; the backend maps it to agy's `--effort` flag at
 // spawn/resume time (never an effort-suffixed slug: agy hard-errors on that
@@ -2117,7 +2117,7 @@ function validateMcpModel(backend, model) {
   if (model == null) return undefined;
   if (backend === 'antigravity') {
     if (!parseAgyModelRef(model)) {
-      throw new Error(`model "${model}" is not a valid model ref for the antigravity backend; choose a model or an effort variant (<model>:low|medium|high), where <model> is an advertised model or any agy model id (lowercase letters, digits, dots and dashes, starting with a letter or digit, at most 64 characters, no -low/-medium/-high suffix): ${AGY_MCP_MODELS.join(', ')}`);
+      throw new Error(`model "${model}" is not a valid model ref for the antigravity backend; choose a model or an effort variant (<model>:low|medium|high|xhigh), where <model> is an advertised model or any agy model id (lowercase letters, digits, dots and dashes, starting with a letter or digit, at most 64 characters, no -low/-medium/-high/-xhigh suffix): ${AGY_MCP_MODELS.join(', ')}`);
     }
     return model;
   }

@@ -68,11 +68,11 @@ async function runOneTurn(backend, events, sessionId, text) {
 
 test('parseAgyModelRef: the whole model surface is one ref plus effort variants', () => {
   assert.deepEqual(parseAgyModelRef(AGY_MODEL_REF), { model: AGY_MODEL_REF, effort: null });
-  assert.deepEqual(parseAgyModelRef('gemini-3.8-flash:low'), { model: AGY_MODEL_REF, effort: 'low' });
-  assert.deepEqual(parseAgyModelRef('gemini-3.8-flash:high'), { model: AGY_MODEL_REF, effort: 'high' });
+  assert.deepEqual(parseAgyModelRef('gemini-4-hydrogen:low'), { model: AGY_MODEL_REF, effort: 'low' });
+  assert.deepEqual(parseAgyModelRef('gemini-4-hydrogen:high'), { model: AGY_MODEL_REF, effort: 'high' });
   assert.equal(parseAgyModelRef('GPT-5.6'), null); // uppercase: not an agy id
-  assert.equal(parseAgyModelRef('gemini-3.8-flash:extreme'), null);
-  assert.equal(parseAgyModelRef('gemini-3.8-flash-high'), null); // slug-suffix form is agy's hard-error trap
+  assert.equal(parseAgyModelRef('gemini-4-hydrogen:extreme'), null);
+  assert.equal(parseAgyModelRef('gemini-4-hydrogen-high'), null); // slug-suffix form is agy's hard-error trap
   for (const m of AGY_MODELS) {
     assert.deepEqual(parseAgyModelRef(m), { model: m, effort: null });
     for (const eff of AGY_MODEL_EFFORTS[m]) {
@@ -103,7 +103,7 @@ test('createConversation: prefixed session id, the one model, settings seeded on
   assert.deepEqual(spawns[0].argv, [
     '--input-format', 'stream-json', '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
-    '--model', 'gemini-3.8-flash', '--effort', 'medium',
+    '--model', 'gemini-4-hydrogen', '--effort', 'medium',
   ]);
   await backend.stop();
 });
@@ -396,7 +396,7 @@ test('the private cwd: agy runs in a 0700 agent directory, not the workspace; th
   assert.ok(first.delivered.endsWith('\n\none'));
   assert.equal(second.delivered, 'two', 'the note rides on the first turn of each child only');
   // setModel respawns: the workspace survives the respawn (not the child's cwd).
-  await backend.setModel(sessionId, 'gemini-3.8-flash:high');
+  await backend.setModel(sessionId, 'gemini-4-hydrogen:high');
   await runOneTurn(backend, events, sessionId, 'three');
   const third = readFileSync(turnLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).at(-1);
   assert.equal(third.workspace, workspace);
@@ -556,12 +556,12 @@ test('setModel: the effort knob -- respawn with the new --effort, same conversat
   // Anything that is not the ref or an effort variant: refused with a clear error.
   await assert.rejects(() => backend.setModel(sessionId, 'GPT 5.6'), /not supported by the antigravity backend/);
   await assert.rejects(() => backend.setModel(sessionId, '--help'), /not supported by the antigravity backend/);
-  await assert.rejects(() => backend.setModel(sessionId, 'gemini-3.8-flash:extreme'), /effort variants/);
+  await assert.rejects(() => backend.setModel(sessionId, 'gemini-4-hydrogen:extreme'), /effort variants/);
   await assert.rejects(() => backend.setModel(sessionId, 'gemini-4-argon-high'), /not supported by the antigravity backend/);
   await assert.rejects(() => backend.setModel(sessionId, 'gemini-4-argon:max'), /effort variants/);
 
   const spawnsBefore = readFileSync(markerLog, 'utf8').trim().split('\n').length;
-  await backend.setModel(sessionId, 'gemini-3.8-flash:high');
+  await backend.setModel(sessionId, 'gemini-4-hydrogen:high');
   const terminal = await runOneTurn(backend, events, sessionId, 'hello high effort');
   assert.equal(terminal.params.status, 'success');
   const spawns = readFileSync(markerLog, 'utf8').trim().split('\n').slice(spawnsBefore).map((l) => JSON.parse(l));
@@ -659,7 +659,7 @@ test('listModels: exactly one ref -- the single-model decision', async (t) => {
   const models = await backend.listModels();
   assert.equal(models.length, 3);
   assert.deepEqual(models, [
-    { ref: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash' },
+    { ref: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen' },
     { ref: 'gemini-4-argon', label: 'Gemini 4 Argon' },
     { ref: 'gemini-4-carbon', label: 'Gemini 4 Carbon' },
   ]);
@@ -1021,6 +1021,12 @@ test("B1: parseAgyModelRef accepts the three advertised models and any well-form
   assert.deepEqual(parseAgyModelRef("gemini-3.1-pro"), { model: "gemini-3.1-pro", effort: null });
   assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen"), { model: "gemini-4-hydrogen", effort: null });
   assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen:high"), { model: "gemini-4-hydrogen", effort: "high" });
+  // xhigh: hydrogen offers it, argon and carbon do not; an unlisted id may ask (agy judges).
+  assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen:xhigh"), { model: "gemini-4-hydrogen", effort: "xhigh" });
+  assert.equal(parseAgyModelRef("gemini-4-argon:xhigh"), null);
+  assert.equal(parseAgyModelRef("gemini-4-carbon:xhigh"), null);
+  assert.deepEqual(parseAgyModelRef("gemini-5-helium:xhigh"), { model: "gemini-5-helium", effort: "xhigh" });
+  assert.equal(parseAgyModelRef("gemini-4-hydrogen-xhigh"), null);
   assert.deepEqual(parseAgyModelRef("a".repeat(64)), { model: "a".repeat(64), effort: null });
   // An id that names an Object.prototype property is just an id (the tables have no prototype).
   assert.deepEqual(parseAgyModelRef("constructor"), { model: "constructor", effort: null });
@@ -1032,7 +1038,7 @@ test("B1: parseAgyModelRef accepts the three advertised models and any well-form
     "gemini-4-hydrogen-medium", "gemini-4-hydrogen-low", "gemini-4\nx", null, 42]) {
     assert.equal(parseAgyModelRef(bad), null, `refused: ${JSON.stringify(bad)}`);
   }
-  assert.deepEqual(parseAgyModelRef("gemini-3.8-flash:medium"), { model: "gemini-3.8-flash", effort: "medium" });
+  assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen:medium"), { model: "gemini-4-hydrogen", effort: "medium" });
   assert.deepEqual(parseAgyModelRef("gemini-4-argon:medium"), { model: "gemini-4-argon", effort: "medium" });
   assert.deepEqual(parseAgyModelRef("gemini-4-carbon:medium"), { model: "gemini-4-carbon", effort: "medium" });
   assert.deepEqual(parseAgyModelRef("gemini-4-carbon"), { model: "gemini-4-carbon", effort: null });
@@ -1071,18 +1077,18 @@ test("B3 + A3: setModel failure rejects, preserves previous model/effort for nex
   const terminal1 = await runOneTurn(backend, events, sessionId, "first turn argon");
   assert.equal(terminal1.params.status, "success");
 
-  // Cause fake to reject gemini-3.8-flash
-  process.env.FIXTURE_AGY_REJECT_MODEL = "gemini-3.8-flash";
+  // Cause fake to reject gemini-4-hydrogen
+  process.env.FIXTURE_AGY_REJECT_MODEL = "gemini-4-hydrogen";
   t.after(() => { delete process.env.FIXTURE_AGY_REJECT_MODEL; });
 
   // Simulate modelSet store flow with rollback
   const entry = store.getTopic(key);
   const previousModel = entry.model;
-  store.setTopic(key, { ...entry, model: "gemini-3.8-flash:high" });
+  store.setTopic(key, { ...entry, model: "gemini-4-hydrogen:high" });
 
   await assert.rejects(async () => {
     try {
-      await backend.setModel(sessionId, "gemini-3.8-flash:high");
+      await backend.setModel(sessionId, "gemini-4-hydrogen:high");
     } catch (e) {
       store.setTopic(key, { ...entry, model: previousModel });
       throw e;

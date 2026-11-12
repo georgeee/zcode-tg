@@ -50,7 +50,7 @@ export function createMcpGateway({
   codexMcpModels = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'],
   // The antigravity family's ADVERTISED refs over MCP (the bridge passes its
   // own list, derived from AGY_MODELS): three models plus their effort
-  // variants. Other well-formed agy ids pass too (AGY_MCP_MODEL_PATTERN).
+  // variants (hydrogen's four, argon's and carbon's three). Other well-formed agy ids pass too (AGY_MCP_MODEL_PATTERN).
   agyMcpModels = AGY_MODELS.flatMap((m) => [m, ...(AGY_MODEL_EFFORTS[m] ?? ['low', 'medium', 'high']).map((eff) => `${m}:${eff}`)]),
 }) {
   // Two listeners, one JSON-RPC core:
@@ -254,7 +254,7 @@ export function createMcpGateway({
             type: 'string',
             anyOf: [{ enum: [...codexMcpModels, ...agyMcpModels] }, { pattern: AGY_MCP_MODEL_PATTERN }],
             description:
-              "Codex only (except where noted): picks which of this bridge's configured Codex MCP models the session runs -- exactly the codex entries of the enum advertised here; anything else is refused. The default when omitted is the bridge's CODEX_DEFAULT_MODEL. Codex's own server-side default (gpt-6-astra, its newest and most expensive model) is deliberately NOT offered: MCP is not a channel for reaching it. For backend 'antigravity' the enum's gemini-3.8-flash, gemini-4-argon and gemini-4-carbon entries are the advertised models, and any other agy model id matching the pattern is passed to agy as is (agy judges it: a wrong id fails at the first turn with agy's error; an effort-suffixed slug such as gemini-4-argon-high is refused -- use gemini-4-argon:high): the bare ref keeps the bridge's AGY_EFFORT default (medium), the :low/:medium/:high suffixes pick reasoning effort.",
+              "Codex only (except where noted): picks which of this bridge's configured Codex MCP models the session runs -- exactly the codex entries of the enum advertised here; anything else is refused. The default when omitted is the bridge's CODEX_DEFAULT_MODEL. Codex's own server-side default (gpt-6-astra, its newest and most expensive model) is deliberately NOT offered: MCP is not a channel for reaching it. For backend 'antigravity' the enum's gemini-4-hydrogen (the default), gemini-4-argon and gemini-4-carbon entries are the advertised models, and any other agy model id matching the pattern is passed to agy as is (agy judges it: a wrong id fails at the first turn with agy's error; an effort-suffixed slug such as gemini-4-argon-high is refused -- use gemini-4-argon:high): the bare ref keeps the bridge's AGY_EFFORT default (medium), the :low/:medium/:high suffixes pick reasoning effort (gemini-4-hydrogen also offers :xhigh).",
           },
         },
         required: ['name'],
@@ -325,7 +325,7 @@ export function createMcpGateway({
     {
       name: 'model_set',
       description:
-        "Switch a session's model. Codex accepts only this bridge's configured Codex MCP models -- the same list session_create's model argument offers (exactly the enum advertised here). Antigravity accepts its three advertised models (gemini-3.8-flash, gemini-4-argon, gemini-4-carbon), any other agy model id matching the pattern (passed to agy as is; a wrong id fails at the next turn with agy's error), or an effort variant (:low|:medium|:high) of either -- model and effort apply from the session's next turn (they are spawn-time flags; the session resumes with the new model and effort). zcode and mock sessions, and anything outside the list and the pattern, all refuse with a clear error, not a silent no-op.",
+        "Switch a session's model. Codex accepts only this bridge's configured Codex MCP models -- the same list session_create's model argument offers (exactly the enum advertised here). Antigravity accepts its three advertised models (gemini-4-hydrogen, gemini-4-argon, gemini-4-carbon), any other agy model id matching the pattern (passed to agy as is; a wrong id fails at the next turn with agy's error), or an effort variant (:low|:medium|:high, and :xhigh for gemini-4-hydrogen or an unlisted id) of either -- model and effort apply from the session's next turn (they are spawn-time flags; the session resumes with the new model and effort). zcode and mock sessions, and anything outside the list and the pattern, all refuse with a clear error, not a silent no-op.",
       inputSchema: {
         type: 'object',
         properties: {

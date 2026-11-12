@@ -44,7 +44,7 @@ function startClient(t, { agyHome, state, cwd, conversationId, marker, extraEnv 
     agyBin: FIXTURE,
     agyHome,
     cwd,
-    model: 'gemini-3.8-flash',
+    model: 'gemini-4-hydrogen',
     effort: 'medium',
     env: {
       ...(state ? { FIXTURE_AGY_STATE: state } : {}),
@@ -74,17 +74,17 @@ async function waitFor(fn, what, ms = 10_000) {
 const resultOf = (events) => events.find((e) => e.event === 'result')?.result;
 
 test('buildArgv: the exact spawn contract (stream-json both sides, NO remote control, auto mode, bare slug + effort)', () => {
-  const client = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-3.8-flash', effort: 'high' });
+  const client = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-4-hydrogen', effort: 'high' });
   assert.deepEqual(client.buildArgv(null), [
     '--input-format', 'stream-json', '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
-    '--model', 'gemini-3.8-flash', '--effort', 'high',
+    '--model', 'gemini-4-hydrogen', '--effort', 'high',
   ]);
   // Resume appends --conversation; nothing else moves (the drivers' argv order).
   assert.deepEqual(client.buildArgv('abc-123'), [
     '--input-format', 'stream-json', '--output-format', 'stream-json',
     '--dangerously-skip-permissions',
-    '--model', 'gemini-3.8-flash', '--effort', 'high',
+    '--model', 'gemini-4-hydrogen', '--effort', 'high',
     '--conversation', 'abc-123',
   ]);
 
@@ -121,7 +121,7 @@ test('spawn: init event arrives with conversation id, always-proceed mode, and H
     const init = await waitFor(() => events.find((e) => e.event === 'init'), 'init');
     assert.ok(init.conversation_id, 'init carries the conversation id');
     assert.equal(init.init.permission_mode, 'always-proceed');
-    assert.equal(init.init.model, 'gemini-3.8-flash'); // the BARE slug is echoed
+    assert.equal(init.init.model, 'gemini-4-hydrogen'); // the BARE slug is echoed
     const m = JSON.parse(readFileSync(marker, 'utf8'));
     assert.equal(m.home, agyHome, 'the child ran with HOME=agyHome (the credential HOME)');
     // Owner decision 2026-09-27: bridge sessions never register with the
@@ -206,7 +206,7 @@ test('a send to a child that already exited rejects with the delivery error -- n
     agyBin: FIXTURE,
     agyHome: path.join(dir, 'home'),
     cwd: dir,
-    model: 'gemini-3.8-flash',
+    model: 'gemini-4-hydrogen',
     effort: '',
   });
   const exits = [];
@@ -280,7 +280,7 @@ test('model-selection rule: bare slug without --effort is refused exactly like t
     agyBin: FIXTURE,
     agyHome: path.join(dir, 'home'),
     cwd: dir,
-    model: 'gemini-3.8-flash',
+    model: 'gemini-4-hydrogen',
     effort: '', // the invalid form: bare slug, no effort
   });
   const events = [];
@@ -345,7 +345,7 @@ test('ensureAgySettings: is idempotent and tolerates a corrupt file', (t) => {
 // servers directly as the agent account (measured, agy 1.2.9 under strace).
 test('buildArgv: never attaches the workspace (--add-dir or any dir-ish flag), on every path', () => {
   for (const skipPermissions of [true, false]) {
-    const client = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-3.8-flash', effort: 'high', skipPermissions });
+    const client = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-4-hydrogen', effort: 'high', skipPermissions });
     for (const id of [null, 'abc-123']) {
       const argv = client.buildArgv(id);
       assert.ok(!argv.some((a) => /^--(add-dir|include-directories|dir|workspace|project)\b/.test(a)), `argv attaches a directory: ${argv.join(' ')}`);

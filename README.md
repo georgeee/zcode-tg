@@ -453,7 +453,7 @@ candidate saying why; an explicit `chat_id` always wins.
 
 The fourth backend runs **Google's Antigravity CLI** (`agy`, the gemini-cli
 successor on a Google AI Pro subscription) in its headless **stream-json**
-mode, offering three models — `gemini-3.8-flash` (default), `gemini-4-argon`
+mode, offering three models — `gemini-4-hydrogen` (default; it replaced `gemini-3.8-flash` on 2026-11-12), `gemini-4-argon`
 and `gemini-4-carbon`, plus any other agy model id over MCP
 — with reasoning effort as an optional knob (`--effort
 low|medium|high`, default `medium`). Where codex multiplexes every thread over one `codex app-server`
@@ -533,14 +533,14 @@ usual config-file pointer. The Telegram path is unchanged when configured.
 
 **Model policy over MCP** (written up with the others in CLAUDE.md):
 `model_get` reports `switchable: true`, and `model_set` / `session_create`'s
-`model` argument accept any of the three advertised models (`gemini-3.8-flash`,
+`model` argument accept any of the three advertised models (`gemini-4-hydrogen`,
 `gemini-4-argon`, `gemini-4-carbon`) — and, since 2026-11-12, **any other
 well-formed agy model id** (lowercase letters, digits, dots and dashes,
-starting with a letter or digit, at most 64 characters, no `-low|-medium|-high`
-suffix), passed to agy as is so a model Google adds server-side needs no
+starting with a letter or digit, at most 64 characters, no `-low|-medium|-high|-xhigh`
+suffix; effort low|medium|high|xhigh), passed to agy as is so a model Google adds server-side needs no
 bridge release; agy judges it, and a wrong id fails at the next turn with
 agy's own error — as a bare ref (keeps the current effort)
-or an effort variant — e.g. `gemini-3.8-flash:low|medium|high`. Model and
+or an effort variant — e.g. `gemini-4-hydrogen:low|medium|high|xhigh` (argon and carbon: low|medium|high). Model and
 effort are spawn-time flags, so a switch stops the session's process and the
 next turn resumes the SAME conversation with the new flags; anything malformed is
 refused with a clear error, never silently ignored. The MCP schema advertises
