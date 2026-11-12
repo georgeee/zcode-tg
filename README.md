@@ -454,7 +454,7 @@ candidate saying why; an explicit `chat_id` always wins.
 The fourth backend runs **Google's Antigravity CLI** (`agy`, the gemini-cli
 successor on a Google AI Pro subscription) in its headless **stream-json**
 mode, offering three models — `gemini-3.8-flash` (default), `gemini-4-argon`
-and `gemini-4-carbon`
+and `gemini-4-carbon`, plus any other agy model id over MCP
 — with reasoning effort as an optional knob (`--effort
 low|medium|high`, default `medium`). Where codex multiplexes every thread over one `codex app-server`
 process, agy's protocol has no multiplexing: this backend keeps **one `agy`
@@ -533,13 +533,19 @@ usual config-file pointer. The Telegram path is unchanged when configured.
 
 **Model policy over MCP** (written up with the others in CLAUDE.md):
 `model_get` reports `switchable: true`, and `model_set` / `session_create`'s
-`model` argument accept any of the three models (`gemini-3.8-flash`,
-`gemini-4-argon`, `gemini-4-carbon`) as a bare ref (keeps the current effort)
+`model` argument accept any of the three advertised models (`gemini-3.8-flash`,
+`gemini-4-argon`, `gemini-4-carbon`) — and, since 2026-11-12, **any other
+well-formed agy model id** (lowercase letters, digits, dots and dashes,
+starting with a letter or digit, at most 64 characters, no `-low|-medium|-high`
+suffix), passed to agy as is so a model Google adds server-side needs no
+bridge release; agy judges it, and a wrong id fails at the next turn with
+agy's own error — as a bare ref (keeps the current effort)
 or an effort variant — e.g. `gemini-3.8-flash:low|medium|high`. Model and
 effort are spawn-time flags, so a switch stops the session's process and the
-next turn resumes the SAME conversation with the new flags; anything else is
-refused with a clear error, never silently ignored. `listModels()` offers all
-three models.
+next turn resumes the SAME conversation with the new flags; anything malformed is
+refused with a clear error, never silently ignored. The MCP schema advertises
+the three models' refs as an enum plus the open-id pattern; `listModels()`
+offers the three advertised models.
 
 **`usage_get` on an antigravity-default bridge is local accounting only.**
 There is no remaining-quota number headless (agy's `/usage` with its

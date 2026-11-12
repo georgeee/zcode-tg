@@ -767,12 +767,12 @@ async function scenario9() {
     const ms = tools.find((t) => t.name === 'model_set');
     check(
       'tools/list: session_create\u2019s model enum is the configured codex list plus the antigravity family',
-      JSON.stringify(sc?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
+      JSON.stringify(sc?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
       JSON.stringify(sc?.inputSchema?.properties?.model),
     );
     check(
       'tools/list: model_set\u2019s model enum is the configured codex list plus the antigravity family',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
+      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {
@@ -802,7 +802,7 @@ async function scenario9() {
     const ms = (lines[0]?.result?.tools ?? []).find((t) => t.name === 'model_set');
     check(
       'with CODEX_MCP_MODELS unset the enum is today\u2019s three tiers plus the antigravity family',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
+      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {
@@ -1042,8 +1042,8 @@ async function scenario11() {
     const mg = await call(4, 'model_get', { key });
     const got = mg?.result?.isError === false ? JSON.parse(mg.result.content[0].text) : null;
     check('(c) model_get: antigravity is switchable (the effort knob)', got?.switchable === true && got?.backend === 'antigravity', JSON.stringify(got));
-    const refused = await call(5, 'model_set', { key, model: 'gpt-5.6-terra' });
-    check('(c) model_set to a codex ref is REFUSED with the effort-variant hint', refused?.result?.isError === true && /effort variant/.test(refused.result.content?.[0]?.text || ''), JSON.stringify(refused).slice(0, 300));
+    const refused = await call(5, 'model_set', { key, model: 'GPT-5.6-terra' });
+    check('(c) model_set to a malformed ref is REFUSED with the effort-variant hint', refused?.result?.isError === true && /effort variant/.test(refused.result.content?.[0]?.text || ''), JSON.stringify(refused).slice(0, 300));
     const high = await call(6, 'model_set', { key, model: 'gemini-3.8-flash:high' });
     check('(c) model_set to :high is accepted', high?.result?.isError === false && JSON.parse(high.result.content[0].text).model === 'gemini-3.8-flash:high', JSON.stringify(high).slice(0, 300));
     await call(7, 'message_send', { key, text: 'after the effort switch' });

@@ -91,7 +91,10 @@ if (process.env.FIXTURE_AGY_EXIT_BEFORE_INIT) {
 // bare slug + --effort is the only valid form; an effort-suffixed slug, or
 // the bare slug without --effort, is a hard startup error -- a `result`
 // envelope with status ERROR, NO init event, exit 1.
-const BARE_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon'];
+// FIXTURE_AGY_EXTRA_MODELS (comma list): models the account serves beyond
+// these, as a new Google model appears server-side without a new agy.
+const BARE_MODELS = ['gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon',
+  ...(process.env.FIXTURE_AGY_EXTRA_MODELS || '').split(',').filter(Boolean)];
 const ALLOWED_EFFORTS = {
   'gemini-3.8-flash': ['low', 'medium', 'high'],
   'gemini-4-argon': ['low', 'medium', 'high'],

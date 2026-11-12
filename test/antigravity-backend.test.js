@@ -70,7 +70,7 @@ test('parseAgyModelRef: the whole model surface is one ref plus effort variants'
   assert.deepEqual(parseAgyModelRef(AGY_MODEL_REF), { model: AGY_MODEL_REF, effort: null });
   assert.deepEqual(parseAgyModelRef('gemini-3.8-flash:low'), { model: AGY_MODEL_REF, effort: 'low' });
   assert.deepEqual(parseAgyModelRef('gemini-3.8-flash:high'), { model: AGY_MODEL_REF, effort: 'high' });
-  assert.equal(parseAgyModelRef('gpt-5.6-terra'), null);
+  assert.equal(parseAgyModelRef('GPT-5.6'), null); // uppercase: not an agy id
   assert.equal(parseAgyModelRef('gemini-3.8-flash:extreme'), null);
   assert.equal(parseAgyModelRef('gemini-3.8-flash-high'), null); // slug-suffix form is agy's hard-error trap
   for (const m of AGY_MODELS) {
@@ -79,7 +79,6 @@ test('parseAgyModelRef: the whole model surface is one ref plus effort variants'
       assert.deepEqual(parseAgyModelRef(`${m}:${eff}`), { model: m, effort: eff });
     }
   }
-  assert.equal(parseAgyModelRef('gemini-3.1-pro'), null);
   assert.equal(parseAgyModelRef('gemini-4-argon-high'), null);
   assert.equal(parseAgyModelRef('gemini-4-argon:max'), null);
   assert.equal(parseAgyModelRef('gemini-4-carbon-high'), null);
@@ -555,7 +554,8 @@ test('setModel: the effort knob -- respawn with the new --effort, same conversat
   // Bare ref: a no-op success (it is the only model).
   await backend.setModel(sessionId, AGY_MODEL_REF);
   // Anything that is not the ref or an effort variant: refused with a clear error.
-  await assert.rejects(() => backend.setModel(sessionId, 'gpt-5.6-terra'), /not supported by the antigravity backend/);
+  await assert.rejects(() => backend.setModel(sessionId, 'GPT 5.6'), /not supported by the antigravity backend/);
+  await assert.rejects(() => backend.setModel(sessionId, '--help'), /not supported by the antigravity backend/);
   await assert.rejects(() => backend.setModel(sessionId, 'gemini-3.8-flash:extreme'), /effort variants/);
   await assert.rejects(() => backend.setModel(sessionId, 'gemini-4-argon-high'), /not supported by the antigravity backend/);
   await assert.rejects(() => backend.setModel(sessionId, 'gemini-4-argon:max'), /effort variants/);
@@ -596,6 +596,32 @@ test('setModel: the effort knob -- respawn with the new --effort, same conversat
   assert.equal(respawnNext.argv[respawnNext.argv.indexOf('--effort') + 1], 'high');
 
   await backend.stop();
+});
+
+test('setModel: an unlisted model id reaches agy as is, and agy judges it', async (t) => {
+  const dir = tmp('setmodel-open');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const markerLog = path.join(dir, 'spawns.jsonl');
+  process.env.FIXTURE_AGY_MARKER_LOG = markerLog;
+  process.env.FIXTURE_AGY_EXTRA_MODELS = 'gemini-4-hydrogen';
+  t.after(() => { delete process.env.FIXTURE_AGY_MARKER_LOG; delete process.env.FIXTURE_AGY_EXTRA_MODELS; });
+  const { backend, events } = makeBackend(dir);
+  t.after(() => backend.stop()); // even when an assertion fails, so no agy child outlives the test
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+
+  // The account serves it: the respawn carries the bare slug plus --effort.
+  const before = readFileSync(markerLog, 'utf8').trim().split('\n').length;
+  await backend.setModel(sessionId, 'gemini-4-hydrogen:high');
+  const terminal = await runOneTurn(backend, events, sessionId, 'hello hydrogen');
+  assert.equal(terminal.params.status, 'success');
+  const respawn = readFileSync(markerLog, 'utf8').trim().split('\n').slice(before).map((l) => JSON.parse(l)).at(-1);
+  assert.equal(respawn.argv[respawn.argv.indexOf('--model') + 1], 'gemini-4-hydrogen');
+  assert.equal(respawn.argv[respawn.argv.indexOf('--effort') + 1], 'high');
+  assert.ok(respawn.argv.includes('--conversation'), 'the respawn resumed the SAME conversation');
+
+  // The account does not serve it: agy's own refusal surfaces at model_set
+  // (setModel awaits the respawn's init), not as a silent fallback.
+  await assert.rejects(() => backend.setModel(sessionId, 'gemini-9-nonesuch:low'), /unsupported model|did not initialize|exited/);
 });
 
 test('usageSnapshot: local accounting accumulates across turns and sessions, quota error stashed', async (t) => {
@@ -982,9 +1008,18 @@ test("requirement d: caps retries at 2 times (3 attempts total)", async (t) => {
   assert.equal(retry3, undefined, "retry 3 must not be attempted (max 2 retries)");
 });
 
-test("B1: parseAgyModelRef accepts only the three offered models", () => {
-  assert.equal(parseAgyModelRef("gemini-3.1-pro"), null);
-  assert.equal(parseAgyModelRef("gemini-3.1-pro:high"), null);
+test("B1: parseAgyModelRef accepts the three advertised models and any well-formed agy id", () => {
+  // Open ids (George, 2026-11-12): an unlisted, well-formed id passes to agy as is.
+  assert.deepEqual(parseAgyModelRef("gemini-3.1-pro"), { model: "gemini-3.1-pro", effort: null });
+  assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen"), { model: "gemini-4-hydrogen", effort: null });
+  assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen:high"), { model: "gemini-4-hydrogen", effort: "high" });
+  assert.deepEqual(parseAgyModelRef("a".repeat(64)), { model: "a".repeat(64), effort: null });
+  // ...and everything malformed is still refused.
+  for (const bad of ["", "a".repeat(65), "-gemini", ".gemini", "Gemini-4-hydrogen", "gemini 4", "gemini_4", "gemini/4",
+    "gemini-4-hydrogen:max", "gemini-4-hydrogen:", ":high", "gemini-4-hydrogen:high:low", "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-medium", "gemini-4-hydrogen-low", "gemini-4\nx", null, 42]) {
+    assert.equal(parseAgyModelRef(bad), null, `refused: ${JSON.stringify(bad)}`);
+  }
   assert.deepEqual(parseAgyModelRef("gemini-3.8-flash:medium"), { model: "gemini-3.8-flash", effort: "medium" });
   assert.deepEqual(parseAgyModelRef("gemini-4-argon:medium"), { model: "gemini-4-argon", effort: "medium" });
   assert.deepEqual(parseAgyModelRef("gemini-4-carbon:medium"), { model: "gemini-4-carbon", effort: "medium" });

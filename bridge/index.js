@@ -2111,11 +2111,13 @@ const AGY_MCP_MODELS = AGY_MODELS.flatMap((m) => [m, ...(AGY_MODEL_EFFORTS[m] ??
 // parseAgyModelRef accepts; the backend maps it to agy's `--effort` flag at
 // spawn/resume time (never an effort-suffixed slug: agy hard-errors on that
 // combination). Anything else is refused with a clear error, never ignored.
+// Since 2026-11-12 (George: open ids) the model half is any well-formed agy
+// id, not only AGY_MODELS: see isAgyModelId in antigravityBackend.js.
 function validateMcpModel(backend, model) {
   if (model == null) return undefined;
   if (backend === 'antigravity') {
     if (!parseAgyModelRef(model)) {
-      throw new Error(`model "${model}" is not offered for the antigravity backend; choose a model or an effort variant (<model>:low|medium|high): ${AGY_MCP_MODELS.join(', ')}`);
+      throw new Error(`model "${model}" is not a valid model ref for the antigravity backend; choose a model or an effort variant (<model>:low|medium|high), where <model> is an advertised model or any agy model id (lowercase letters, digits, dots and dashes, no -low/-medium/-high suffix): ${AGY_MCP_MODELS.join(', ')}`);
     }
     return model;
   }
@@ -3182,7 +3184,7 @@ async function main() {
       unixSocket: cfg.mcpUnixSocket,
       host: process.env.MCP_BIND || '127.0.0.1',
       codexMcpModels: CODEX_MCP_MODELS, // the schemas advertise exactly what validateMcpModel enforces
-      agyMcpModels: AGY_MCP_MODELS, // ditto for the antigravity family
+      agyMcpModels: AGY_MCP_MODELS, // the antigravity family's advertised refs; well-formed others pass too
       log: (m) => console.log(`[bridge] ${m}`),
     });
     mcp.wire({

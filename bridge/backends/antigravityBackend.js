@@ -75,21 +75,37 @@ export const AGY_MODEL_DEFAULT_EFFORT = {
   'gemini-4-carbon': null,
 };
 
+// OPEN MODEL IDS (George, 2026-11-12): AGY_MODELS is the ADVERTISED list
+// (the MCP schema's suggestions, listModels, the default), not a gate. Any
+// other id that is well formed is passed to agy as is, and agy judges it: a
+// wrong id fails at the first turn with agy's own error. Well formed =
+// lowercase letters, digits, dots and dashes, starting with a letter or
+// digit (so never an option to agy), at most 64 characters, and NOT ending
+// in -low/-medium/-high: that is how `agy models` prints effort variants,
+// and the slug-suffix form is agy's hard-error trap (see the arg rule).
+export const AGY_MODEL_ID_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
+const AGY_EFFORT_SUFFIX_RE = /-(low|medium|high)$/;
+// The MCP schema's form of the same rule (advisory: parseAgyModelRef, which
+// also refuses the -low/-medium/-high suffix, is the gate).
+export const AGY_MCP_MODEL_PATTERN = '^[a-z0-9][a-z0-9.-]{0,63}(:(low|medium|high))?$';
+
+export function isAgyModelId(id) {
+  return typeof id === 'string' && AGY_MODEL_ID_RE.test(id) && !AGY_EFFORT_SUFFIX_RE.test(id);
+}
+
 // parseAgyModelRef: <model> -> {model, effort: null} (backend
-// default effort); <model>:<effort> -> {model, effort};
+// default effort); <model>:<effort> -> {model, effort}; a listed model takes
+// only its AGY_MODEL_EFFORTS, any other well-formed id takes AGY_EFFORTS;
 // anything else -> null (caller refuses with a clear error).
 export function parseAgyModelRef(ref) {
   if (typeof ref !== 'string' || !ref) return null;
-  for (const m of AGY_MODELS) {
-    if (ref === m) return { model: m, effort: null };
-    if (ref.startsWith(`${m}:`)) {
-      const eff = ref.slice(m.length + 1);
-      const allowed = AGY_MODEL_EFFORTS[m] ?? AGY_EFFORTS;
-      if (allowed.includes(eff)) return { model: m, effort: eff };
-      return null;
-    }
-  }
-  return null;
+  const colon = ref.indexOf(':');
+  const model = colon < 0 ? ref : ref.slice(0, colon);
+  const effort = colon < 0 ? null : ref.slice(colon + 1);
+  if (!isAgyModelId(model)) return null;
+  if (effort === null) return { model, effort: null };
+  const allowed = AGY_MODEL_EFFORTS[model] ?? AGY_EFFORTS;
+  return allowed.includes(effort) ? { model, effort } : null;
 }
 
 // Envelope statuses (VERIFIED LIVE): SUCCESS / ERROR / INTERRUPTED / TIMEOUT.
@@ -806,8 +822,11 @@ export class AntigravityBackend extends Backend {
 
   _badModelRefError(model) {
     return new Error(
-      `model "${model}" is not supported by the antigravity backend: supported models are ${AGY_MODELS.join(', ')}; ` +
-      `effort variants are ${AGY_MODELS.map((m) => `${m}:${AGY_MODEL_EFFORTS[m].join('|')}`).join(', ')}`,
+      `model "${model}" is not supported by the antigravity backend: a model ref is <model> or one of its effort variants ` +
+      '<model>:low|medium|high, where <model> ' +
+      'is an agy model id (lowercase letters, digits, dots and dashes, starting with a letter or digit, at most 64 ' +
+      'characters, without an effort suffix such as -high); ' +
+      `the advertised models are ${AGY_MODELS.join(', ')}`,
     );
   }
 

@@ -551,13 +551,13 @@ test("requirement a: progress_get includes lastError when turn failed", () => {
   assert.deepEqual(out.lastError, { at: "2026-10-05T20:00:00Z", message: "⚠️ Turn failed: 503 UNAVAILABLE" });
 });
 
-test('tools/list: session_create and model_set advertise 12 antigravity model enum entries', async (t) => {
+test('tools/list: session_create and model_set advertise 12 antigravity model enum entries plus the open-id pattern', async (t) => {
   const h = await startGateway(t, {});
   t.after(() => h.close());
   const r = await rpc(h.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const sc = r.body.result.tools.find((x) => x.name === 'session_create');
   const ms = r.body.result.tools.find((x) => x.name === 'model_set');
-  const agyEntries = sc.inputSchema.properties.model.enum.filter((m) => m.startsWith('gemini-'));
+  const agyEntries = sc.inputSchema.properties.model.anyOf[0].enum.filter((m) => m.startsWith('gemini-'));
   assert.equal(agyEntries.length, 12);
   const expectedAgy = [
     'gemini-3.8-flash', 'gemini-3.8-flash:low', 'gemini-3.8-flash:medium', 'gemini-3.8-flash:high',
@@ -565,5 +565,12 @@ test('tools/list: session_create and model_set advertise 12 antigravity model en
     'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high',
   ];
   assert.deepEqual(agyEntries, expectedAgy);
-  assert.deepEqual(ms.inputSchema.properties.model.enum.filter((m) => m.startsWith('gemini-')), expectedAgy);
+  assert.deepEqual(ms.inputSchema.properties.model.anyOf[0].enum.filter((m) => m.startsWith('gemini-')), expectedAgy);
+  for (const schema of [sc.inputSchema.properties.model, ms.inputSchema.properties.model]) {
+    assert.equal(schema.anyOf.length, 2);
+    assert.equal(schema.anyOf[1].pattern, '^[a-z0-9][a-z0-9.-]{0,63}(:(low|medium|high))?$');
+    const re = new RegExp(schema.anyOf[1].pattern);
+    assert.ok(re.test('gemini-4-hydrogen') && re.test('gemini-4-hydrogen:high'));
+    assert.ok(!re.test('Gemini-4') && !re.test('-x') && !re.test('gemini-4:max') && !re.test('a'.repeat(65)));
+  }
 });
