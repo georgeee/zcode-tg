@@ -551,7 +551,7 @@ test("requirement a: progress_get includes lastError when turn failed", () => {
   assert.deepEqual(out.lastError, { at: "2026-10-05T20:00:00Z", message: "⚠️ Turn failed: 503 UNAVAILABLE" });
 });
 
-test('tools/list: session_create and model_set advertise 13 antigravity model enum entries plus the open-id pattern', async (t) => {
+test('tools/list: session_create and model_set advertise 18 antigravity model enum entries plus the open-id pattern', async (t) => {
   const h = await startGateway(t, {});
   t.after(() => h.close());
   const r = await rpc(h.url, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
