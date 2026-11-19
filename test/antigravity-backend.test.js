@@ -658,11 +658,12 @@ test('listModels: exactly one ref -- the single-model decision', async (t) => {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const { backend } = makeBackend(dir);
   const models = await backend.listModels();
-  assert.equal(models.length, 3);
+  assert.equal(models.length, 4);
   assert.deepEqual(models, [
     { ref: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen' },
     { ref: 'gemini-4-argon', label: 'Gemini 4 Argon' },
     { ref: 'gemini-4-carbon', label: 'Gemini 4 Carbon' },
+    { ref: 'gemini-4-neon', label: 'Gemini 4 Neon' },
   ]);
   assert.deepEqual(backend.listModes(), []);
 });
@@ -1017,13 +1018,16 @@ test("requirement d: caps retries at 2 times (3 attempts total)", async (t) => {
   assert.equal(retry3, undefined, "retry 3 must not be attempted (max 2 retries)");
 });
 
-test("B1: parseAgyModelRef accepts the three advertised models and any well-formed agy id", () => {
+test("B1: parseAgyModelRef accepts the four advertised models and any well-formed agy id", () => {
   // Open ids (George, 2026-11-12): an unlisted, well-formed id passes to agy as is.
   assert.deepEqual(parseAgyModelRef("gemini-3.1-pro"), { model: "gemini-3.1-pro", effort: null });
   assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen"), { model: "gemini-4-hydrogen", effort: null });
   assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen:high"), { model: "gemini-4-hydrogen", effort: "high" });
-  // xhigh: hydrogen offers it, argon and carbon do not; an unlisted id may ask (agy judges).
+  // xhigh: hydrogen and neon offer it, argon and carbon do not; an unlisted id may ask (agy judges).
   assert.deepEqual(parseAgyModelRef("gemini-4-hydrogen:xhigh"), { model: "gemini-4-hydrogen", effort: "xhigh" });
+  assert.deepEqual(parseAgyModelRef("gemini-4-neon:xhigh"), { model: "gemini-4-neon", effort: "xhigh" });
+  assert.equal(parseAgyModelRef("gemini-4-neon:max"), null);
+  assert.equal(parseAgyModelRef("gemini-4-neon-medium"), null);
   assert.equal(parseAgyModelRef("gemini-4-argon:xhigh"), null);
   assert.equal(parseAgyModelRef("gemini-4-carbon:xhigh"), null);
   assert.deepEqual(parseAgyModelRef("gemini-5-helium:xhigh"), { model: "gemini-5-helium", effort: "xhigh" });

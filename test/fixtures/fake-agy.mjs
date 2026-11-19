@@ -93,13 +93,14 @@ if (process.env.FIXTURE_AGY_EXIT_BEFORE_INIT) {
 // envelope with status ERROR, NO init event, exit 1.
 // FIXTURE_AGY_EXTRA_MODELS (comma list): models the account serves beyond
 // these, as a new Google model appears server-side without a new agy.
-const BARE_MODELS = ['gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon',
+const BARE_MODELS = ['gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon', 'gemini-4-neon',
   ...(process.env.FIXTURE_AGY_EXTRA_MODELS || '').split(',').filter(Boolean)];
 const ALLOWED_EFFORTS = {
   'gemini-4-hydrogen': ['low', 'medium', 'high', 'xhigh'],
   'gemini-3.8-flash': ['low', 'medium', 'high'],
   'gemini-4-argon': ['low', 'medium', 'high'],
   'gemini-4-carbon': ['low', 'medium', 'high'],
+  'gemini-4-neon': ['low', 'medium', 'high', 'xhigh'],
 };
 // An extra (FIXTURE_AGY_EXTRA_MODELS) model takes all four efforts.
 const allowed = (Object.hasOwn(ALLOWED_EFFORTS, model ?? '') ? ALLOWED_EFFORTS[model] : null) ?? ['low', 'medium', 'high', 'xhigh'];

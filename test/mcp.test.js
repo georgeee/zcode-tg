@@ -558,11 +558,12 @@ test('tools/list: session_create and model_set advertise 13 antigravity model en
   const sc = r.body.result.tools.find((x) => x.name === 'session_create');
   const ms = r.body.result.tools.find((x) => x.name === 'model_set');
   const agyEntries = sc.inputSchema.properties.model.anyOf[0].enum.filter((m) => m.startsWith('gemini-'));
-  assert.equal(agyEntries.length, 13);
+  assert.equal(agyEntries.length, 18);
   const expectedAgy = [
     'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh',
     'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high',
     'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high',
+    'gemini-4-neon', 'gemini-4-neon:low', 'gemini-4-neon:medium', 'gemini-4-neon:high', 'gemini-4-neon:xhigh',
   ];
   assert.deepEqual(agyEntries, expectedAgy);
   assert.deepEqual(ms.inputSchema.properties.model.anyOf[0].enum.filter((m) => m.startsWith('gemini-')), expectedAgy);

@@ -53,11 +53,12 @@ function formatAge(ms) {
 // Arg rule (VERIFIED LIVE, battery (d)): always the bare slug + --effort,
 // never an effort-suffixed slug, never the bare slug without --effort.
 // This now applies to every model in the antigravity family.
-export const AGY_MODELS = ['gemini-4-hydrogen', 'gemini-4-argon', 'gemini-4-carbon'];
+export const AGY_MODELS = ['gemini-4-hydrogen', 'gemini-4-argon', 'gemini-4-carbon', 'gemini-4-neon'];
 export const AGY_MODEL_LABELS = Object.freeze(Object.assign(Object.create(null), {
   'gemini-4-hydrogen': 'Gemini 4 Hydrogen',
   'gemini-4-argon': 'Gemini 4 Argon',
   'gemini-4-carbon': 'Gemini 4 Carbon',
+  'gemini-4-neon': 'Gemini 4 Neon',
 }));
 export const AGY_MODEL_REF = 'gemini-4-hydrogen';
 export const AGY_MODEL_LABEL = AGY_MODEL_LABELS[AGY_MODEL_REF];
@@ -67,12 +68,14 @@ export const AGY_MODEL_EFFORTS = Object.freeze(Object.assign(Object.create(null)
   'gemini-4-hydrogen': ['low', 'medium', 'high', 'xhigh'],
   'gemini-4-argon': ['low', 'medium', 'high'],
   'gemini-4-carbon': ['low', 'medium', 'high'],
+  'gemini-4-neon': ['low', 'medium', 'high', 'xhigh'],
 }));
 
 export const AGY_MODEL_DEFAULT_EFFORT = Object.freeze(Object.assign(Object.create(null), {
   'gemini-4-hydrogen': null,
   'gemini-4-argon': null,
   'gemini-4-carbon': null,
+  'gemini-4-neon': null,
 }));
 
 // The three per-model tables have NO prototype: with open ids an unlisted
