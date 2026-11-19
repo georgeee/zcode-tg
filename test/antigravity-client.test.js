@@ -107,6 +107,15 @@ test('buildArgv: the exact spawn contract (stream-json both sides, NO remote con
     '--dangerously-skip-permissions',
     '--model', 'gemini-4-carbon', '--effort', 'low',
   ]);
+
+  // A model without efforts (the orchestrators): the backend passes effort null.
+  const clientOrch = new AntigravityClient({ agyBin: 'agy', agyHome: '/h', cwd: '/w', model: 'gemini-pro-orchestrator-neon', effort: null });
+  assert.deepEqual(clientOrch.buildArgv('abc-123'), [
+    '--input-format', 'stream-json', '--output-format', 'stream-json',
+    '--dangerously-skip-permissions',
+    '--model', 'gemini-pro-orchestrator-neon',
+    '--conversation', 'abc-123',
+  ]);
 });
 
 test('spawn: init event arrives with conversation id, always-proceed mode, and HOME=agyHome in the child env', async (t) => {

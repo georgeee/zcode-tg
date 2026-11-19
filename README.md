@@ -453,8 +453,9 @@ candidate saying why; an explicit `chat_id` always wins.
 
 The fourth backend runs **Google's Antigravity CLI** (`agy`, the gemini-cli
 successor on a Google AI Pro subscription) in its headless **stream-json**
-mode, offering four models — `gemini-4-hydrogen` (default; it replaced `gemini-3.8-flash` on 2026-11-12), `gemini-4-argon`,
-`gemini-4-carbon` and `gemini-4-neon` (since 2026-11-19), plus any other agy model id over MCP
+mode, offering six models — `gemini-4-hydrogen` (default; it replaced `gemini-3.8-flash` on 2026-11-12), `gemini-4-argon`,
+`gemini-4-carbon`, `gemini-4-neon` (since 2026-11-19) and the orchestrators `gemini-pro-orchestrator-neon` and
+`gemini-pro-orchestrator-argon` (since 2026-11-19; they take no effort, agy refuses `--effort` for them), plus any other agy model id over MCP
 — with reasoning effort as an optional knob (`--effort
 low|medium|high`, plus `xhigh` for `gemini-4-hydrogen` and `gemini-4-neon`; default `medium`). Where codex multiplexes every thread over one `codex app-server`
 process, agy's protocol has no multiplexing: this backend keeps **one `agy`
@@ -533,8 +534,9 @@ usual config-file pointer. The Telegram path is unchanged when configured.
 
 **Model policy over MCP** (written up with the others in CLAUDE.md):
 `model_get` reports `switchable: true`, and `model_set` / `session_create`'s
-`model` argument accept any of the four advertised models (`gemini-4-hydrogen`,
-`gemini-4-argon`, `gemini-4-carbon`, `gemini-4-neon`) — and, since 2026-11-12, **any other
+`model` argument accept any of the six advertised models (`gemini-4-hydrogen`,
+`gemini-4-argon`, `gemini-4-carbon`, `gemini-4-neon`, `gemini-pro-orchestrator-neon`, `gemini-pro-orchestrator-argon`; the
+orchestrators as bare refs only) — and, since 2026-11-12, **any other
 well-formed agy model id** (lowercase letters, digits, dots and dashes,
 starting with a letter or digit, at most 64 characters, no `-low|-medium|-high|-xhigh`
 suffix; effort low|medium|high|xhigh), passed to agy as is so a model Google adds server-side needs no

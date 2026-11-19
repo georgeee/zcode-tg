@@ -767,12 +767,12 @@ async function scenario9() {
     const ms = tools.find((t) => t.name === 'model_set');
     check(
       'tools/list: session_create\u2019s model enum is the configured codex list plus the antigravity family',
-      JSON.stringify(sc?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high', 'gemini-4-neon', 'gemini-4-neon:low', 'gemini-4-neon:medium', 'gemini-4-neon:high', 'gemini-4-neon:xhigh']),
+      JSON.stringify(sc?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high', 'gemini-4-neon', 'gemini-4-neon:low', 'gemini-4-neon:medium', 'gemini-4-neon:high', 'gemini-4-neon:xhigh', 'gemini-pro-orchestrator-neon', 'gemini-pro-orchestrator-argon']),
       JSON.stringify(sc?.inputSchema?.properties?.model),
     );
     check(
       'tools/list: model_set\u2019s model enum is the configured codex list plus the antigravity family',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high', 'gemini-4-neon', 'gemini-4-neon:low', 'gemini-4-neon:medium', 'gemini-4-neon:high', 'gemini-4-neon:xhigh']),
+      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-terra', 'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high', 'gemini-4-neon', 'gemini-4-neon:low', 'gemini-4-neon:medium', 'gemini-4-neon:high', 'gemini-4-neon:xhigh', 'gemini-pro-orchestrator-neon', 'gemini-pro-orchestrator-argon']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {
@@ -802,7 +802,7 @@ async function scenario9() {
     const ms = (lines[0]?.result?.tools ?? []).find((t) => t.name === 'model_set');
     check(
       'with CODEX_MCP_MODELS unset the enum is today\u2019s three tiers plus the antigravity family',
-      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high', 'gemini-4-neon', 'gemini-4-neon:low', 'gemini-4-neon:medium', 'gemini-4-neon:high', 'gemini-4-neon:xhigh']),
+      JSON.stringify(ms?.inputSchema?.properties?.model?.anyOf?.[0]?.enum) === JSON.stringify(['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gemini-4-hydrogen', 'gemini-4-hydrogen:low', 'gemini-4-hydrogen:medium', 'gemini-4-hydrogen:high', 'gemini-4-hydrogen:xhigh', 'gemini-4-argon', 'gemini-4-argon:low', 'gemini-4-argon:medium', 'gemini-4-argon:high', 'gemini-4-carbon', 'gemini-4-carbon:low', 'gemini-4-carbon:medium', 'gemini-4-carbon:high', 'gemini-4-neon', 'gemini-4-neon:low', 'gemini-4-neon:medium', 'gemini-4-neon:high', 'gemini-4-neon:xhigh', 'gemini-pro-orchestrator-neon', 'gemini-pro-orchestrator-argon']),
       JSON.stringify(ms?.inputSchema?.properties?.model),
     );
   } finally {

@@ -633,6 +633,60 @@ test('setModel: an unlisted model id reaches agy as is, and agy judges it', asyn
   assert.equal(bare.argv[bare.argv.indexOf('--effort') + 1], backend.effort);
 });
 
+test('the orchestrator models spawn with --model alone: never --effort, which agy refuses for them', async (t) => {
+  const dir = tmp('orchestrator');
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const markerLog = path.join(dir, 'spawns.jsonl');
+  process.env.FIXTURE_AGY_MARKER_LOG = markerLog;
+  t.after(() => { delete process.env.FIXTURE_AGY_MARKER_LOG; });
+  const { backend, events } = makeBackend(dir);
+  t.after(() => backend.stop());
+  const spawnsSince = (n) => readFileSync(markerLog, 'utf8').trim().split('\n').slice(n).map((l) => JSON.parse(l));
+  const count = () => readFileSync(markerLog, 'utf8').trim().split('\n').length;
+
+  // session_create with an orchestrator: one spawn, no --effort, and a turn works.
+  const { sessionId, model } = await backend.createConversation({ workspaceDir: dir, model: 'gemini-pro-orchestrator-neon' });
+  assert.equal(model, 'gemini-pro-orchestrator-neon');
+  const created = spawnsSince(0);
+  assert.equal(created.length, 1, 'no retry: the first spawn initialized');
+  assert.equal(created[0].argv[created[0].argv.indexOf('--model') + 1], 'gemini-pro-orchestrator-neon');
+  assert.ok(!created[0].argv.includes('--effort'), `no --effort: ${created[0].argv.join(' ')}`);
+  assert.equal((await runOneTurn(backend, events, sessionId, 'hello orchestrator')).params.status, 'success');
+
+  // An effort suffix on an orchestrator is refused before any spawn.
+  await assert.rejects(() => backend.setModel(sessionId, 'gemini-pro-orchestrator-argon:high'), /effort variants/);
+
+  // model_set from an effort model to an orchestrator drops the effort...
+  const { sessionId: s2 } = await backend.createConversation({ workspaceDir: dir, model: 'gemini-4-neon:high' });
+  let n = count();
+  await backend.setModel(s2, 'gemini-pro-orchestrator-argon');
+  let spawn = spawnsSince(n).at(-1);
+  assert.equal(spawn.argv[spawn.argv.indexOf('--model') + 1], 'gemini-pro-orchestrator-argon');
+  assert.ok(!spawn.argv.includes('--effort') && spawn.argv.includes('--conversation'), spawn.argv.join(' '));
+  // ...the same ref again is a no-op (no respawn)...
+  n = count();
+  await backend.setModel(s2, 'gemini-pro-orchestrator-argon');
+  assert.equal(count(), n, 'a no-op model_set did not respawn');
+  // ...a reaped session respawns without --effort...
+  const sessionObj = backend._sessions.get(s2.split(':')[1]);
+  await backend._gcClose(sessionObj, null);
+  n = count();
+  assert.equal((await runOneTurn(backend, events, s2, 'after reap')).params.status, 'success');
+  spawn = spawnsSince(n).at(-1);
+  assert.ok(!spawn.argv.includes('--effort'), spawn.argv.join(' '));
+  // ...and going back to an effort model brings --effort back (the default).
+  n = count();
+  await backend.setModel(s2, 'gemini-4-neon');
+  spawn = spawnsSince(n).at(-1);
+  assert.equal(spawn.argv[spawn.argv.indexOf('--effort') + 1], backend.effort);
+
+  // The unadvertised gemini-pro-orchestrator (Carbon) also gets no --effort.
+  n = count();
+  await backend.setModel(s2, 'gemini-pro-orchestrator');
+  spawn = spawnsSince(n).at(-1);
+  assert.ok(!spawn.argv.includes('--effort'), spawn.argv.join(' '));
+});
+
 test('usageSnapshot: local accounting accumulates across turns and sessions, quota error stashed', async (t) => {
   const dir = tmp('usage');
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -658,12 +712,14 @@ test('listModels: exactly one ref -- the single-model decision', async (t) => {
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const { backend } = makeBackend(dir);
   const models = await backend.listModels();
-  assert.equal(models.length, 4);
+  assert.equal(models.length, 6);
   assert.deepEqual(models, [
     { ref: 'gemini-4-hydrogen', label: 'Gemini 4 Hydrogen' },
     { ref: 'gemini-4-argon', label: 'Gemini 4 Argon' },
     { ref: 'gemini-4-carbon', label: 'Gemini 4 Carbon' },
     { ref: 'gemini-4-neon', label: 'Gemini 4 Neon' },
+    { ref: 'gemini-pro-orchestrator-neon', label: 'Orchestrator (Neon)' },
+    { ref: 'gemini-pro-orchestrator-argon', label: 'Orchestrator (Argon)' },
   ]);
   assert.deepEqual(backend.listModes(), []);
 });

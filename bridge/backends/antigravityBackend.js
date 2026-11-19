@@ -52,13 +52,18 @@ function formatAge(ms) {
 
 // Arg rule (VERIFIED LIVE, battery (d)): always the bare slug + --effort,
 // never an effort-suffixed slug, never the bare slug without --effort.
-// This now applies to every model in the antigravity family.
-export const AGY_MODELS = ['gemini-4-hydrogen', 'gemini-4-argon', 'gemini-4-carbon', 'gemini-4-neon'];
+// Except the orchestrator models (agy 1.5.7+, verified live 2026-11-19): they
+// have no effort variants and agy REFUSES any --effort with them ("--effort is
+// not supported for model ..."), so they get the bare slug alone. Their
+// AGY_MODEL_EFFORTS entry is [] (see agyTakesEffort).
+export const AGY_MODELS = ['gemini-4-hydrogen', 'gemini-4-argon', 'gemini-4-carbon', 'gemini-4-neon', 'gemini-pro-orchestrator-neon', 'gemini-pro-orchestrator-argon'];
 export const AGY_MODEL_LABELS = Object.freeze(Object.assign(Object.create(null), {
   'gemini-4-hydrogen': 'Gemini 4 Hydrogen',
   'gemini-4-argon': 'Gemini 4 Argon',
   'gemini-4-carbon': 'Gemini 4 Carbon',
   'gemini-4-neon': 'Gemini 4 Neon',
+  'gemini-pro-orchestrator-neon': 'Orchestrator (Neon)',
+  'gemini-pro-orchestrator-argon': 'Orchestrator (Argon)',
 }));
 export const AGY_MODEL_REF = 'gemini-4-hydrogen';
 export const AGY_MODEL_LABEL = AGY_MODEL_LABELS[AGY_MODEL_REF];
@@ -69,6 +74,12 @@ export const AGY_MODEL_EFFORTS = Object.freeze(Object.assign(Object.create(null)
   'gemini-4-argon': ['low', 'medium', 'high'],
   'gemini-4-carbon': ['low', 'medium', 'high'],
   'gemini-4-neon': ['low', 'medium', 'high', 'xhigh'],
+  // No effort at all (agy refuses --effort for these). The unsuffixed
+  // gemini-pro-orchestrator (Carbon) is not advertised, but an open-id use of
+  // it must not get --effort either.
+  'gemini-pro-orchestrator-neon': [],
+  'gemini-pro-orchestrator-argon': [],
+  'gemini-pro-orchestrator': [],
 }));
 
 export const AGY_MODEL_DEFAULT_EFFORT = Object.freeze(Object.assign(Object.create(null), {
@@ -76,6 +87,8 @@ export const AGY_MODEL_DEFAULT_EFFORT = Object.freeze(Object.assign(Object.creat
   'gemini-4-argon': null,
   'gemini-4-carbon': null,
   'gemini-4-neon': null,
+  'gemini-pro-orchestrator-neon': null,
+  'gemini-pro-orchestrator-argon': null,
 }));
 
 // The three per-model tables have NO prototype: with open ids an unlisted
@@ -94,6 +107,13 @@ const AGY_EFFORT_SUFFIX_RE = /-(low|medium|high|xhigh)$/;
 // The MCP schema's form of the same rule (advisory: parseAgyModelRef, which
 // also refuses the -low/-medium/-high/-xhigh suffix, is the gate).
 export const AGY_MCP_MODEL_PATTERN = '^[a-z0-9][a-z0-9.-]{0,63}(:(low|medium|high|xhigh))?$';
+
+// agyTakesEffort: false for a model whose effort list is empty (the
+// orchestrators): it is spawned with --model alone. Unknown ids take effort.
+export function agyTakesEffort(model) {
+  const efforts = AGY_MODEL_EFFORTS[model];
+  return !efforts || efforts.length > 0;
+}
 
 export function isAgyModelId(id) {
   return typeof id === 'string' && AGY_MODEL_ID_RE.test(id) && !AGY_EFFORT_SUFFIX_RE.test(id);
@@ -787,7 +807,9 @@ export class AntigravityBackend extends Backend {
     if (!session) return;
     const targetModel = parsed.model;
     const defaultEffort = AGY_MODEL_DEFAULT_EFFORT[targetModel] ?? this.effort;
-    const targetEffort = parsed.effort ?? (session.model === targetModel ? session.effort : null) ?? defaultEffort;
+    const targetEffort = agyTakesEffort(targetModel)
+      ? (parsed.effort ?? (session.model === targetModel ? session.effort : null) ?? defaultEffort)
+      : null;
     if (session.model === targetModel && session.effort === targetEffort) return;
     const workspaceDir = session.workspaceDir ?? this.cwd;
     this._gcClose(session, null);
@@ -856,6 +878,8 @@ export class AntigravityBackend extends Backend {
     // an unmakeable, foreign-owned, symlinked or group/other-accessible one
     // refuses the spawn outright. agy never falls back to the workspace.
     ensurePrivateCwd(this.privateCwd);
+    // Every spawn passes here: a model without efforts never gets one.
+    if (!agyTakesEffort(model)) effort = null;
     const violation = this._configViolation();
     if (violation) throw new Error(this._quarantine(violation, this._keyOf({ rawId: conversationId })));
     await this._admitNewChild();

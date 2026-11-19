@@ -94,6 +94,7 @@ if (process.env.FIXTURE_AGY_EXIT_BEFORE_INIT) {
 // FIXTURE_AGY_EXTRA_MODELS (comma list): models the account serves beyond
 // these, as a new Google model appears server-side without a new agy.
 const BARE_MODELS = ['gemini-4-hydrogen', 'gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon', 'gemini-4-neon',
+  'gemini-pro-orchestrator', 'gemini-pro-orchestrator-neon', 'gemini-pro-orchestrator-argon',
   ...(process.env.FIXTURE_AGY_EXTRA_MODELS || '').split(',').filter(Boolean)];
 const ALLOWED_EFFORTS = {
   'gemini-4-hydrogen': ['low', 'medium', 'high', 'xhigh'],
@@ -101,14 +102,22 @@ const ALLOWED_EFFORTS = {
   'gemini-4-argon': ['low', 'medium', 'high'],
   'gemini-4-carbon': ['low', 'medium', 'high'],
   'gemini-4-neon': ['low', 'medium', 'high', 'xhigh'],
+  // The orchestrators take NO effort: real agy 1.5.7+ refuses any --effort
+  // with them ("--effort is not supported for model ...", verified live).
+  'gemini-pro-orchestrator': [],
+  'gemini-pro-orchestrator-neon': [],
+  'gemini-pro-orchestrator-argon': [],
 };
 // An extra (FIXTURE_AGY_EXTRA_MODELS) model takes all four efforts.
 const allowed = (Object.hasOwn(ALLOWED_EFFORTS, model ?? '') ? ALLOWED_EFFORTS[model] : null) ?? ['low', 'medium', 'high', 'xhigh'];
-if (!BARE_MODELS.includes(model) || !allowed.includes(effort)) {
+const effortless = allowed.length === 0;
+if (!BARE_MODELS.includes(model) || (effortless ? effort !== undefined : !allowed.includes(effort))) {
   const why =
     !BARE_MODELS.includes(model)
       ? `invalid model selection: unsupported model "${model ?? ''}"`
-      : `invalid model selection (--model "${model}" --effort "${effort ?? ''}"): --model ${model} requires --effort (available: ${allowed.join(', ')})`;
+      : effortless
+        ? `invalid model selection (--model "${model}" --effort "${effort}"): --effort is not supported for model "${model}"`
+        : `invalid model selection (--model "${model}" --effort "${effort ?? ''}"): --model ${model} requires --effort (available: ${allowed.join(', ')})`;
   process.stdout.write(JSON.stringify({ event: 'result', result: { conversation_id: '', status: 'ERROR', response: '', error: why, duration_seconds: 0, num_turns: 0, usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 } } }) + '\n');
   process.stderr.write(`error: ${why}\n`);
   process.exit(1);

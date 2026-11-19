@@ -37,10 +37,12 @@
 //     registered instance; bridge sessions never register, and must work
 //     whether or not any dashboard registration succeeds. buildArgv has no
 //     way to emit the flag, deliberately.
-//   - `--effort` must always accompany the bare `--model` slug: bare slug
-//     without --effort, or an effort-suffixed slug together with --effort,
-//     are both hard-errors (verified live, battery (d)). This file always
-//     emits exactly one valid form.
+//   - `--effort` must accompany the bare `--model` slug of a model with
+//     efforts: bare slug without --effort, or an effort-suffixed slug together
+//     with --effort, are both hard-errors (verified live, battery (d)). The
+//     orchestrator models (agy 1.5.7+) are the reverse: agy refuses ANY
+//     --effort with them, so the backend passes effort null and this file
+//     emits --model alone. Either way exactly one valid form.
 //   - a stdin write can lose the race against the child's death (SIGTERM
 //     cancel, crash): the kernel refuses it with EPIPE, and an uncaught
 //     EPIPE in the bridge process takes down EVERY session. Writes are
@@ -209,7 +211,7 @@ export class AntigravityClient extends EventEmitter {
     this.cwd = cwd; // agy's PRIVATE working directory -- never the workspace (see AGY_PROJECT_CONFIG_NAMES's block)
     this.workspaceDir = workspaceDir; // the workspace the model works in -- CAGE_WORKSPACE for the executor shim
     this.model = model; // the BARE slug (e.g. 'gemini-4-hydrogen'); effort travels separately
-    this.effort = effort; // 'low' | 'medium' | 'high' | 'xhigh' -- always paired with the bare slug
+    this.effort = effort; // 'low' | 'medium' | 'high' | 'xhigh', or null for a model without efforts
     this.skipPermissions = skipPermissions;
     this.env = env;
     this.proc = null;
@@ -249,7 +251,9 @@ export class AntigravityClient extends EventEmitter {
     // Never `--remote-control` (see the header: the dashboard slot quota).
     const argv = ['--input-format', 'stream-json', '--output-format', 'stream-json'];
     if (this.skipPermissions) argv.push('--dangerously-skip-permissions');
-    argv.push('--model', this.model, '--effort', this.effort);
+    argv.push('--model', this.model);
+    // null for a model agy takes no --effort with (the orchestrators).
+    if (this.effort) argv.push('--effort', this.effort);
     // Resume: agy persists conversations under
     // $HOME/.gemini/antigravity-cli/conversations/<id>.db (SQLite), so a
     // fresh process restores full history from the id alone (VERIFIED LIVE,
