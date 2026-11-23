@@ -263,6 +263,9 @@ const cfg = {
   // copied into this process's env or the store.
   zaiConfigPath: process.env.ZAI_CONFIG_PATH || `${process.env.HOME}/.zcode/cli/config.json`,
   maxQueuePerTopic: Number(process.env.MAX_QUEUE_PER_TOPIC || 20),
+  // How long a topic's queue waits after a quota failure whose error names
+  // no reset time.
+  quotaHoldMs: Number(process.env.QUOTA_HOLD_MS || 15 * 60 * 1000),
   // shutdown()'s graceful-drain window: how long to let turns already in
   // flight at redeploy time finish NATURALLY (through the ordinary
   // finalizeTurn delivery path) before falling back to the interrupt-and-
@@ -706,6 +709,10 @@ const activeTurns = new Map(); // sessionId -> { placeholderMessageId, textBuffe
 // (don't promote the next queued item) so activeTurns can actually reach
 // zero instead of one finished turn being replaced by a freshly-started one.
 let draining = false;
+// threadId -> hold timer: the topic's queue is held after a turn failed
+// on the backend's quota, so its queued messages are not run into the same
+// failure one after another. See holdQueueForQuota.
+const quotaHolds = new Map();
 // Turns still inside finalizeTurn's delivery awaits (Telegram calls) after
 // activeTurns has already lost their entry -- see finalizeTurn and
 // shutdown()'s waitForDrain. Without this, the drain wait could see
@@ -1173,8 +1180,11 @@ function onBackendEvent(msg) {
     if (typeof payload?.response === 'string' && payload.usage) {
       // Turn-level final event ({response, tokenCount, usage, toolCallCount,
       // duration, resultType} -- verified live): authoritative full-turn text
-      // plus the cumulative usage the footer renders from.
-      turn.finalText = payload.response;
+      // plus the cumulative usage the footer renders from. An EMPTY response
+      // (agy reports '' when the turn's last step was a tool call or a
+      // silent finish) is the same trap as the content guard below: it must
+      // not override the text the turn already streamed.
+      if (payload.response) turn.finalText = payload.response;
       turn.usageSummary = payload.usage;
     } else if (typeof payload?.content === 'string' && payload.content) {
       // Last assistant message's text. The guard matters: a model request
@@ -1320,17 +1330,26 @@ async function finalizeTurn(sessionId, terminalParams) {
         await deliverReply(replaceId, topic?.threadId, replyText, footer);
       }
     }
+    // A turn that failed on the backend's quota would fail every queued
+    // message behind it the same way, so the queue is held instead.
+    const quotaText = turn && terminalParams.status !== 'success' ? `${terminalParams.errorCode || ''} ${turn.error?.message || ''}` : '';
+    const held = !!topic && isQuotaFailure(quotaText) && holdQueueForQuota(topic.threadId, quotaText);
     if (topic) {
       // Skip the idle write when a queued message immediately re-busies the
       // topic (drainQueue -> startTurn writes "busy") -- two racing edits of
       // the same status message can land out of order.
-      if (!store.getQueue(topic.threadId).length) updateTopicStatus(topic.threadId, 'idle').catch(() => {});
+      if (held || !store.getQueue(topic.threadId).length) updateTopicStatus(topic.threadId, 'idle').catch(() => {});
     }
     // Whatever the user queued behind this turn runs now -- success, failure,
     // and the "!turn" early-return case all lead here for one reason: the
     // session is no longer busy, and the queue's whole contract is "runs when
     // the current message finishes". A no-op while draining (see drainQueue).
-    if (topic) void drainQueue(topic.threadId);
+    // During a hold only a turn that succeeds ends it: any other failure
+    // (a crash, an interrupt) leaves the held queue to the hold's timer.
+    if (topic && !held) {
+      if (terminalParams.status === 'success') clearQuotaHold(topic.threadId);
+      if (!quotaHolds.has(topic.threadId)) void drainQueue(topic.threadId);
+    }
   } finally {
     pendingFinalize--;
   }
@@ -2361,6 +2380,8 @@ async function interruptTurn(sessionId, { killEverything }) {
 //      conversation back up.
 // Errors on one path never stop the others: a close must close.
 async function releaseSessionForKey(key) {
+  // A held queue's timer must not bring a released session back.
+  clearQuotaHold(key);
   const sessionId = store.getTopic(key)?.sessionId;
   if (!sessionId) return;
   const wasBusy = busySessions.has(sessionId);
@@ -2674,6 +2695,7 @@ async function handleMessage(message) {
   if (command === 'clearqueue') {
     const q = store.getQueue(threadId);
     store.setQueue(threadId, []);
+    clearQuotaHold(threadId);
     refreshTopicStatusForQueue(threadId);
     for (const it of q) {
       if (it.waiterId) {
@@ -3058,6 +3080,55 @@ async function startTurn(threadId, session, text, placeholderMessageId, waiterId
   }
 }
 
+// The same test the antigravity backend applies to its own quota errors,
+// plus the HTTP status.
+function isQuotaFailure(text) {
+  return /quota|resource.?exhaust|\b429\b/i.test(text || '');
+}
+
+// "Resets in 2h13m5s" / "resets in 2 hours 13 minutes" / "reset after 45s"
+// -> ms, or null when the error names no reset time in hours, minutes or
+// seconds ("500ms", "1.5h" and "1d" are not read, so the default applies).
+const RESET_PART = String.raw`(\d+)\s*(h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)(?![a-z])`;
+const RESET_RE = new RegExp(String.raw`\bresets?\s+(?:in|after)\s+((?:${RESET_PART}[\s,]*(?:and\s+)?)+)`, 'i');
+const RESET_UNIT_MS = { h: 3600000, m: 60000, s: 1000 };
+function quotaResetMs(text) {
+  const m = RESET_RE.exec(text || '');
+  if (!m) return null;
+  let ms = 0;
+  for (const [, n, u] of m[1].matchAll(new RegExp(RESET_PART, 'gi'))) ms += Number(n) * RESET_UNIT_MS[u[0].toLowerCase()];
+  return ms;
+}
+
+function clearQuotaHold(threadId) {
+  clearTimeout(quotaHolds.get(threadId));
+  quotaHolds.delete(threadId);
+}
+
+// Holds the topic's queue after a quota failure: the queue runs again when
+// the error's reset time has passed (cfg.quotaHoldMs when it names none,
+// at most a day), or as soon as a turn the user sends in the meantime
+// succeeds. Returns false when nothing is queued, so there is nothing to
+// hold.
+function holdQueueForQuota(threadId, why) {
+  const queued = store.getQueue(threadId).length;
+  if (!queued) return false;
+  clearQuotaHold(threadId);
+  const ms = Math.min(Math.max(quotaResetMs(why) ?? cfg.quotaHoldMs, 1000), 24 * 3600000);
+  const timer = setTimeout(() => {
+    quotaHolds.delete(threadId);
+    void drainQueue(threadId);
+  }, ms);
+  quotaHolds.set(threadId, timer);
+  console.log(`[bridge] topic ${threadId}: quota failure, holding ${queued} queued message(s) for ${fmtDuration(ms)}`);
+  tg.sendMessage({
+    chatId: chatOf(threadId),
+    messageThreadId: threadOf(threadId),
+    text: `⏸ ${queued} queued message(s) held: the backend's quota is exhausted. They run in about ${fmtDuration(ms)}, or as soon as a message you send now succeeds. /clearqueue to drop them.`,
+  }).catch(() => {});
+  return true;
+}
+
 // Runs the next queued message for a topic, if any -- called from every path
 // that marks a topic's session not-busy (turn finished, failed, cancelled,
 // watchdog-timed-out, send rejected), and once at startup for queues
@@ -3070,6 +3141,8 @@ async function drainQueue(threadId) {
   // after the next boot picks it up (drainQueue also runs once at startup
   // for exactly this reason).
   if (draining) return;
+  // A closed topic is final (see dispatchUserPrompt): its queue never runs.
+  if (store.getTopic(threadId)?.closed) return;
   const queue = store.getQueue(threadId);
   if (!queue.length) return;
   const [next, ...rest] = queue;

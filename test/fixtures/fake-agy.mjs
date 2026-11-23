@@ -230,6 +230,25 @@ async function runTurn(content) {
     currentTurn = null;
     return;
   }
+  // A slow turn that then fails on the quota: the window in which the
+  // bridge queues messages behind a turn that will hit the quota. With
+  // NORESET the error names no reset time.
+  if (content === 'AGY-SLOW-QUOTA' || content === 'AGY-SLOW-QUOTA NORESET') {
+    await new Promise((r) => setTimeout(r, Number(process.env.FIXTURE_AGY_SLOW_MS || 60000)));
+    const short = `RESOURCE_EXHAUSTED (code 429): quota exhausted for gemini-4-hydrogen.${content.endsWith('NORESET') ? '' : ' Resets in 3s.'}`;
+    process.stderr.write(`AGY_ERROR: ${JSON.stringify({ short_error: short, status: 'RESOURCE_EXHAUSTED', error_code: 429, code_kind: 'http', retryable: false, error_id: 'fake' })}\n`);
+    emit({ event: 'result', result: { conversation_id: conversationId, status: 'ERROR', response: '', error: short, duration_seconds: 0.1, num_turns: seq, usage: USAGE(0) } });
+    currentTurn = null;
+    return;
+  }
+  // The reply streams as text deltas, and the result envelope's response is
+  // empty (agy does this when a turn ends on a tool call or a silent finish).
+  if (content === 'AGY-EMPTY-RESULT') {
+    step(index++, 'ACTIVE', 'agent_response', { text_delta: 'STREAMED-ONLY answer' });
+    emit({ event: 'result', result: { conversation_id: conversationId, status: 'SUCCESS', response: '', duration_seconds: 0.05, num_turns: seq, usage: USAGE(100) } });
+    currentTurn = null;
+    return;
+  }
   if (content === 'AGY-SLOW' || content.startsWith('AGY-SLOW ')) {
     step(index++, 'ACTIVE', 'agent_response', { text_delta: 'working…' });
     await new Promise((r) => setTimeout(r, Number(process.env.FIXTURE_AGY_SLOW_MS || 60000)));

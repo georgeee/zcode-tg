@@ -707,6 +707,12 @@ through to the model as ordinary input):
   (`data/sessions.json`) and drained in order when the current turn ends,
   fails, or is cancelled; they're also restored and drained on
   startup after a restart. Capped at `MAX_QUEUE_PER_TOPIC` (default 20).
+  After a turn fails on the backend's quota, the queue is **held** instead of
+  run into the same error: it runs once the error's "Resets in …" time has
+  passed (`QUOTA_HOLD_MS`, default 15 min, when it names none), or as soon
+  as a message sent in the meantime succeeds. `/clearqueue` and closing the
+  topic end the hold. The hold lives in memory: after a restart the queue
+  drains at once and holds again on the first quota failure.
 - **`/stop` or `/cancel`** in a topic with a turn in progress is a HARD
   interrupt. It calls `session/stop` (aborting the model stream and future
   steps), kills the session's in-flight tool processes — found via `/proc`

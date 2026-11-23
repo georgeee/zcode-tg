@@ -50,7 +50,7 @@
 // Drive: node test/e2e-backend-lifecycle.mjs
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdirSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 
@@ -1200,12 +1200,96 @@ async function scenario12() {
   }
 }
 
+// --- scenario 13: an empty result envelope keeps the streamed reply, and a
+// quota failure holds the queue behind it. Before the fix the reply was
+// "(no reply text)" (the empty response overrode the streamed text), and
+// every queued message ran straight into the same quota error. ---
+async function scenario13() {
+  console.log('\n--- scenario 13: empty result keeps the streamed text; a quota failure holds the queue ---');
+  const sock = path.join(TMP, 's13-state', 'agy-tg', 'mcp.sock');
+  const agyState = path.join(TMP, 's13-agy-state');
+  const b = startBridge({
+    DEFAULT_BACKEND: 'antigravity',
+    ZCODE_NODE_BIN: NODE,
+    ZCODE_BIN: ZCODE_FIXTURE,
+    ZCODE_WORKSPACE_DIR: TMP,
+    AGY_BIN: AGY_FIXTURE,
+    AGY_HOME: path.join(TMP, 's13-agy-home'),
+    AGY_EFFORT: 'medium',
+    FIXTURE_AGY_STATE: agyState,
+    FIXTURE_AGY_SLOW_MS: '1500',
+    INPUT_MERGE_MS: '0', // each queued message stays its own entry
+    QUOTA_HOLD_MS: '60000', // the hold when the error names no reset time
+    STORE_PATH: path.join(TMP, 's13-store.json'),
+    MCP_UNIX_SOCKET: sock,
+  }, 's13');
+  // Every user turn the fake agy has seen, across its conversations.
+  const ran = () => (existsSync(agyState) ? readdirSync(agyState).flatMap((f) => { try { return JSON.parse(readFileSync(path.join(agyState, f), 'utf8')); } catch { return []; } }) : []);
+  const ranIt = (text) => ran().some((t) => t.includes(text));
+  try {
+    await waitFor(() => b.log.includes(`mcp gateway listening on unix:${sock}`), 15000, 'mcp unix socket bind');
+    let id = 1300;
+    const call = (name, args) => unixJsonRpc(sock, [{ jsonrpc: '2.0', id: ++id, method: 'tools/call', params: { name, arguments: args } }]).then((ls) => ls[0]);
+    const created = await call('session_create', { name: 's13' });
+    const key = created?.result?.isError === false ? JSON.parse(created.result.content[0].text).key : null;
+    check('(a) session_create completes', !!key, JSON.stringify(created).slice(0, 300));
+
+    const empty = await call('message_send', { key, text: 'AGY-EMPTY-RESULT' });
+    const emptyReply = empty?.result?.isError === false ? JSON.parse(empty.result.content[0].text).reply : null;
+    check('(a) an empty result response keeps the streamed text as the reply', emptyReply === 'STREAMED-ONLY answer', JSON.stringify(empty).slice(0, 300));
+
+    // (b) quota failure with a reset time: the queue waits for it.
+    await call('message_send', { key, text: 'AGY-SLOW-QUOTA', wait: false });
+    await waitFor(() => ranIt('AGY-SLOW-QUOTA'), 10000, '(b) the slow quota turn to start');
+    for (const text of ['queued one', 'queued two']) {
+      const q = await call('message_send', { key, text, wait: false });
+      check(`(b) "${text}" is accepted behind the busy turn`, q?.result?.isError === false, JSON.stringify(q).slice(0, 300));
+    }
+    await waitFor(() => b.log.includes('holding 2 queued message(s) for 3s'), 10000, '(b) the quota hold');
+    const heldAt = Date.now();
+    await sleep(1500);
+    check('(b) no queued message ran right after the quota failure', !ranIt('queued one') && !ranIt('queued two'), JSON.stringify(ran()));
+    await waitFor(() => ranIt('queued one') && ranIt('queued two'), 15000, '(b) the queue to run after the reset');
+    check('(b) the queue ran once the reset time had passed', Date.now() - heldAt >= 2500, `${Date.now() - heldAt}ms after the hold`);
+
+    // (c) no reset time: the default hold, ended early by a turn that succeeds.
+    await call('message_send', { key, text: 'AGY-SLOW-QUOTA NORESET', wait: false });
+    await waitFor(() => ranIt('AGY-SLOW-QUOTA NORESET'), 10000, '(c) the second slow quota turn to start');
+    await call('message_send', { key, text: 'queued three', wait: false });
+    await waitFor(() => b.log.includes('holding 1 queued message(s) for 1m00s'), 10000, '(c) the default hold (QUOTA_HOLD_MS)');
+    await sleep(500);
+    check('(c) the queued message is held', !ranIt('queued three'), JSON.stringify(ran()));
+    // A turn that fails for another reason (agy dies) does not end the hold.
+    await call('message_send', { key, text: 'AGY-CRASH-MID-TURN' });
+    await sleep(1000);
+    check('(c) a crashed turn leaves the queue held', !ranIt('queued three'), JSON.stringify(ran()));
+    const unblock = await call('message_send', { key, text: 'unblock now' });
+    const unblockReply = unblock?.result?.isError === false ? JSON.parse(unblock.result.content[0].text).reply : null;
+    check('(c) a message sent during the hold runs at once', unblockReply === 'FAKE-REPLY: unblock now', JSON.stringify(unblock).slice(0, 300));
+    await waitFor(() => ranIt('queued three'), 10000, '(c) the held message to run after a turn succeeded');
+
+    // (d) a session closed during a hold: its queue never runs, and the
+    // hold's timer does not bring the session back.
+    await call('message_send', { key, text: 'AGY-SLOW-QUOTA', wait: false });
+    await waitFor(() => ran().filter((t) => t === 'AGY-SLOW-QUOTA').length === 2, 10000, '(d) the third slow quota turn to start');
+    await call('message_send', { key, text: 'queued before close', wait: false });
+    await waitFor(() => b.log.includes('holding 1 queued message(s) for 3s'), 10000, '(d) the quota hold');
+    const closed = await call('session_close', { key });
+    check('(d) session_close answers ok during the hold', closed?.result?.isError === false, JSON.stringify(closed).slice(0, 300));
+    await sleep(4500);
+    check('(d) the closed session\'s held message never ran', !ranIt('queued before close'), JSON.stringify(ran()));
+  } finally {
+    b.proc.kill('SIGKILL');
+    await sleep(300);
+  }
+}
+
 // EACH SCENARIO REPORTS ITS OWN FAILURE, so one scenario's throw (which is
 // how a bridge that dies at boot usually surfaces -- a waitFor timeout)
 // doesn't silently skip the scenarios after it: on the :546 boot-crash
 // this file exists to catch, EVERY non-zcode-default scenario is red, and
 // the run must say so rather than stop at the first.
-for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11, scenario12]) {
+for (const s of [scenario1, scenario2, scenario3, scenario4, scenario5, scenario6, scenario7, scenario8, scenario9, scenario10, scenario11, scenario12, scenario13]) {
     try {
       await s();
     } catch (e) {
