@@ -986,6 +986,17 @@ test("H1: turn ending SUCCESS with empty response after AGY_ERROR becomes failed
   assert.match(terminal.params.errorCode, /UNAVAILABLE/);
 });
 
+test("H1: a lone zero-width-space response after AGY_ERROR is blank too: the turn fails", async (t) => {
+  const dir = tmp("h1-503-zwsp");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { backend, events } = makeBackend(dir, { retryDelays: [20, 50] });
+  t.after(() => backend.stop());
+  const { sessionId } = await backend.createConversation({ workspaceDir: dir });
+  const terminal = await runOneTurn(backend, events, sessionId, "AGY-503-ZWSP");
+  assert.equal(terminal.params.status, "failed");
+  assert.match(terminal.params.errorCode, /UNAVAILABLE/);
+});
+
 test("H3 / requirement b: usage_get counts failed turns and records non-quota lastError", async (t) => {
   const dir = tmp("h3-usage-failed-turns");
   t.after(() => rmSync(dir, { recursive: true, force: true }));

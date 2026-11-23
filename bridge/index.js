@@ -64,6 +64,7 @@ import { CodexBackend } from './backends/codexBackend.js';
 import { AntigravityBackend, AGY_MODEL_REF, AGY_MODELS, AGY_MODEL_EFFORTS, parseAgyModelRef } from './backends/antigravityBackend.js';
 import { reapOrphanAgyChildren } from './agyProcesses.js';
 import { MockBackend, MOCK_MODEL_REF } from './backends/mockBackend.js';
+import { isBlankReply } from './blankReply.js';
 import { makeSessionId, backendNameOf, rawSessionId } from './backend.js';
 import { TelegramClient, TelegramClient as TG } from './telegram.js';
 import { Store } from './store.js';
@@ -1187,7 +1188,7 @@ function onBackendEvent(msg) {
       // nothing after its last tool call.
       if (!isBlankReply(payload.response)) turn.finalText = payload.response;
       turn.usageSummary = payload.usage;
-    } else if (typeof payload?.content === 'string' && payload.content) {
+    } else if (typeof payload?.content === 'string' && !isBlankReply(payload.content)) {
       // Last assistant message's text. The guard matters: a model request
       // that ends in tool calls also emits {content: ""} -- an empty string
       // is NOT nullish and used to blank the reply by overriding the
@@ -3092,12 +3093,6 @@ async function startTurn(threadId, session, text, placeholderMessageId, waiterId
 
 // The same test the antigravity backend applies to its own quota errors,
 // plus the HTTP status.
-// Whitespace and zero-width characters only: nothing a reader would see.
-// String.prototype.trim keeps U+200B, so it cannot answer this.
-function isBlankReply(text) {
-  return !String(text ?? '').replace(/[\s\u200b-\u200d\u2060\ufeff]/g, '');
-}
-
 function isQuotaFailure(text) {
   return /quota|resource.?exhaust|\b429\b/i.test(text || '');
 }

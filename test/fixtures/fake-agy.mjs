@@ -186,10 +186,10 @@ async function runTurn(content) {
   }
   step(index, 'DONE', 'agent_response', { duration_seconds: 0.02, usage: USAGE() });
   let response = `FAKE-REPLY: ${content}`;
-  if (content === 'AGY-503-EMPTY' || content.includes('AGY-503-EMPTY')) {
+  if (content === 'AGY-503-EMPTY' || content.includes('AGY-503-EMPTY') || content === 'AGY-503-ZWSP') {
     process.stderr.write('AGY_ERROR: {"short_error":"API error (attempt 1): UNAVAILABLE (code 503): The service is currently unavailable.","status":"UNAVAILABLE","error_code":503,"code_kind":"http","retryable":true,"error_id":"fake"}\n');
     await new Promise((r) => setTimeout(r, 30));
-    emit({ event: 'result', result: { conversation_id: conversationId, status: 'SUCCESS', response: '', duration_seconds: 0.05, num_turns: seq, usage: USAGE(0) } });
+    emit({ event: 'result', result: { conversation_id: conversationId, status: 'SUCCESS', response: content === 'AGY-503-ZWSP' ? '\u200b\n' : '', duration_seconds: 0.05, num_turns: seq, usage: USAGE(0) } });
     currentTurn = null;
     return;
   }

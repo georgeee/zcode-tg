@@ -38,6 +38,7 @@ import {
 } from '../antigravityClient.js';
 import { ConversationWatcher, conversationDbPath } from '../conversationStore.js';
 import { readProcRssBytes } from '../agyProcesses.js';
+import { isBlankReply } from '../blankReply.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -1256,8 +1257,9 @@ export class AntigravityBackend extends Backend {
     const turn = session.turn;
     const cancelled = turn != null && session.cancelPending === true;
 
-    // Per-turn error tap (H1): turn ending SUCCESS with empty response after AGY_ERROR
-    const h1Error = turn != null && !cancelled && result.status === 'SUCCESS' && (!result.response || !result.response.trim()) && turn.lastAgyError != null;
+    // Per-turn error tap (H1): turn ending SUCCESS with a blank response
+    // (empty, or a lone zero-width space) after AGY_ERROR
+    const h1Error = turn != null && !cancelled && result.status === 'SUCCESS' && isBlankReply(result.response) && turn.lastAgyError != null;
     const errorStatus = h1Error ? (turn.lastAgyError.status ?? (turn.lastAgyError.error_code ? String(turn.lastAgyError.error_code) : 'UNAVAILABLE')) : (result.status !== 'SUCCESS' ? (result.status ?? 'ERROR') : null);
     const errorMsg = h1Error ? (turn.lastAgyError.short_error || turn.lastAgyError.message || 'agy error') : (result.status !== 'SUCCESS' ? (result.error || result.status || 'agy error') : null);
 
