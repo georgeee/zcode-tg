@@ -249,6 +249,14 @@ async function runTurn(content) {
     currentTurn = null;
     return;
   }
+  // agy 1.5.7, live: a model that writes nothing after its last tool call
+  // ends the turn SUCCESS with response "\u200b\n" (a lone zero-width space).
+  if (content === 'AGY-ZWSP-RESULT' || content === 'AGY-ZWSP-ONLY') {
+    if (content === 'AGY-ZWSP-RESULT') step(index++, 'ACTIVE', 'agent_response', { text_delta: 'STREAMED before the tool call' });
+    emit({ event: 'result', result: { conversation_id: conversationId, status: 'SUCCESS', response: '\u200b\n', duration_seconds: 0.05, num_turns: seq, usage: USAGE(100) } });
+    currentTurn = null;
+    return;
+  }
   if (content === 'AGY-SLOW' || content.startsWith('AGY-SLOW ')) {
     step(index++, 'ACTIVE', 'agent_response', { text_delta: 'working…' });
     await new Promise((r) => setTimeout(r, Number(process.env.FIXTURE_AGY_SLOW_MS || 60000)));

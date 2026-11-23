@@ -1180,11 +1180,12 @@ function onBackendEvent(msg) {
     if (typeof payload?.response === 'string' && payload.usage) {
       // Turn-level final event ({response, tokenCount, usage, toolCallCount,
       // duration, resultType} -- verified live): authoritative full-turn text
-      // plus the cumulative usage the footer renders from. An EMPTY response
-      // (agy reports '' when the turn's last step was a tool call or a
-      // silent finish) is the same trap as the content guard below: it must
-      // not override the text the turn already streamed.
-      if (payload.response) turn.finalText = payload.response;
+      // plus the cumulative usage the footer renders from. A BLANK response
+      // is the same trap as the content guard below: it must not override
+      // the text the turn already streamed. Blank includes a lone zero-width
+      // space -- what agy answers (status SUCCESS) when the model writes
+      // nothing after its last tool call.
+      if (!isBlankReply(payload.response)) turn.finalText = payload.response;
       turn.usageSummary = payload.usage;
     } else if (typeof payload?.content === 'string' && payload.content) {
       // Last assistant message's text. The guard matters: a model request
@@ -1291,7 +1292,7 @@ async function finalizeTurn(sessionId, terminalParams) {
         const err = turn.error;
         text = `⚠️ Turn failed: ${terminalParams.errorCode || 'unknown_error'}${err?.message ? `\n${err.message}` : ''}`;
       }
-      if (turn.adopted && !text.trim()) {
+      if (turn.adopted && isBlankReply(text)) {
         // Auto-started notification turns sometimes produce no user-facing
         // text; a quiet label beats spamming "(no reply text)".
         const quietId = replaceId ?? turnLiveMessageId(turn);
@@ -1304,7 +1305,7 @@ async function finalizeTurn(sessionId, terminalParams) {
         }
       } else {
         const footer = terminalParams.status === 'success' ? usageFooter(turn, terminalParams) : '';
-        const replyText = text.trim() ? text : '(no reply text)';
+        const replyText = isBlankReply(text) ? '(no reply text)' : text;
         const isError = terminalParams.status !== 'success';
         if (topic) {
           if (isError) {
@@ -2409,7 +2410,16 @@ async function closeSessionForKey(key) {
   const t = store.getTopic(key) ?? {};
   await releaseSessionForKey(key);
   await tg.closeForumTopic({ chatId: chatOf(key), messageThreadId: Number(t.threadId) }).catch(() => {});
+  markClosed(key);
+}
+
+// Closed is final, so the topic's queued messages will never run (drainQueue
+// refuses a closed topic). Their parked MCP callers -- an idle session's, e.g.
+// during a quota hold, which releaseSessionForKey's busy-only notice misses --
+// are told now instead of at the wait timeout.
+function markClosed(key) {
   store.setTopic(key, { closed: true });
+  stranded(key, `this conversation was closed, so its queued message(s) will never run -- no reply is coming; create a new session and send again`);
 }
 
 // --- Telegram message handling ---
@@ -2633,7 +2643,7 @@ async function handleMessage(message) {
     const entry = key ? store.getTopic(key) : null;
     if (entry) {
       await releaseSessionForKey(key);
-      if (deleted) store.setTopic(key, { closed: true });
+      if (deleted) markClosed(key);
       console.log(`[bridge] topic ${key} ${deleted ? 'deleted' : 'closed'}${entry.sessionId ? ' -- session released' : ''}`);
     }
     return;
@@ -3082,6 +3092,12 @@ async function startTurn(threadId, session, text, placeholderMessageId, waiterId
 
 // The same test the antigravity backend applies to its own quota errors,
 // plus the HTTP status.
+// Whitespace and zero-width characters only: nothing a reader would see.
+// String.prototype.trim keeps U+200B, so it cannot answer this.
+function isBlankReply(text) {
+  return !String(text ?? '').replace(/[\s\u200b-\u200d\u2060\ufeff]/g, '');
+}
+
 function isQuotaFailure(text) {
   return /quota|resource.?exhaust|\b429\b/i.test(text || '');
 }

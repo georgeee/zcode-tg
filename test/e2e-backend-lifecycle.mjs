@@ -1237,6 +1237,11 @@ async function scenario13() {
     const empty = await call('message_send', { key, text: 'AGY-EMPTY-RESULT' });
     const emptyReply = empty?.result?.isError === false ? JSON.parse(empty.result.content[0].text).reply : null;
     check('(a) an empty result response keeps the streamed text as the reply', emptyReply === 'STREAMED-ONLY answer', JSON.stringify(empty).slice(0, 300));
+    const replyOf = (r) => (r?.result?.isError === false ? JSON.parse(r.result.content[0].text).reply : null);
+    const zw = await call('message_send', { key, text: 'AGY-ZWSP-RESULT' });
+    check('(a) a zero-width-space result response keeps the streamed text as the reply', replyOf(zw) === 'STREAMED before the tool call', JSON.stringify(zw).slice(0, 300));
+    const zwOnly = await call('message_send', { key, text: 'AGY-ZWSP-ONLY' });
+    check('(a) a reply that is only a zero-width space reads as no reply text', replyOf(zwOnly) === '(no reply text)', JSON.stringify(zwOnly).slice(0, 300));
 
     // (b) quota failure with a reset time: the queue waits for it.
     await call('message_send', { key, text: 'AGY-SLOW-QUOTA', wait: false });
@@ -1268,14 +1273,18 @@ async function scenario13() {
     check('(c) a message sent during the hold runs at once', unblockReply === 'FAKE-REPLY: unblock now', JSON.stringify(unblock).slice(0, 300));
     await waitFor(() => ranIt('queued three'), 10000, '(c) the held message to run after a turn succeeded');
 
-    // (d) a session closed during a hold: its queue never runs, and the
-    // hold's timer does not bring the session back.
+    // (d) a session closed during a hold: its queue never runs, the hold's
+    // timer does not bring the session back, and the held message's parked
+    // caller is told at the close rather than at the wait timeout.
     await call('message_send', { key, text: 'AGY-SLOW-QUOTA', wait: false });
     await waitFor(() => ran().filter((t) => t === 'AGY-SLOW-QUOTA').length === 2, 10000, '(d) the third slow quota turn to start');
-    await call('message_send', { key, text: 'queued before close', wait: false });
+    let parked = null;
+    call('message_send', { key, text: 'queued before close' }).then((r) => { parked = r; }, (e) => { parked = { harnessError: e.message }; });
     await waitFor(() => b.log.includes('holding 1 queued message(s) for 3s'), 10000, '(d) the quota hold');
     const closed = await call('session_close', { key });
     check('(d) session_close answers ok during the hold', closed?.result?.isError === false, JSON.stringify(closed).slice(0, 300));
+    await waitFor(() => parked, 3000, '(d) the parked caller to be answered').catch(() => {});
+    check('(d) the held message\'s parked caller is told the conversation closed', parked?.result?.isError === true && /closed/.test(JSON.stringify(parked.result.content)), JSON.stringify(parked).slice(0, 300));
     await sleep(4500);
     check('(d) the closed session\'s held message never ran', !ranIt('queued before close'), JSON.stringify(ran()));
   } finally {
